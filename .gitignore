@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Data — large parquet files, never commit
+data/
+artifacts/*.parquet
+artifacts/*.pkl
+artifacts/*.csv
+
+# Paper trades and research output — keep locally only
+# (uncomment below to also exclude these)
+# artifacts/paper_trades.json
+# artifacts/research_v2_report.json
+
+# Spot buffer (runtime file)
+/tmp/spot_buffer.json
+
+# pytest
+.pytest_cache/
+
+# OS
+.DS_Store
