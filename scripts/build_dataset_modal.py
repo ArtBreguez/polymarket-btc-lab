@@ -110,78 +110,26 @@ def build_and_upload():
     log.info("  Last resolved: %s",
              datetime.fromtimestamp(known_resolved["slot_ts"].max(), tz=timezone.utc))
 
-    # ── Step 4: Fetch ALL BTC 5min markets from Polymarket gamma API ──────────
-    log.info("Step 4: Fetching all BTC 5min markets from Polymarket API...")
-    all_markets = []
-    offset = 0
-    limit  = 1000
-    session = requests.Session()
-    session.headers["User-Agent"] = "polymarket-dataset-builder/1.0"
+    # ── Step 4: Extract ALL slot_ts from BrockMisner (has all 11k slugs) ────────
+    log.info("Step 4: Extracting all BTC 5min slot_ts from BrockMisner markets...")
+    # BrockMisner has all 11k markets (resolution=-1 for unresolved)
+    btc5_all = markets_src[
+        (markets_src["crypto"] == "BTC") &
+        (markets_src["timeframe"] == "5-minute")
+    ].copy()
+    btc5_all["slot_ts"] = btc5_all["slug"].apply(
+        lambda s: int(str(s).split("-")[-1]) if str(s).split("-")[-1].isdigit() else 0)
+    btc5_all = btc5_all[btc5_all["slot_ts"] > 0].sort_values("slot_ts")
+    log.info("  Total BTC 5min markets in BrockMisner: %d", len(btc5_all))
+    log.info("  Resolution breakdown: %s", dict(btc5_all["resolution"].value_counts()))
 
-    while True:
-        try:
-            r = session.get(
-                "https://gamma-api.polymarket.com/markets",
-                params={
-                    "tag":    "crypto-btc",
-                    "limit":  limit,
-                    "offset": offset,
-                    "closed": "true",
-                },
-                timeout=30,
-            )
-            if r.status_code != 200:
-                log.warning("  API returned %d at offset %d", r.status_code, offset)
-                break
-            batch = r.json()
-            if not batch:
-                break
-            # Filter BTC 5min based on slug pattern
-            btc5_batch = [
-                m for m in batch
-                if isinstance(m.get("slug", ""), str) and
-                   "btc-updown-5m-" in m.get("slug", "")
-            ]
-            all_markets.extend(btc5_batch)
-            log.info("  offset=%d | batch=%d | btc5min_so_far=%d",
-                     offset, len(batch), len(all_markets))
-            if len(batch) < limit:
-                break
-            offset += limit
-            time.sleep(0.2)
-        except Exception as e:
-            log.warning("  API error at offset %d: %s", offset, e)
-            time.sleep(2)
-            break
+    now_ts    = datetime.now(timezone.utc).timestamp()
+    past_mask = btc5_all["slot_ts"] < (now_ts - 600)
+    past_all  = btc5_all[past_mask]
+    log.info("  Slots in the past (resolvable): %d", len(past_all))
 
-    log.info("  Total BTC 5min markets from API: %d", len(all_markets))
-
-    # Parse API markets into DataFrame
-    def parse_slot_ts(slug):
-        try:
-            return int(slug.split("-")[-1])
-        except Exception:
-            return 0
-
-    api_rows = []
-    for m in all_markets:
-        slug     = m.get("slug", "")
-        slot_ts  = parse_slot_ts(slug)
-        if slot_ts == 0:
-            continue
-        api_rows.append({
-            "market_id":    m.get("id", ""),
-            "question":     m.get("question", ""),
-            "slug":         slug,
-            "slot_ts":      slot_ts,
-            "condition_id": m.get("conditionId", ""),
-            "end_ts":       m.get("endDate", slot_ts + 300),
-            "volume":       float(m.get("volume", 0) or 0),
-            "closed":       m.get("closed", False),
-        })
-
-    df_api = pd.DataFrame(api_rows)
-    log.info("  Parsed API markets: %d", len(df_api))
+    # Build lookup: slot_ts → row metadata
+    slot_meta = btc5_all.set_index("slot_ts").to_dict("index")
 
     # Merge with known resolved to get market_id → condition_id mapping
     known_map = known_resolved.set_index("slot_ts")[
@@ -193,13 +141,10 @@ def build_and_upload():
     log.info("Step 5: Resolving markets via Binance BTCUSDT 1m klines...")
 
     BINANCE_URL = "https://api.binance.com/api/v3/klines"
-    now_ts = datetime.now(timezone.utc).timestamp()
+    session = requests.Session()
 
-    # Collect all slot_ts that need resolution (past slots only)
-    all_slot_ts = sorted(set(df_api["slot_ts"].tolist() +
-                             known_resolved["slot_ts"].tolist()))
-    past_slots  = [ts for ts in all_slot_ts if ts < now_ts - 600]
-
+    # Use all past slots from BrockMisner
+    past_slots = sorted(past_all["slot_ts"].tolist())
     log.info("  Slots to resolve: %d", len(past_slots))
 
     # Batch-fetch Binance klines (process in chunks of 500)
@@ -311,26 +256,23 @@ def build_and_upload():
                 "fee_rate_bps": meta.get("fee_rate_bps", 0),
             }
         else:
-            # From API data
-            api_row = df_api[df_api["slot_ts"] == slot_ts]
-            if len(api_row) == 0:
-                continue
-            api_row = api_row.iloc[0]
+            # Use metadata from BrockMisner slot_meta lookup
+            meta_src = slot_meta.get(slot_ts, {})
             row = {
-                "market_id":    str(api_row.get("market_id", "")),
-                "question":     api_row.get("question", f"Bitcoin Up or Down 5min {slot_ts}"),
+                "market_id":    str(meta_src.get("market_id", "")),
+                "question":     meta_src.get("question", f"Bitcoin Up or Down 5min {slot_ts}"),
                 "crypto":       "BTC",
                 "timeframe":    "5-minute",
-                "volume":       float(api_row.get("volume", 0)),
+                "volume":       float(meta_src.get("volume", 0) or 0),
                 "resolution":   res,
-                "start_ts":     int(slot_ts - 300),
-                "end_ts":       int(slot_ts + 300),
-                "closed_ts":    int(slot_ts + 310),
-                "condition_id": str(api_row.get("condition_id", "")),
-                "up_token_id":  "",
-                "down_token_id": "",
+                "start_ts":     int(meta_src.get("start_ts", slot_ts - 300) or slot_ts - 300),
+                "end_ts":       int(meta_src.get("end_ts", slot_ts + 300) or slot_ts + 300),
+                "closed_ts":    int(meta_src.get("closed_ts", slot_ts + 310) or slot_ts + 310),
+                "condition_id": str(meta_src.get("condition_id", "")),
+                "up_token_id":  str(meta_src.get("up_token_id", "")),
+                "down_token_id": str(meta_src.get("down_token_id", "")),
                 "slug":         f"btc-updown-5m-{slot_ts}",
-                "fee_rate_bps": 0,
+                "fee_rate_bps": int(meta_src.get("fee_rate_bps", 0) or 0),
             }
         new_rows.append(row)
 
