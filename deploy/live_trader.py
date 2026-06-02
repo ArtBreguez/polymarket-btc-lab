@@ -704,6 +704,23 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str]) -> dict
         last30  = sum(1 for t in ticks if t["t_sec"] >= OBS - 30)
         tick_accel = float((last30 - first30) / (first30 + 1e-8))
 
+        # ── v9 features ────────────────────────────────────────────────────────
+        # Signal consistency across 6 windows
+        w_vals_list = [sw[f"btc_up_w{i}"] for i in range(6)]
+        up_ratio_stability = float(np.std(w_vals_list))
+
+        # Volume acceleration: last 90s vs first 90s
+        vol_first90 = sum(t["size"] for t in ticks if t["t_sec"] < 90)
+        vol_last90  = sum(t["size"] for t in ticks if t["t_sec"] >= 90)
+        vol_accel   = float(vol_last90 / (vol_first90 + 1e-8))
+
+        # Size disparity: avg trade size Up vs Down
+        up_tks_v9   = [t for t in ticks if t.get("outcome") == "Up"]
+        dn_tks_v9   = [t for t in ticks if t.get("outcome") == "Down"]
+        avg_up_sz   = float(sum(t["size"] for t in up_tks_v9) / (len(up_tks_v9) + 1e-8))
+        avg_dn_sz   = float(sum(t["size"] for t in dn_tks_v9) / (len(dn_tks_v9) + 1e-8))
+        size_disparity = float(avg_up_sz / (avg_dn_sz + 1e-8))
+
         feat.update({
             "btc_n_ticks":     float(n),
             "btc_vol_up":      float(vol_up),
@@ -720,6 +737,10 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str]) -> dict
             "btc_vwap_trend":  vwap_trend,
             "btc_vwmom":       vwmom,
             "btc_tick_accel":  tick_accel,
+            # v9
+            "btc_up_ratio_stability": up_ratio_stability,
+            "btc_vol_accel":          vol_accel,
+            "btc_size_disparity":     size_disparity,
             **sw,
         })
         cur_up_ratio = float(vol_up / total)
@@ -732,6 +753,7 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str]) -> dict
             "btc_buy_ratio": 0.5, "btc_avg_size": 0.0, "btc_momentum": 0.0,
             "btc_tw_up_ratio": 0.5, "btc_vwap_trend": 0.0,
             "btc_vwmom": 0.0, "btc_tick_accel": 0.0,
+            "btc_up_ratio_stability": 0.0, "btc_vol_accel": 1.0, "btc_size_disparity": 1.0,
             **{f"btc_up_w{i}": 0.5 for i in range(6)},
         })
         cur_up_ratio = 0.5
