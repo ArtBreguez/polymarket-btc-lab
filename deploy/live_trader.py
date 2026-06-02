@@ -64,7 +64,9 @@ BINANCE_WS      = "wss://stream.binance.com:9443/stream?streams=btcusdt@kline_1m
 BINANCE_REST    = "https://api.binance.com/api/v3"
 
 HTTP_TIMEOUT    = 3    # seconds — tight budget for a 10s loop
-MAX_TRADE_PAGES = 6    # max pages from data-api per token (500/page = 3000 trades max)
+MAX_TRADE_PAGES = 20   # max pages from data-api per token (500/page = 10000 trades max)
+                       # NOTE: data-api returns trades in random order (not chronological),
+                       # so we must page through all pages to collect inslot trades.
 
 SLOT_DURATION   = 300
 OBSERVE_SECS    = 180
@@ -598,12 +600,9 @@ def fetch_inslot_trades(yes_token: str, no_token: str, slot_ts: int) -> list[dic
                             "size":    float(t.get("size", 0) or 0),
                             "t_sec":   t_sec,
                         })
-                # Stop paging if we've gone past slot start
-                min_ts = min((int(x.get("timestamp", 0)) for x in batch), default=0)
-                if min_ts > 1e12:
-                    min_ts //= 1000
-                if min_ts < slot_ts:
-                    break
+                # NOTE: data-api returns trades in random order, NOT chronological.
+                # Do NOT break early based on min_ts — it would skip inslot trades
+                # that appear on later pages. Page until empty or max pages.
             except Exception:
                 break
     return all_trades
