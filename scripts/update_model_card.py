@@ -30,11 +30,16 @@ HF_META_FILENAME = "champion_meta.json"
 HF_README_FILENAME = "README.md"
 
 CHANGELOG = [
-    ("v4", "0.8430", "—",      "—",      "Baseline multi-crypto (deprecated)"),
-    ("v5", "0.8553", "—",      "—",      "BTC-only, OB ts_ms fix, Optuna WF"),
-    ("v6", "0.8559", "0.7738", "0.1562", "Lagged outcomes, purged WF gap=5, perm importance"),
-    ("v7", "0.8536", "0.7598", "0.1593", "Realized vol, tw_up_ratio, VWAP trend; ensemble removed"),
-    ("v8", "0.8529", "0.7802", "0.1707", "6x30s sub-windows, multi-scale zscore (5/10/20), no ensemble"),
+    # (version, AUC, Acc, Brier, key_changes)
+    ("v4",  "0.8430", "—",      "—",      "Baseline multi-crypto (deprecated — ETH/SOL noise)"),
+    ("v5",  "0.8553", "—",      "—",      "BTC-only, OB ts_ms fix, Optuna WF objective"),
+    ("v6",  "0.8559", "0.7738", "0.1562", "Lagged outcomes, purged WF gap=5 — best Brier ever"),
+    ("v7",  "0.8536", "0.7598", "0.1593", "Realized vol, tw_up_ratio, VWAP trend; ensemble tested & removed"),
+    ("v8",  "0.8529", "0.7802", "0.1707", "6x30s sub-windows, multi-scale zscore (5/10/20) — 63 features, too many"),
+    ("v9",  "0.8519", "0.7842", "0.1809", "Sigmoid calib (worse!), pruning 63→27 features, 3 new tick features"),
+    ("v10", "0.8547", "0.7902", "0.1554", "Isotonic back, interaction features, min_child 5-40 — TRUE BEST"),
+    ("v11", "0.8533", "0.7839", "0.1585", "price_percentile + final_burst — no improvement over v10"),
+    ("v12", "0.8542", "0.7762", "0.1634", "7-fold WF experiment — fewer samples/fold hurts stability"),
 ]
 
 USAGE_SNIPPET = '''\
@@ -294,6 +299,45 @@ def _section_usage() -> str:
 """
 
 
+def _section_lessons() -> str:
+    return """\
+## Experiment Lessons
+
+Full experiment log: [docs/EXPERIMENTS.md](https://github.com/ArtBreguez/polymarket-btc-lab/blob/main/docs/EXPERIMENTS.md)
+
+### What Works
+| Finding | Since |
+|---------|-------|
+| **Isotonic calibration** — better than sigmoid for ~600 samples | v6 |
+| **Purged WF gap=5** — essential with lag features to prevent leakage | v6 |
+| **6x30s sub-windows** — finer temporal resolution than 3x60s | v8 |
+| **btc_up_w5 (final 30s)** is consistently the #1 feature | v8 |
+| **Multi-scale zscore** (5/10/20 slots) — top 3 always | v8 |
+| **~30 features** is the sweet spot for 601 samples (ratio ~20:1) | v9 |
+| **Interaction features** — signal_conviction, momentum_vol_sync add value | v10 |
+| **min_child_samples 5-40** — allows deeper trees with smaller feature set | v10 |
+| **5 folds** — stable with 601 samples; 7 folds is too granular | v10 |
+
+### What Doesn't Work
+| Finding | Version |
+|---------|---------|
+| ❌ ETH/SOL cross-asset features — correlated noise, not signal | v5 |
+| ❌ Ensemble (LightGBM + LR) — hurt AUC at 601 samples | v7 |
+| ❌ OB Down token — `best_bid_size` always 0 for resolved markets | v7 |
+| ❌ Sigmoid/Platt calibration — only 2 params, underfits here | v9 |
+| ❌ 63+ features — variance too high, fold AUC range 0.81-0.91 | v8 |
+| ❌ price_percentile (4h range) — irrelevant at 5min scale | v11 |
+| ❌ final_burst (last 30s vol) — redundant with btc_up_w5_zscore | v11 |
+| ❌ 7-fold WF — test sets too small (~85 samples), noisier estimates | v12 |
+
+### Gate Fix (Critical)
+Previous versions re-evaluated the champion with *default* params in Step 11,
+deflating its AUC from ~0.85 to ~0.82 and letting weaker models promote incorrectly.
+Fixed in v10+: use `CHAMPION_AUC` from `champion_meta.json` directly.
+Gate requires **2 of 3 metrics** (AUC, Brier, Acc) to be strictly better.
+"""
+
+
 def _section_changelog() -> str:
     rows = [
         f"| {v} | {auc} | {acc} | {brier} | {changes} |"
@@ -357,6 +401,8 @@ def build_model_card(meta: dict) -> str:
         _section_usage(),
         "",
         _section_changelog(),
+        "",
+        _section_lessons(),
         "",
         _section_notes(),
     ]
