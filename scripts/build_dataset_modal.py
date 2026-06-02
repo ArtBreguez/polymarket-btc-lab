@@ -110,8 +110,23 @@ def build_and_upload():
     log.info("  Last resolved: %s",
              datetime.fromtimestamp(known_resolved["slot_ts"].max(), tz=timezone.utc))
 
-    # ── Step 4: Extract ALL slot_ts from BrockMisner (has all 11k slugs) ────────
-    log.info("Step 4: Extracting all BTC 5min slot_ts from BrockMisner markets...")
+    # ── Step 4: Extract ALL slot_ts from BrockMisner ─────────────────────────
+    # Quick connectivity test first
+    log.info("Step 4a: Testing Binance API connectivity from Modal...")
+    try:
+        test_r = requests.get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": "BTCUSDT", "interval": "1m", "limit": 2},
+            timeout=15, headers={"User-Agent": "Mozilla/5.0"}
+        )
+        log.info("  Binance test: HTTP %d | response len=%d",
+                 test_r.status_code, len(test_r.json()))
+        if test_r.status_code != 200:
+            raise RuntimeError(f"Binance API unreachable from Modal: HTTP {test_r.status_code}")
+    except Exception as e:
+        raise RuntimeError(f"Binance connectivity test failed: {e}")
+
+    log.info("Step 4b: Extracting all BTC 5min slot_ts from BrockMisner markets...")
     # BrockMisner has all 11k markets (resolution=-1 for unresolved)
     btc5_all = markets_src[
         (markets_src["crypto"] == "BTC") &
@@ -142,21 +157,21 @@ def build_and_upload():
 
     BINANCE_URL = "https://api.binance.com/api/v3/klines"
     session = requests.Session()
+    session.headers["User-Agent"] = "Mozilla/5.0"
 
     # Use all past slots from BrockMisner
     past_slots = sorted(past_all["slot_ts"].tolist())
     log.info("  Slots to resolve: %d", len(past_slots))
 
-    # Batch-fetch Binance klines (process in chunks of 500)
+    # Batch-fetch Binance klines (process in chunks of 200)
     SLOT_DUR = 300   # 5 minutes
     resolution_map = {}   # slot_ts → 0 or 1
     errors = 0
     verified_vs_known = {"match": 0, "mismatch": 0, "missing": 0}
 
-    def resolve_batch(slots_batch):
-        """Fetch Binance klines for a batch of slots and return resolutions."""
-        results = {}
-        for slot_ts in slots_batch:
+    def fetch_klines(slot_ts):
+        """Fetch Binance 1m klines for a slot with retries. Returns (open, close) or None."""
+        for attempt in range(4):
             try:
                 r = session.get(
                     BINANCE_URL,
@@ -167,44 +182,51 @@ def build_and_upload():
                         "endTime":   (slot_ts + SLOT_DUR) * 1000,
                         "limit":     6,
                     },
-                    timeout=15,
+                    timeout=20,
                 )
-                if r.status_code == 429:   # rate limit
-                    time.sleep(5)
-                    r = session.get(BINANCE_URL, params={
-                        "symbol": "BTCUSDT", "interval": "1m",
-                        "startTime": slot_ts * 1000,
-                        "endTime": (slot_ts + SLOT_DUR) * 1000,
-                        "limit": 6,
-                    }, timeout=15)
+                if r.status_code == 429:
+                    wait = 10 * (attempt + 1)
+                    log.warning("  Rate limit hit, sleeping %ds", wait)
+                    time.sleep(wait)
+                    continue
                 if r.status_code != 200:
+                    log.debug("  Binance HTTP %d for slot %d", r.status_code, slot_ts)
+                    time.sleep(1)
                     continue
                 klines = r.json()
                 if not klines:
-                    continue
-                open_price  = float(klines[0][1])
-                close_price = float(klines[-1][4])
-                results[slot_ts] = 1 if close_price > open_price else 0
-            except Exception:
-                pass
-        return results
+                    return None
+                return float(klines[0][1]), float(klines[-1][4])
+            except Exception as exc:
+                log.debug("  Binance error slot %d attempt %d: %s", slot_ts, attempt, exc)
+                time.sleep(2 * (attempt + 1))
+        return None
 
     CHUNK = 200
     log.info("  Processing %d slots in chunks of %d...", len(past_slots), CHUNK)
     for i in range(0, len(past_slots), CHUNK):
         chunk = past_slots[i:i + CHUNK]
-        batch_res = resolve_batch(chunk)
-        resolution_map.update(batch_res)
-        errors += len(chunk) - len(batch_res)
-        if (i // CHUNK) % 5 == 0:
-            log.info("  Progress: %d/%d resolved, %d errors",
+        for slot_ts in chunk:
+            result = fetch_klines(slot_ts)
+            if result is None:
+                errors += 1
+            else:
+                open_p, close_p = result
+                resolution_map[slot_ts] = 1 if close_p > open_p else 0
+            time.sleep(0.05)   # gentle rate limiting
+        if i % (CHUNK * 5) == 0:
+            log.info("  Progress: %d/%d resolved, %d errors so far",
                      len(resolution_map), len(past_slots), errors)
-        time.sleep(0.05)   # gentle rate limiting
 
     log.info("  Total resolved: %d | Errors/missing: %d",
              len(resolution_map), errors)
 
-    # ── Step 6: Cross-validate against known BrockMisner labels ───────────────
+    if len(resolution_map) == 0:
+        raise RuntimeError(
+            "Binance returned ZERO results — possible network block in Modal. "
+            "Check Modal region or use a proxy.")
+
+    # ── Step 6: Cross-validate
     log.info("Step 6: Cross-validating against BrockMisner ground truth...")
     for _, row in known_resolved.iterrows():
         ts  = row["slot_ts"]
