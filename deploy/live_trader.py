@@ -577,7 +577,7 @@ def fetch_inslot_trades(yes_token: str, no_token: str, slot_ts: int) -> list[dic
             offset = page * 500
             try:
                 r = _http.get(f"{DATA_API}/trades",
-                    params={"asset": token_id[:40], "limit": 500, "offset": offset},
+                    params={"asset": token_id, "limit": 500, "offset": offset},
                     timeout=HTTP_TIMEOUT)
                 if not r.ok:
                     break
