@@ -595,16 +595,13 @@ def train_v9():
         final_wf["wf_auc"], final_wf["wf_acc"], final_wf["wf_brier"])
 
     # ── Step 11: Re-evaluate champion with same purged WF ─────────────────────
-    log.info("Step 11: Re-evaluating champion (%s)...", champion.get("version", "?"))
-    champ_feats = [f for f in CHAMPION_FEATS if f in df.columns]
-    if len(champ_feats) >= 10:
-        wf_champ      = walk_forward_purged(df, champ_feats)
-        fair_champ_auc = wf_champ["wf_auc"]
-        log.info("  Champion purged WF AUC: %.4f (original: %.4f)",
-                 fair_champ_auc, CHAMPION_AUC)
-    else:
-        fair_champ_auc = max(CHAMPION_AUC - 0.01, 0.0)
-        log.info("  Champion features not available — using %.4f", fair_champ_auc)
+    log.info("Step 11: Champion comparison...")
+    # Use the AUC from champion_meta.json directly — it was already computed
+    # with the same purged WF protocol. Re-evaluating with default params
+    # artificially deflates it and lets weaker models pass the gate.
+    fair_champ_auc = CHAMPION_AUC
+    log.info("  Champion (%s): AUC=%.4f  Brier=%.4f  Acc=%.4f",
+             champion.get("version", "?"), CHAMPION_AUC, CHAMPION_BRIER, CHAMPION_ACC)
 
     # ── Step 12: Train final with calibration ─────────────────────────────────
     log.info("Step 12: Training final model...")
@@ -655,8 +652,8 @@ def train_v9():
     beats_brier = final_brier < CHAMPION_BRIER
     beats_acc   = final_acc   > CHAMPION_ACC
     n_passed    = sum([beats_auc, beats_brier, beats_acc])
-    auc_close   = final_auc >= (fair_champ_auc - 0.005)
-    should_promote = beats_auc or (n_passed >= 2 and auc_close)
+    # Strict gate: must beat champion on at least 2 of 3 metrics
+    should_promote = n_passed >= 2
 
     log.info("  Gate: AUC>%.4f[%s] Brier<%.4f[%s] Acc>%.4f[%s] → %d/3 | %s",
              fair_champ_auc, "✓" if beats_auc   else "✗",
