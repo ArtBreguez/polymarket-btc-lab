@@ -144,7 +144,7 @@ unless noted) on 601 resolved BTC 5-minute markets.
 
 | AUC | Acc | Brier | Features |
 |-----|-----|-------|----------|
-| **0.8571** | **0.7862** | **0.1579** | 31 |
+| **0.8547** | **0.7902** | **0.1554** | 31 |
 
 **Fold AUCs:** [0.853, 0.898, 0.874, 0.814, 0.847]
 
@@ -264,7 +264,7 @@ Features tested and consistently dropped by permutation importance:
 
 | Config | AUC | Notes |
 |--------|-----|-------|
-| 5 folds, gap=5 | 0.8571 (v10) | Best |
+| 5 folds, gap=5 | 0.8547 (v10) | Best |
 | 5 folds, gap=3 | not isolated | Higher AUC in some runs, riskier (lag leakage) |
 | 7 folds, gap=5 | 0.8542 (v12) | Worse — test sets too small (~85 samples) |
 
