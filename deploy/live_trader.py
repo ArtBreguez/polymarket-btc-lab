@@ -513,36 +513,112 @@ def get_market_mid(slot_ts: int) -> tuple[float, float] | tuple[None, None]:
     return None, None
 
 def fetch_inslot_trades(yes_token: str, no_token: str, slot_ts: int) -> list[dict]:
-    # data-api has ~4-5 minute lag — inslot trades are NOT available at t=180s.
-    # Return empty list; build_features will use price_history + spot only.
-    return []
+    """Fetch inslot trades from data-api. Lag is ~90-120s so t=0-60s trades available at t=180s."""
+    all_trades = []
+    for token_id, outcome_label in [(yes_token, "Up"), (no_token, "Down")]:
+        for offset in range(0, 1500, 500):
+            try:
+                r = _http.get(f"{DATA_API}/trades",
+                    params={"asset": token_id[:40], "limit": 500, "offset": offset},
+                    timeout=HTTP_TIMEOUT)
+                if not r.ok:
+                    break
+                batch = r.json()
+                if not batch:
+                    break
+                # Filter to inslot window [slot_ts, slot_ts+OBS_SECS)
+                for t in batch:
+                    ts = int(t.get("timestamp", 0))
+                    if ts > 1e12:
+                        ts //= 1000
+                    t_sec = ts - slot_ts
+                    if 0 <= t_sec < OBSERVE_SECS:
+                        all_trades.append({
+                            "outcome": t.get("outcome", outcome_label),
+                            "side":    t.get("side", "BUY"),
+                            "price":   float(t.get("price", 0) or 0),
+                            "size":    float(t.get("size", 0) or 0),
+                            "t_sec":   t_sec,
+                        })
+                # Stop paging if we've gone past slot start
+                min_ts = min((int(x.get("timestamp", 0)) for x in batch), default=0)
+                if min_ts > 1e12:
+                    min_ts //= 1000
+                if min_ts < slot_ts:
+                    break
+            except Exception:
+                break
+    return all_trades
 
 
 def build_features(ticks: list[dict], slot_ts: int, features: list[str]) -> dict | None:
     """
-    Build real-time features for the v3 model.
-    Uses CLOB prices-history (UP token) + Binance spot buffer + time only.
-    Order flow dropped: data-api has 4-5 min lag, not available at entry time.
+    Build real-time features for the v4 model.
+    Uses inslot ticks (from data-api, ~120s lag) + Binance spot buffer + time.
     """
-    # ── Price series from CLOB prices-history ────────────────────────────────
-    # yes_token is not passed here; we need it from the caller context.
-    # The prices-history call happens in the caller (run()) instead.
-    # This function just assembles the feature dict from pre-computed values.
-    # For compatibility, accept ticks param (ignored).
-
     # Time features
     dt   = datetime.fromtimestamp(slot_ts, tz=timezone.utc)
     hour = dt.hour + dt.minute / 60.0
     dow  = dt.weekday()
 
     feat: dict = {
-        "hour":     hour,
         "hour_sin": math.sin(2 * math.pi * hour / 24),
         "hour_cos": math.cos(2 * math.pi * hour / 24),
         "dow_sin":  math.sin(2 * math.pi * dow / 7),
         "dow_cos":  math.cos(2 * math.pi * dow / 7),
     }
+
+    # ── Order flow features from inslot ticks ────────────────────────────────
+    if ticks:
+        up   = [t for t in ticks if t.get("outcome") == "Up"]
+        dn   = [t for t in ticks if t.get("outcome") == "Down"]
+        vol_up = sum(t["size"] for t in up)
+        vol_dn = sum(t["size"] for t in dn)
+        total  = vol_up + vol_dn + 1e-8
+        n      = len(ticks)
+
+        vwap_up = sum(t["price"] * t["size"] for t in up) / (vol_up + 1e-8) if up else 0.5
+        vwap_dn = sum(t["price"] * t["size"] for t in dn) / (vol_dn + 1e-8) if dn else 0.5
+
+        def ur(subset):
+            vu = sum(t["size"] for t in subset if t.get("outcome") == "Up")
+            t_ = sum(t["size"] for t in subset) + 1e-8
+            return vu / t_
+
+        w0 = [t for t in ticks if t["t_sec"] < 60]
+        w1 = [t for t in ticks if 60 <= t["t_sec"] < 120]
+        w2 = [t for t in ticks if t["t_sec"] >= 120]
+
+        up_w0 = ur(w0); up_w1 = ur(w1); up_w2 = ur(w2)
+
+        feat.update({
+            "btc_n_ticks":     float(n),
+            "btc_vol_up":      vol_up,
+            "btc_vol_dn":      vol_dn,
+            "btc_up_ratio":    vol_up / total,
+            "btc_vwap_up":     vwap_up,
+            "btc_vwap_dn":     vwap_dn,
+            "btc_vwap_spread": vwap_up - vwap_dn,
+            "btc_buy_ratio":   sum(1 for t in ticks if t.get("side") == "BUY") / (n + 1e-8),
+            "btc_avg_size":    total / n,
+            "btc_momentum":    up_w2 - up_w0,
+            "btc_up_w0":       up_w0,
+            "btc_up_w1":       up_w1,
+            "btc_up_w2":       up_w2,
+        })
+    else:
+        # No ticks yet — fill with neutral values (not zeros for ratio features)
+        feat.update({
+            "btc_n_ticks": 0.0, "btc_vol_up": 0.0, "btc_vol_dn": 0.0,
+            "btc_up_ratio": 0.5, "btc_vwap_up": 0.5, "btc_vwap_dn": 0.5,
+            "btc_vwap_spread": 0.0, "btc_buy_ratio": 0.5, "btc_avg_size": 0.0,
+            "btc_momentum": 0.0, "btc_up_w0": 0.5, "btc_up_w1": 0.5, "btc_up_w2": 0.5,
+        })
+
+    # ── Pre-slot spot returns (from Binance buffer) ───────────────────────────
     feat.update(build_spot_features(slot_ts))
+
+    # Fill any missing features with 0
     for f in features:
         feat.setdefault(f, 0.0)
     return feat
@@ -762,9 +838,9 @@ def run(client, model, features):
             feat = build_features(ticks, slot_ts, features)
             if feat is None:
                 continue
-            log.info("  btc_inslot_ret=%.5f eth_inslot_ret=%.5f sol_inslot_ret=%.5f",
-                     feat.get("btc_inslot_3m_ret",0), feat.get("eth_inslot_3m_ret",0),
-                     feat.get("sol_inslot_3m_ret",0))
+            log.info("  btc_up_ratio=%.3f momentum=%.3f n_ticks=%d",
+                     feat.get("btc_up_ratio", 0.5), feat.get("btc_momentum", 0),
+                     int(feat.get("btc_n_ticks", 0)))
 
             X = pd.DataFrame([[feat.get(f, 0.0) for f in features]], columns=features)
             prob_up = float(model.predict_proba(X)[0][1])
