@@ -31,31 +31,64 @@ HF_REPO = "artbreguez/polymarket-btc-model"
 
 
 def sanity_check(model, features: list[str]) -> dict:
-    """Run sanity check: BTC up/down signals should predict correctly."""
+    """Run sanity check: directional signals should predict correctly.
+    
+    Feature-aware: detects which signal features exist in the model
+    and sets them appropriately for UP/DOWN/neutral scenarios.
+    """
     results = {}
 
-    def predict(btc_ret: float) -> float:
+    def predict(scenario: dict) -> float:
         row = {f: 0.0 for f in features}
-        row["btc_inslot_3m_ret"] = btc_ret
+        for k, v in scenario.items():
+            if k in row:
+                row[k] = v
         X = pd.DataFrame([row], columns=features)
-        prob_up = float(model.predict_proba(X)[0][1])
-        return prob_up
+        return float(model.predict_proba(X)[0, 1])
 
-    # BTC +0.3% → should predict UP strongly
-    prob_up_pos = predict(0.003)
-    # BTC -0.3% → should predict DOWN (low UP prob)
-    prob_up_neg = predict(-0.003)
-    # Neutral → should be near 50/50
-    prob_up_neutral = predict(0.0)
+    # Neutral scenario: realistic 50/50 order flow
+    neutral_scenario = {
+        "btc_up_ratio": 0.50, "btc_momentum": 0.0,
+        "btc_vwap_spread": 0.0, "btc_up_w0": 0.50,
+        "btc_up_w1": 0.50, "btc_up_w2": 0.50,
+        "btc_inslot_3m_ret": 0.0,
+        "btc_pre_5m_ret": 0.0, "btc_pre_10m_ret": 0.0,
+        "btc_n_ticks": 500.0, "btc_vol_up": 1000.0, "btc_vol_dn": 1000.0,
+        "btc_buy_ratio": 0.50, "btc_avg_size": 50.0,
+    }
 
-    results["btc_up_0.3pct"] = round(prob_up_pos, 4)
-    results["btc_dn_0.3pct"] = round(prob_up_neg, 4)
-    results["btc_neutral"] = round(prob_up_neutral, 4)
+    # UP scenario: order flow strongly bullish
+    up_scenario = {**neutral_scenario,
+        "btc_up_ratio": 0.70, "btc_momentum": 0.15,
+        "btc_vwap_spread": 0.05,
+        "btc_up_w0": 0.65, "btc_up_w1": 0.68, "btc_up_w2": 0.72,
+        "btc_inslot_3m_ret": 0.003,
+        "btc_pre_5m_ret": 0.002, "btc_pre_10m_ret": 0.003,
+        "btc_vol_up": 1600.0, "btc_vol_dn": 700.0,
+    }
 
-    # Directional check: UP > neutral > DOWN
-    # Also check strong UP (+1%) reaches at least 0.40
-    prob_strong_up = predict(0.01)
-    results["btc_up_1pct"] = round(prob_strong_up, 4)
+    # DOWN scenario: order flow strongly bearish
+    dn_scenario = {**neutral_scenario,
+        "btc_up_ratio": 0.30, "btc_momentum": -0.15,
+        "btc_vwap_spread": -0.05,
+        "btc_up_w0": 0.35, "btc_up_w1": 0.32, "btc_up_w2": 0.28,
+        "btc_inslot_3m_ret": -0.003,
+        "btc_pre_5m_ret": -0.002, "btc_pre_10m_ret": -0.003,
+        "btc_vol_up": 700.0, "btc_vol_dn": 1600.0,
+    }
+
+    prob_up_pos     = predict(up_scenario)
+    prob_up_neg     = predict(dn_scenario)
+    prob_up_neutral = predict(neutral_scenario)
+
+    results["up_scenario"]   = round(prob_up_pos, 4)
+    results["dn_scenario"]   = round(prob_up_neg, 4)
+    results["neutral"]       = round(prob_up_neutral, 4)
+
+    # Strong check: UP scenario must predict higher prob than DOWN scenario
+    prob_strong_up = predict({**up_scenario,
+                              "btc_up_ratio": 0.80, "btc_momentum": 0.25})
+    results["strong_up"] = round(prob_strong_up, 4)
 
     passed = (
         prob_up_pos > prob_up_neutral
@@ -100,9 +133,10 @@ def main():
     # Sanity check
     print("\nRunning sanity check...")
     check = sanity_check(model, features)
-    print(f"  BTC +0.3% → P(UP) = {check['btc_up_0.3pct']:.3f}  (expect >0.65)")
-    print(f"  BTC -0.3% → P(UP) = {check['btc_dn_0.3pct']:.3f}  (expect <0.35)")
-    print(f"  BTC  0.0% → P(UP) = {check['btc_neutral']:.3f}  (expect 0.35-0.65)")
+    print(f"  UP scenario    → P(UP) = {check['up_scenario']:.3f}  (expect > neutral)")
+    print(f"  DOWN scenario  → P(UP) = {check['dn_scenario']:.3f}  (expect < neutral)")
+    print(f"  Neutral        → P(UP) = {check['neutral']:.3f}  (baseline)")
+    print(f"  Strong UP      → P(UP) = {check['strong_up']:.3f}  (expect >= 0.40)")
 
     if not check["passed"]:
         print("\nSANITY CHECK FAILED — model has wrong directional bias. Aborting.")
