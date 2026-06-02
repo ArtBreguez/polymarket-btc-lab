@@ -740,6 +740,9 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str]) -> dict
             "btc_up_ratio_stability": up_ratio_stability,
             "btc_vol_accel":          vol_accel,
             "btc_size_disparity":     size_disparity,
+            # v10 interaction features
+            "btc_signal_conviction":  float((vol_up / total) * (1.0 - up_ratio_stability)),
+            "btc_momentum_vol_sync":  float(btc_momentum * vol_accel),
             **sw,
         })
         cur_up_ratio = float(vol_up / total)
@@ -753,6 +756,7 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str]) -> dict
             "btc_tw_up_ratio": 0.5, "btc_vwap_trend": 0.0,
             "btc_vwmom": 0.0, "btc_tick_accel": 0.0,
             "btc_up_ratio_stability": 0.0, "btc_vol_accel": 1.0, "btc_size_disparity": 1.0,
+            "btc_signal_conviction": 0.0, "btc_momentum_vol_sync": 0.0,
             **{f"btc_up_w{i}": 0.5 for i in range(6)},
         })
         cur_up_ratio = 0.5
