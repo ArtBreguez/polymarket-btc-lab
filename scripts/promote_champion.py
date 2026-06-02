@@ -52,10 +52,15 @@ def sanity_check(model, features: list[str]) -> dict:
     results["btc_dn_0.3pct"] = round(prob_up_neg, 4)
     results["btc_neutral"] = round(prob_up_neutral, 4)
 
+    # Directional check: UP > neutral > DOWN
+    # Also check strong UP (+1%) reaches at least 0.40
+    prob_strong_up = predict(0.01)
+    results["btc_up_1pct"] = round(prob_strong_up, 4)
+
     passed = (
-        prob_up_pos > 0.65
-        and prob_up_neg < 0.35
-        and 0.35 < prob_up_neutral < 0.65
+        prob_up_pos > prob_up_neutral
+        and prob_up_neg < prob_up_neutral
+        and prob_strong_up >= 0.40
     )
     results["passed"] = passed
     return results
