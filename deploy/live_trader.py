@@ -369,9 +369,23 @@ def load_model():
             raise RuntimeError(f"Failed to download champion model from HF: {e}") from e
     with open(MODEL_PATH, "rb") as f:
         bundle = pickle.load(f)
-    log.info("Model loaded: %d features, WF AUC=%.3f",
-             len(bundle["features"]), bundle.get("wf_auc", 0))
+    log.info("Model loaded: %d features, WF AUC=%.3f, ensemble=%s",
+             len(bundle["features"]), bundle.get("wf_auc", 0),
+             bundle.get("ensemble", False))
     return bundle["model"], bundle["features"]
+
+
+def predict_proba(model_obj, X: "pd.DataFrame") -> float:
+    """Unified predict — handles both plain sklearn model and ensemble dict."""
+    if isinstance(model_obj, dict) and model_obj.get("ensemble"):
+        lgb_prob = model_obj["lgb"].predict_proba(X)[0][1]
+        lr_prob  = model_obj["lr"].predict_proba(X)[0][1]
+        w = model_obj.get("lgb_weight", 0.65)
+        return float(lgb_prob * w + lr_prob * (1 - w))
+    else:
+        # Plain sklearn / calibrated model (v5/v6 and v7 non-ensemble)
+        m = model_obj["lgb"] if isinstance(model_obj, dict) else model_obj
+        return float(m.predict_proba(X)[0][1])
 
 
 # ── Spot features from buffer ──────────────────────────────────────────────────
@@ -843,7 +857,7 @@ def run(client, model, features):
                      int(feat.get("btc_n_ticks", 0)))
 
             X = pd.DataFrame([[feat.get(f, 0.0) for f in features]], columns=features)
-            prob_up = float(model.predict_proba(X)[0][1])
+            prob_up = predict_proba(model, X)
             direction  = "UP" if prob_up >= 0.5 else "DOWN"
             confidence = prob_up if direction == "UP" else 1.0 - prob_up
             log.info("  Prediction: %s  conf=%.1f%%", direction, confidence*100)
