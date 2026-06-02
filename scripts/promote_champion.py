@@ -188,6 +188,16 @@ def main():
     os.unlink(tmp)
     print("  ✅ champion_meta.json uploaded")
 
+    # Update HuggingFace model card
+    print("\nUpdating HuggingFace model card...")
+    try:
+        from scripts.update_model_card import update_model_card
+        update_model_card(meta, args.hf_token)
+        print("  ✅ Model card updated on HuggingFace")
+    except Exception as e:
+        print(f"  ⚠️  Model card update failed (non-fatal): {e}")
+        print("     Run manually: python scripts/update_model_card.py --hf-token $HF_TOKEN")
+
     print(f"\n🏆 Champion promoted!")
     print(f"   URL: https://huggingface.co/{HF_REPO}")
     print(f"   AUC: {wf_auc:.4f}  Acc: {wf_acc:.4f}")
