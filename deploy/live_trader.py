@@ -1,7 +1,7 @@
 """
-live_trader.py — BTC Directional Live Trader v2
+live_trader.py — BTC Directional Live Trader v3
 ================================================
-Runs the v2 ML model on Polymarket BTC 5-minute markets.
+Runs the v8 ML model on Polymarket BTC 5-minute markets.
 
 Strategy:
   - Observe first 3 min of each 5m slot (order flow from CLOB)
@@ -17,9 +17,18 @@ Credentials (Fly secrets):
   MM_BUILDER_SECRET     — Builder API secret
   MM_BUILDER_PASSPHRASE — Builder API passphrase
 
-Model: downloaded from HuggingFace on startup (BrockMisner/polymarket-btc-updown).
-Spot data: Binance WebSocket stream (btcusdt/ethusdt/solusdt @kline_1m) running
-           as a background thread, writing to /tmp/spot_buffer.json.
+Model: downloaded from HuggingFace on startup (artbreguez/polymarket-btc-model).
+Spot data: Binance WebSocket stream (btcusdt @kline_1m) running as a background
+           thread, writing to /tmp/spot_buffer.json. BTC buffer = 300 candles (5h)
+           to support btc_pre_4h_ret feature.
+
+Feature parity: build_features() matches train_v8_modal.py tick_features_v8() exactly:
+  - 6x30s sub-windows (btc_up_w0..w5) + per-window zscores
+  - multi-scale up_ratio zscore (5/10/20 slots)
+  - time-weighted order flow, VWAP trend, volume-weighted momentum
+  - lag outcomes + lag streak from _slot_history ring buffer
+  - BTC-only spot: inslot_ret/vol, pre_5m/15m/30m/1h/4h_ret/vol, dist_1k/5k/10k
+  - OB features filled with neutral defaults (not available live)
 """
 
 import gc
@@ -88,9 +97,9 @@ _http.headers.update({"User-Agent": "polymarket-btc-trader/2.0"})
 
 # ── Spot daemon (background thread) ───────────────────────────────────────────
 _spot_buffers: dict[str, deque] = {
-    "btcusdt": deque(maxlen=75),
-    "ethusdt": deque(maxlen=75),
-    "solusdt": deque(maxlen=75),
+    "btcusdt": deque(maxlen=300),  # 5h of 1m candles — needed for btc_pre_4h_ret
+    "ethusdt": deque(maxlen=75),   # kept for future use; not used by v8
+    "solusdt": deque(maxlen=75),   # kept for future use; not used by v8
 }
 _spot_last_write = 0.0
 
@@ -109,9 +118,10 @@ def _write_spot_buffer():
 
 def _seed_spot_buffers():
     for sym in _spot_buffers:
+        limit = 300 if sym == "btcusdt" else 75  # BTC needs 4h+ history
         try:
             r = _http.get(f"{BINANCE_REST}/klines",
-                             params={"symbol": sym.upper(), "interval": "1m", "limit": 75},
+                             params={"symbol": sym.upper(), "interval": "1m", "limit": limit},
                              timeout=HTTP_TIMEOUT)
             if r.ok:
                 for k in r.json():
@@ -404,45 +414,78 @@ def _window_feats(prices, label, wname):
             f"{label}_{wname}_mom": mom}
 
 def build_spot_features(slot_ts: int) -> dict:
+    """Build BTC spot features matching train_v8_modal.py exactly.
+
+    Windows (BTC only — v8 is BTC-only):
+      btc_inslot_ret / btc_inslot_vol  — [slot_ts, slot_ts+180s]
+      btc_pre_5m_ret / _vol            — [slot_ts-300,  slot_ts]
+      btc_pre_15m_ret / _vol           — [slot_ts-900,  slot_ts]
+      btc_pre_30m_ret / _vol           — [slot_ts-1800, slot_ts]
+      btc_pre_1h_ret  / _vol           — [slot_ts-3600, slot_ts]
+      btc_pre_4h_ret  / _vol           — [slot_ts-14400,slot_ts]
+      btc_dist_1k / _5k / _10k        — round-number proximity
+    """
     feat: dict = {}
-    label_map = {"btcusdt": "btc", "ethusdt": "eth", "solusdt": "sol"}
+    zeros = {
+        "btc_inslot_ret": 0.0, "btc_inslot_vol": 0.0,
+        "btc_pre_5m_ret": 0.0,  "btc_pre_5m_vol": 0.0,
+        "btc_pre_15m_ret": 0.0, "btc_pre_15m_vol": 0.0,
+        "btc_pre_30m_ret": 0.0, "btc_pre_30m_vol": 0.0,
+        "btc_pre_1h_ret": 0.0,  "btc_pre_1h_vol": 0.0,
+        "btc_pre_4h_ret": 0.0,  "btc_pre_4h_vol": 0.0,
+        "btc_dist_1k": 0.5, "btc_dist_5k": 0.5, "btc_dist_10k": 0.5,
+    }
     if not SPOT_BUFFER.exists():
         log.warning("spot_buffer missing — filling zeros")
-        for label in label_map.values():
-            for wname in ["inslot_3m", "pre_3m", "pre_15m", "pre_1h"]:
-                feat.update({f"{label}_{wname}_ret": 0.0,
-                              f"{label}_{wname}_vol": 0.0,
-                              f"{label}_{wname}_mom": 0.0})
-            feat[f"{label}_pct_of_1h_range"] = 0.5
-        return feat
+        return zeros
+
     try:
         buf = json.loads(SPOT_BUFFER.read_text())
     except Exception as e:
         log.warning("spot_buffer read error: %s", e)
-        return feat
+        return zeros
+
     age = int(time.time()) - buf.get("updated_at", 0)
     if age > BUFFER_STALE:
         log.warning("spot_buffer is %ds stale", age)
-    for sym, label in label_map.items():
-        candles = buf.get(sym, [])
-        ts_arr = np.array([c[0] for c in candles], dtype=np.int64)
-        px_arr = np.array([c[1] for c in candles], dtype=np.float64)
-        def slice_px(lo, hi):
-            mask = (ts_arr >= lo) & (ts_arr < hi)
-            return px_arr[mask].tolist()
-        for wname, (lo, hi) in {
-            "inslot_3m": (slot_ts,       slot_ts + OBSERVE_SECS),
-            "pre_3m":    (slot_ts - 180,  slot_ts),
-            "pre_15m":   (slot_ts - 900,  slot_ts),
-            "pre_1h":    (slot_ts - 3600, slot_ts),
-        }.items():
-            feat.update(_window_feats(slice_px(lo, hi), label, wname))
-        px_1h = slice_px(slot_ts - 3600, slot_ts)
-        if len(px_1h) > 1:
-            lo1h, hi1h = min(px_1h), max(px_1h)
-            feat[f"{label}_pct_of_1h_range"] = float((px_1h[-1] - lo1h) / (hi1h - lo1h + 1e-8))
-        else:
-            feat[f"{label}_pct_of_1h_range"] = 0.5
+
+    candles = buf.get("btcusdt", [])
+    if not candles:
+        return zeros
+
+    ts_arr = np.array([c[0] for c in candles], dtype=np.int64)
+    px_arr = np.array([c[1] for c in candles], dtype=np.float64)
+
+    def _seg(lo: int, hi: int) -> np.ndarray:
+        mask = (ts_arr >= lo) & (ts_arr < hi)
+        return px_arr[mask]
+
+    def _ret_vol(seg: np.ndarray) -> tuple[float, float]:
+        if len(seg) < 2:
+            return 0.0, 0.0
+        ret = float((seg[-1] - seg[0]) / (seg[0] + 1e-8))
+        vol = float(np.std(seg) / (np.mean(seg) + 1e-8))
+        return ret, vol
+
+    # Inslot: [slot_ts, slot_ts+OBSERVE_SECS)
+    seg_inslot = _seg(slot_ts, slot_ts + OBSERVE_SECS)
+    feat["btc_inslot_ret"], feat["btc_inslot_vol"] = _ret_vol(seg_inslot)
+
+    # Pre-slot windows
+    for w_s, lbl in [(300, "5m"), (900, "15m"), (1800, "30m"), (3600, "1h"), (14400, "4h")]:
+        seg = _seg(slot_ts - w_s, slot_ts)
+        feat[f"btc_pre_{lbl}_ret"], feat[f"btc_pre_{lbl}_vol"] = _ret_vol(seg)
+
+    # Round-number proximity (use slot_open price)
+    idx = np.searchsorted(ts_arr, slot_ts, side="right") - 1
+    spot_open = float(px_arr[idx]) if idx >= 0 else 0.0
+    if spot_open > 0:
+        feat["btc_dist_1k"]  = float(abs(spot_open % 1000) / 1000)
+        feat["btc_dist_5k"]  = float(abs(spot_open % 5000) / 5000)
+        feat["btc_dist_10k"] = float(abs(spot_open % 10000) / 10000)
+    else:
+        feat["btc_dist_1k"] = feat["btc_dist_5k"] = feat["btc_dist_10k"] = 0.5
+
     return feat
 
 
@@ -567,72 +610,197 @@ def fetch_inslot_trades(yes_token: str, no_token: str, slot_ts: int) -> list[dic
 
 def build_features(ticks: list[dict], slot_ts: int, features: list[str]) -> dict | None:
     """
-    Build real-time features for the v4 model.
-    Uses inslot ticks (from data-api, ~120s lag) + Binance spot buffer + time.
+    Build real-time features matching train_v8_modal.py tick_features_v8() exactly.
+
+    Tick features computed from inslot trades [t=0, t=180s):
+      - 6x30s sub-windows (btc_up_w0..w5)
+      - per-sub-window zscores vs _slot_history (btc_up_w0_zscore..w5_zscore)
+      - multi-scale up_ratio zscore (5/10/20 slots: btc_up_ratio_zscore_5s/10s/20s)
+      - time-weighted order flow (btc_tw_up_ratio)
+      - VWAP trend (btc_vwap_trend)
+      - volume-weighted momentum (btc_vwmom)
+      - tick acceleration (btc_tick_accel)
+      - lag outcomes (lag_1/2/3_outcome, lag_streak) from _slot_history
+      - OB features: filled with 0.5/0 (no live OB available in real-time)
+
+    Spot features from Binance buffer (build_spot_features):
+      btc_inslot_ret/vol, btc_pre_5m/15m/30m/1h/4h_ret/vol, btc_dist_1k/5k/10k
+
+    Historical context from _slot_history ring buffer (last 20 slots).
     """
-    # Time features
+    OBS = OBSERVE_SECS  # 180s
+
+    # ── Time features ──────────────────────────────────────────────────────────
     dt   = datetime.fromtimestamp(slot_ts, tz=timezone.utc)
     hour = dt.hour + dt.minute / 60.0
-    dow  = dt.weekday()
-
     feat: dict = {
         "hour_sin": math.sin(2 * math.pi * hour / 24),
         "hour_cos": math.cos(2 * math.pi * hour / 24),
-        "dow_sin":  math.sin(2 * math.pi * dow / 7),
-        "dow_cos":  math.cos(2 * math.pi * dow / 7),
+        "dow_sin":  math.sin(2 * math.pi * dt.weekday() / 7),
+        "dow_cos":  math.cos(2 * math.pi * dt.weekday() / 7),
     }
 
-    # ── Order flow features from inslot ticks ────────────────────────────────
+    # ── Order flow from inslot ticks ───────────────────────────────────────────
     if ticks:
-        up   = [t for t in ticks if t.get("outcome") == "Up"]
-        dn   = [t for t in ticks if t.get("outcome") == "Down"]
-        vol_up = sum(t["size"] for t in up)
-        vol_dn = sum(t["size"] for t in dn)
-        total  = vol_up + vol_dn + 1e-8
         n      = len(ticks)
+        vol_up = sum(t["size"] for t in ticks if t.get("outcome") == "Up")
+        vol_dn = sum(t["size"] for t in ticks if t.get("outcome") == "Down")
+        total  = vol_up + vol_dn + 1e-8
 
-        vwap_up = sum(t["price"] * t["size"] for t in up) / (vol_up + 1e-8) if up else 0.5
-        vwap_dn = sum(t["price"] * t["size"] for t in dn) / (vol_dn + 1e-8) if dn else 0.5
+        up_tks = [t for t in ticks if t.get("outcome") == "Up"]
+        dn_tks = [t for t in ticks if t.get("outcome") == "Down"]
+        vwap_up = sum(t["price"] * t["size"] for t in up_tks) / (vol_up + 1e-8) if up_tks else 0.5
+        vwap_dn = sum(t["price"] * t["size"] for t in dn_tks) / (vol_dn + 1e-8) if dn_tks else 0.5
 
-        def ur(subset):
+        def _ur_w(subset: list[dict]) -> float:
             vu = sum(t["size"] for t in subset if t.get("outcome") == "Up")
-            t_ = sum(t["size"] for t in subset) + 1e-8
-            return vu / t_
+            tt = sum(t["size"] for t in subset) + 1e-8
+            return float(vu / tt)
 
-        w0 = [t for t in ticks if t["t_sec"] < 60]
-        w1 = [t for t in ticks if 60 <= t["t_sec"] < 120]
-        w2 = [t for t in ticks if t["t_sec"] >= 120]
+        # 6x30s sub-windows
+        sw: dict = {}
+        for i in range(6):
+            t0_w, t1_w = i * 30, (i + 1) * 30
+            sub = [t for t in ticks if t0_w <= t["t_sec"] < t1_w]
+            sw[f"btc_up_w{i}"] = _ur_w(sub) if sub else 0.5
 
-        up_w0 = ur(w0); up_w1 = ur(w1); up_w2 = ur(w2)
+        # Momentum: mean(last 3 windows) - mean(first 3 windows)
+        w_vals = [sw[f"btc_up_w{i}"] for i in range(6)]
+        btc_momentum = float(np.mean(w_vals[3:]) - np.mean(w_vals[:3]))
+
+        # Time-weighted order flow: exp decay toward slot end
+        if n > 0:
+            t_secs  = np.array([t["t_sec"] for t in ticks], dtype=np.float64)
+            is_up_v = np.array([1.0 if t.get("outcome") == "Up" else 0.0 for t in ticks])
+            weights = np.exp(t_secs / OBS * 2.0)
+            weights /= weights.sum() + 1e-8
+            tw_up = float((weights * is_up_v).sum())
+        else:
+            tw_up = 0.5
+
+        # VWAP trend: early half vs late half
+        half = OBS / 2
+        early = [t for t in ticks if t["t_sec"] < half]
+        late  = [t for t in ticks if t["t_sec"] >= half]
+        def _vwap_up_half(grp: list[dict]) -> float:
+            up = [t for t in grp if t.get("outcome") == "Up"]
+            if not up: return 0.5
+            return float(sum(t["price"] * t["size"] for t in up) /
+                         (sum(t["size"] for t in up) + 1e-8))
+        vwap_trend = float(_vwap_up_half(late) - _vwap_up_half(early))
+
+        # Volume-weighted momentum across 6 windows
+        vol_by_w = np.array([
+            sum(t["size"] for t in ticks if i*30 <= t["t_sec"] < (i+1)*30)
+            for i in range(6)
+        ], dtype=np.float64)
+        ur_by_w  = np.array([sw[f"btc_up_w{i}"] for i in range(6)], dtype=np.float64)
+        tw_vol   = vol_by_w.sum() + 1e-8
+        vwmom    = float(np.dot(vol_by_w / tw_vol, ur_by_w - 0.5))
+
+        # Tick acceleration: last 30s vs first 30s
+        first30 = sum(1 for t in ticks if t["t_sec"] < 30)
+        last30  = sum(1 for t in ticks if t["t_sec"] >= OBS - 30)
+        tick_accel = float((last30 - first30) / (first30 + 1e-8))
 
         feat.update({
             "btc_n_ticks":     float(n),
-            "btc_vol_up":      vol_up,
-            "btc_vol_dn":      vol_dn,
-            "btc_up_ratio":    vol_up / total,
-            "btc_vwap_up":     vwap_up,
-            "btc_vwap_dn":     vwap_dn,
-            "btc_vwap_spread": vwap_up - vwap_dn,
-            "btc_buy_ratio":   sum(1 for t in ticks if t.get("side") == "BUY") / (n + 1e-8),
-            "btc_avg_size":    total / n,
-            "btc_momentum":    up_w2 - up_w0,
-            "btc_up_w0":       up_w0,
-            "btc_up_w1":       up_w1,
-            "btc_up_w2":       up_w2,
+            "btc_vol_up":      float(vol_up),
+            "btc_vol_dn":      float(vol_dn),
+            "btc_vol_ratio":   float(vol_up / (vol_dn + 1e-8)),
+            "btc_up_ratio":    float(vol_up / total),
+            "btc_vwap_up":     float(vwap_up),
+            "btc_vwap_dn":     float(vwap_dn),
+            "btc_vwap_spread": float(vwap_up - vwap_dn),
+            "btc_buy_ratio":   float(sum(1 for t in ticks if t.get("side") == "BUY") / (n + 1e-8)),
+            "btc_avg_size":    float(total / n),
+            "btc_momentum":    btc_momentum,
+            "btc_tw_up_ratio": tw_up,
+            "btc_vwap_trend":  vwap_trend,
+            "btc_vwmom":       vwmom,
+            "btc_tick_accel":  tick_accel,
+            **sw,
         })
+        cur_up_ratio = float(vol_up / total)
     else:
-        # No ticks yet — fill with neutral values (not zeros for ratio features)
+        # No ticks — neutral fill
         feat.update({
             "btc_n_ticks": 0.0, "btc_vol_up": 0.0, "btc_vol_dn": 0.0,
-            "btc_up_ratio": 0.5, "btc_vwap_up": 0.5, "btc_vwap_dn": 0.5,
-            "btc_vwap_spread": 0.0, "btc_buy_ratio": 0.5, "btc_avg_size": 0.0,
-            "btc_momentum": 0.0, "btc_up_w0": 0.5, "btc_up_w1": 0.5, "btc_up_w2": 0.5,
+            "btc_vol_ratio": 1.0, "btc_up_ratio": 0.5,
+            "btc_vwap_up": 0.5, "btc_vwap_dn": 0.5, "btc_vwap_spread": 0.0,
+            "btc_buy_ratio": 0.5, "btc_avg_size": 0.0, "btc_momentum": 0.0,
+            "btc_tw_up_ratio": 0.5, "btc_vwap_trend": 0.0,
+            "btc_vwmom": 0.0, "btc_tick_accel": 0.0,
+            **{f"btc_up_w{i}": 0.5 for i in range(6)},
         })
+        cur_up_ratio = 0.5
 
-    # ── Pre-slot spot returns (from Binance buffer) ───────────────────────────
+    # ── Historical zscore features (from ring buffer) ──────────────────────────
+    # _slot_history: list of {"slot_ts", "up_ratio", "target", "sw": [6 floats]}
+    # populated by _update_slot_history() after each prediction
+    hist = _slot_history  # module-level ring buffer
+
+    # Multi-scale up_ratio zscore (5 / 10 / 20 slots lookback)
+    for win, lbl in [(5, "5s"), (10, "10s"), (20, "20s")]:
+        past = [h["up_ratio"] for h in hist[-win:]] if hist else []
+        if len(past) >= 3:
+            mu, sd = float(np.mean(past)), float(np.std(past))
+            feat[f"btc_up_ratio_zscore_{lbl}"]    = float((cur_up_ratio - mu) / (sd + 1e-8))
+            feat[f"btc_up_ratio_hist_mean_{lbl}"] = mu
+        else:
+            feat[f"btc_up_ratio_zscore_{lbl}"]    = 0.0
+            feat[f"btc_up_ratio_hist_mean_{lbl}"] = 0.5
+
+    # Per-sub-window zscore vs last 20 slots
+    cur_sws = [feat.get(f"btc_up_w{i}", 0.5) for i in range(6)]
+    for i in range(6):
+        past_sw = [h["sw"][i] for h in hist[-20:] if "sw" in h] if hist else []
+        if len(past_sw) >= 5:
+            mu, sd = float(np.mean(past_sw)), float(np.std(past_sw))
+            feat[f"btc_up_w{i}_zscore"] = float((cur_sws[i] - mu) / (sd + 1e-8))
+        else:
+            feat[f"btc_up_w{i}_zscore"] = 0.0
+
+    # Realized vol (std of pre-slot returns over last 5/10 slots)
+    for win, lbl in [(5, "5s"), (10, "10s")]:
+        past_rets = [h.get("pre_ret", 0.0) for h in hist[-win:]] if hist else []
+        feat[f"btc_realized_vol_{lbl}"] = float(np.std(past_rets)) if len(past_rets) >= 3 else 0.0
+
+    # Lag outcomes
+    n_hist = len(hist)
+    for lag in [1, 2, 3]:
+        if n_hist >= lag and hist[-lag].get("target") is not None:
+            feat[f"lag_{lag}_outcome"] = float(hist[-lag]["target"])
+        else:
+            feat[f"lag_{lag}_outcome"] = 0.5
+
+    # Lag streak
+    streak = 0
+    if n_hist >= 1 and hist[-1].get("target") is not None:
+        last_val = hist[-1]["target"]
+        for back in range(1, min(n_hist + 1, 6)):
+            v = hist[-back].get("target")
+            if v == last_val and v is not None:
+                streak += 1
+            else:
+                break
+    feat["lag_streak"] = float(streak)
+
+    # ── OB features: not available live → fill with neutral defaults ───────────
+    # In training, ob_up_bid ≈ market mid price (implied prob proxy).
+    # Best live approximation: use Gamma outcomePrices (already fetched for edge check).
+    # Fill with 0.5/0 — model was trained with real OB so these will be slightly off,
+    # but it's better than zeros which were the training default for missing OB.
+    feat.update({
+        "ob_up_bid": 0.5, "ob_up_ask": 0.5, "ob_up_spread": 0.0,
+        "ob_implied_prob": 0.5, "ob_up_bid_depth": 0.0,
+        "ob_up_ask_depth": 0.0, "ob_up_imbalance": 0.0,
+    })
+
+    # ── Spot features ──────────────────────────────────────────────────────────
     feat.update(build_spot_features(slot_ts))
 
-    # Fill any missing features with 0
+    # ── Final: fill any remaining model features with 0 ───────────────────────
     for f in features:
         feat.setdefault(f, 0.0)
     return feat
@@ -640,6 +808,33 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str]) -> dict
 
 
 
+
+
+# ── Slot history ring buffer (for zscore/lag features in build_features) ───────
+# Each entry: {slot_ts, up_ratio, sw: [6 floats], pre_ret: float, target: int|None}
+# 'target' is filled in by settle_trades() or left None until settlement.
+_slot_history: list[dict] = []
+_HIST_MAX = 25  # keep last 25 slots (enough for 20-slot zscore window)
+
+def _update_slot_history(slot_ts: int, up_ratio: float, sw: list[float],
+                          pre_ret: float = 0.0, target: int | None = None):
+    """Append or update a slot entry in the ring buffer."""
+    global _slot_history
+    # Update if already present (e.g. when target resolves)
+    for entry in _slot_history:
+        if entry["slot_ts"] == slot_ts:
+            if target is not None:
+                entry["target"] = target
+            return
+    _slot_history.append({
+        "slot_ts":  slot_ts,
+        "up_ratio": up_ratio,
+        "sw":       sw,
+        "pre_ret":  pre_ret,
+        "target":   target,
+    })
+    if len(_slot_history) > _HIST_MAX:
+        _slot_history = _slot_history[-_HIST_MAX:]
 
 
 # ── Trades log ─────────────────────────────────────────────────────────────────
@@ -773,6 +968,9 @@ def settle_trades(trades: list[dict]) -> bool:
             log.warning("  Unresolvable resolution value: %r — skipping", resolution)
             continue
         actual     = "UP" if resolution >= 0.5 else "DOWN"
+        target_int = 1 if actual == "UP" else 0
+        # Backfill resolved target into slot history (improves future lag features)
+        _update_slot_history(trade["slot_ts"], up_ratio=0.5, sw=[0.5]*6, target=target_int)
         direction  = trade["direction"]
         entry      = trade["entry_price"]
         # Use actual_cost if stored (bumped-to-min-5 case), else derive from stake
@@ -852,9 +1050,18 @@ def run(client, model, features):
             feat = build_features(ticks, slot_ts, features)
             if feat is None:
                 continue
-            log.info("  btc_up_ratio=%.3f momentum=%.3f n_ticks=%d",
+
+            # Push this slot into history ring buffer (target unknown until settlement)
+            _update_slot_history(
+                slot_ts=slot_ts,
+                up_ratio=feat.get("btc_up_ratio", 0.5),
+                sw=[feat.get(f"btc_up_w{i}", 0.5) for i in range(6)],
+                pre_ret=feat.get("btc_pre_5m_ret", 0.0),
+            )
+
+            log.info("  btc_up_ratio=%.3f momentum=%.3f tw=%.3f n_ticks=%d",
                      feat.get("btc_up_ratio", 0.5), feat.get("btc_momentum", 0),
-                     int(feat.get("btc_n_ticks", 0)))
+                     feat.get("btc_tw_up_ratio", 0.5), int(feat.get("btc_n_ticks", 0)))
 
             X = pd.DataFrame([[feat.get(f, 0.0) for f in features]], columns=features)
             prob_up = predict_proba(model, X)
