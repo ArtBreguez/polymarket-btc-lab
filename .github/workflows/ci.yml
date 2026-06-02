@@ -24,7 +24,7 @@ jobs:
           uv sync
 
       - name: Run tests
-        run: uv run pytest tests/ -v
+        run: uv run --with pytest pytest tests/ -v
 
   validate-model:
     name: Validate champion model
