@@ -92,6 +92,15 @@ def main():
             if k in row:
                 row[k] = v
         X = pd.DataFrame([row], columns=features)
+        # Support both plain model and ensemble dict (v7+)
+        if isinstance(model, dict) and model.get("ensemble"):
+            lgb_p = model["lgb"].predict_proba(X)[0, 1]
+            lr_p  = model["lr"].predict_proba(X)[0, 1]
+            w = model.get("lgb_weight", 0.65)
+            return float(lgb_p * w + lr_p * (1 - w))
+        elif isinstance(model, dict):
+            m = model.get("lgb", model)
+            return float(m.predict_proba(X)[0, 1])
         return float(model.predict_proba(X)[0, 1])
 
     # Neutral: realistic 50/50 order flow (not all-zeros which = extreme bearish for ratio features)
