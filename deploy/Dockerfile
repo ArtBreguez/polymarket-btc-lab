@@ -1,0 +1,14 @@
+FROM python:3.12-slim
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y libgomp1 && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY live_trader.py .
+
+# Model is downloaded from HuggingFace at startup via HF_TOKEN secret.
+# No pkl bundled in image — always pulls champion.pkl from artbreguez/polymarket-btc-model.
+
+CMD ["python", "-u", "live_trader.py"]

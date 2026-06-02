@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install uv
+          uv sync
+
+      - name: Run tests
+        run: uv run pytest tests/ -v
+
+  validate-model:
+    name: Validate champion model
+    runs-on: ubuntu-latest
+    # Only run on main or when deploy/ files change
+    if: github.ref == 'refs/heads/main' || contains(github.event.commits[0].modified, 'deploy/')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ML deps
+        run: pip install huggingface_hub lightgbm==4.6.0 scikit-learn==1.8.0 pandas==2.2.3 numpy==1.26.4
+
+      - name: Validate champion model
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python scripts/validate_model.py

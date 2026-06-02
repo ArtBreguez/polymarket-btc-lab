@@ -1,0 +1,14 @@
+app = "polymarket-maker-mm"
+primary_region = "ams"
+
+[build]
+
+[env]
+  PYTHONUNBUFFERED = "1"
+
+[[vm]]
+  size = "performance-1x"
+  memory = "2048mb"
+
+[processes]
+  app = "python -u live_trader.py"

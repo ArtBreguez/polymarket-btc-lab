@@ -1,0 +1,975 @@
+"""
+live_trader.py — BTC Directional Live Trader v2
+================================================
+Runs the v2 ML model on Polymarket BTC 5-minute markets.
+
+Strategy:
+  - Observe first 3 min of each 5m slot (order flow from CLOB)
+  - Predict UP or DOWN at t=170–240s
+  - Enter only if confidence > 60% AND edge (model_prob - ask_price) >= 10%
+  - Flat stake: $1.50 USDC per trade
+  - Settle 60s after slot end
+
+Credentials (Fly secrets):
+  POLY_PRIVATE_KEY      — EOA private key
+  POLY_SAFE_ADDRESS     — Proxy wallet (0x362095...)
+  MM_BUILDER_KEY        — Builder API key
+  MM_BUILDER_SECRET     — Builder API secret
+  MM_BUILDER_PASSPHRASE — Builder API passphrase
+
+Model: downloaded from HuggingFace on startup (BrockMisner/polymarket-btc-updown).
+Spot data: Binance WebSocket stream (btcusdt/ethusdt/solusdt @kline_1m) running
+           as a background thread, writing to /tmp/spot_buffer.json.
+"""
+
+import gc
+import json
+import logging
+import math
+import os
+import pickle
+import queue as _queue_mod
+import threading
+import time
+from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
+
+import asyncio
+import numpy as np
+import pandas as pd
+import requests
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+PRIVATE_KEY    = os.environ["POLY_PRIVATE_KEY"]
+PROXY_WALLET   = os.environ["POLY_SAFE_ADDRESS"]
+BUILDER_KEY    = os.environ["MM_BUILDER_KEY"]
+BUILDER_SECRET = os.environ["MM_BUILDER_SECRET"]
+BUILDER_PASS   = os.environ["MM_BUILDER_PASSPHRASE"]
+
+GAMMA_HOST      = "https://gamma-api.polymarket.com"
+DATA_API        = "https://data-api.polymarket.com"
+CLOB_URL        = "https://clob.polymarket.com"
+CLOB_WS_URL     = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+BINANCE_WS      = "wss://stream.binance.com:9443/stream?streams=btcusdt@kline_1m/ethusdt@kline_1m/solusdt@kline_1m"
+BINANCE_REST    = "https://api.binance.com/api/v3"
+
+HTTP_TIMEOUT    = 3    # seconds — tight budget for a 10s loop
+MAX_TRADE_PAGES = 2    # max pages from data-api per token (500/page = 1000 trades max)
+
+SLOT_DURATION   = 300
+OBSERVE_SECS    = 180
+ENTER_WINDOW    = (170, 240)
+SETTLE_GRACE    = 60
+MIN_CONFIDENCE  = 0.60
+MIN_EDGE        = 0.10
+MIN_EDGE_MID    = 0.05          # edge vs market mid (catches stale ask)
+TAKER_FEE       = 0.02          # Polymarket taker fee ~2%
+STAKE_USDC      = 1.50          # capped at $1.50 per trade
+BUFFER_STALE    = 120
+
+MODEL_PATH  = Path("/tmp/champion.pkl")
+HF_REPO     = "artbreguez/polymarket-btc-model"
+HF_TOKEN    = os.environ.get("HF_TOKEN")
+TRADES_FILE = Path("/tmp/live_trades.json")
+SPOT_BUFFER = Path("/tmp/spot_buffer.json")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("live_trader")
+
+# Shared HTTP session — connection keep-alive, no TCP handshake per call
+_http = requests.Session()
+_http.headers.update({"User-Agent": "polymarket-btc-trader/2.0"})
+
+
+# ── Spot daemon (background thread) ───────────────────────────────────────────
+_spot_buffers: dict[str, deque] = {
+    "btcusdt": deque(maxlen=75),
+    "ethusdt": deque(maxlen=75),
+    "solusdt": deque(maxlen=75),
+}
+_spot_last_write = 0.0
+
+def _write_spot_buffer():
+    global _spot_last_write
+    now = time.time()
+    if now - _spot_last_write < 1.0:
+        return
+    payload = {"updated_at": int(now)}
+    for sym, dq in _spot_buffers.items():
+        payload[sym] = list(dq)
+    tmp = Path(str(SPOT_BUFFER) + ".tmp")
+    tmp.write_text(json.dumps(payload))
+    tmp.replace(SPOT_BUFFER)
+    _spot_last_write = now
+
+def _seed_spot_buffers():
+    for sym in _spot_buffers:
+        try:
+            r = _http.get(f"{BINANCE_REST}/klines",
+                             params={"symbol": sym.upper(), "interval": "1m", "limit": 75},
+                             timeout=HTTP_TIMEOUT)
+            if r.ok:
+                for k in r.json():
+                    _spot_buffers[sym].append([k[0] // 1000, float(k[4])])
+                log.info("Spot seed %s: %d candles", sym.upper(), len(_spot_buffers[sym]))
+        except Exception as e:
+            log.warning("Spot seed %s failed: %s", sym, e)
+    _write_spot_buffer()
+
+def _spot_daemon_thread():
+    """Background thread: WS stream → buffer → /tmp/spot_buffer.json"""
+    import websockets
+
+    async def _run():
+        _seed_spot_buffers()
+        while True:
+            try:
+                async with websockets.connect(BINANCE_WS, ping_interval=20, ping_timeout=10) as ws:
+                    log.info("Spot daemon connected")
+                    async for raw in ws:
+                        msg = json.loads(raw)
+                        sym = msg.get("stream", "").split("@")[0]
+                        if sym not in _spot_buffers:
+                            continue
+                        k = msg.get("data", {}).get("k", {})
+                        if not k:
+                            continue
+                        ts_s = k["t"] // 1000
+                        close = float(k["c"])
+                        dq = _spot_buffers[sym]
+                        if dq and dq[-1][0] == ts_s:
+                            dq[-1][1] = close
+                        else:
+                            dq.append([ts_s, close])
+                        _write_spot_buffer()
+            except Exception as e:
+                log.warning("Spot WS error: %s — reconnecting in 5s", e)
+                await asyncio.sleep(5)
+
+    asyncio.run(_run())
+
+def start_spot_daemon():
+    t = threading.Thread(target=_spot_daemon_thread, daemon=True, name="spot-daemon")
+    t.start()
+    log.info("Spot daemon thread started")
+    # Wait up to 10s for initial seed
+    for _ in range(10):
+        if SPOT_BUFFER.exists():
+            return
+        time.sleep(1)
+    log.warning("Spot buffer not ready after 10s — continuing anyway")
+
+
+# ── CLOB WebSocket daemon (background thread) ──────────────────────────────────
+_clob_prices: dict[str, float] = {}
+_clob_price_ts: dict[str, float] = {}   # token_id → timestamp of last price update
+_clob_prices_lock = threading.Lock()
+_clob_subscribed: set[str] = set()
+_token_slot: dict[str, int] = {}   # token_id → slot_ts for pruning
+_subscribe_queue: _queue_mod.Queue = _queue_mod.Queue()
+
+
+def clob_subscribe(token_ids: list[str], slot_ts: int = 0):
+    """Queue token_ids for the CLOB WS daemon to subscribe to."""
+    for tid in token_ids:
+        _subscribe_queue.put((tid, slot_ts))
+
+
+PRICE_MAX_AGE = 15.0   # seconds — reject WS price older than this
+
+def get_ask_price_ws(token_id: str) -> float | None:
+    """Return best ask from WS cache only if fresh (<15s). None triggers HTTP fallback."""
+    with _clob_prices_lock:
+        price = _clob_prices.get(token_id)
+        ts    = _clob_price_ts.get(token_id, 0)
+    if price is None:
+        return None
+    age = time.time() - ts
+    if age > PRICE_MAX_AGE:
+        log.debug("WS ask for %s is %.1fs old — stale, using HTTP fallback", token_id[:12], age)
+        return None
+    return price
+
+
+def _clob_daemon_thread():
+    """Background thread: CLOB WS → _clob_prices dict."""
+    import websockets
+
+    async def _clob_run():
+        while True:
+            try:
+                # No ping_interval — Polymarket WS server doesn't support WS-level pings
+                # and will drop the connection if it receives an unexpected frame.
+                async with websockets.connect(
+                    CLOB_WS_URL, ping_interval=None, close_timeout=5
+                ) as ws:
+                    log.info("CLOB WS daemon connected")
+                    last_send = time.time()
+
+                    # Clear stale prices on reconnect — book snapshots arrive fresh below
+                    with _clob_prices_lock:
+                        _clob_prices.clear()
+                        _clob_price_ts.clear()
+
+                    # Prune stale tokens — only keep current + next 3 slots
+                    now_ts = int(time.time())
+                    cur = (now_ts // SLOT_DURATION) * SLOT_DURATION
+                    active_cutoff = cur - SLOT_DURATION
+                    with _clob_prices_lock:
+                        stale = {tid for tid in _clob_subscribed
+                                 if _token_slot.get(tid, 0) < active_cutoff}
+                        for tid in stale:
+                            _clob_subscribed.discard(tid)
+                            _clob_prices.pop(tid, None)
+                            _token_slot.pop(tid, None)
+                        existing = list(_clob_subscribed)
+                    if stale:
+                        log.info("CLOB WS pruned %d stale tokens", len(stale))
+                    if existing:
+                        await ws.send(json.dumps({"type": "Market", "assets_ids": existing}))
+                        log.info("CLOB WS re-subscribed %d tokens", len(existing))
+                        last_send = time.time()
+
+                    # Drain any queued subscription requests that arrived before connect
+                    pending: list[tuple[str,int]] = []
+                    while True:
+                        try:
+                            pending.append(_subscribe_queue.get_nowait())
+                        except _queue_mod.Empty:
+                            break
+                    if pending:
+                        new_tokens = [t for t, _ in pending if t not in _clob_subscribed]
+                        if new_tokens:
+                            _clob_subscribed.update(new_tokens)
+                            for t, s in pending:
+                                if s:
+                                    _token_slot[t] = s
+                            await ws.send(json.dumps({"type": "Market", "assets_ids": new_tokens}))
+                            log.info("CLOB WS subscribed %d new tokens", len(new_tokens))
+                            last_send = time.time()
+
+                    while True:
+                        # Check for new subscription requests (non-blocking)
+                        pending = []
+                        while True:
+                            try:
+                                pending.append(_subscribe_queue.get_nowait())
+                            except _queue_mod.Empty:
+                                break
+                        if pending:
+                            new_tokens = [t for t, _ in pending if t not in _clob_subscribed]
+                            if new_tokens:
+                                _clob_subscribed.update(new_tokens)
+                                for t, s in pending:
+                                    if s:
+                                        _token_slot[t] = s
+                                await ws.send(json.dumps({"type": "Market", "assets_ids": new_tokens}))
+                                log.info("CLOB WS subscribed %d new tokens", len(new_tokens))
+                                last_send = time.time()
+
+                        # Keepalive: re-subscribe active tokens every 8 min to prevent
+                        # server-side idle timeout (~11 min observed on Polymarket WS)
+                        if time.time() - last_send >= 480:
+                            with _clob_prices_lock:
+                                active = list(_clob_subscribed)
+                            if active:
+                                await ws.send(json.dumps({"type": "Market", "assets_ids": active}))
+                                log.info("CLOB WS keepalive — re-subscribed %d tokens", len(active))
+                            last_send = time.time()
+
+                        # Wait for next WS message with a short timeout so we can poll queue
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        except asyncio.TimeoutError:
+                            continue
+
+                        try:
+                            events = json.loads(raw)
+                        except Exception:
+                            continue
+
+                        # Server may send a list or a single dict
+                        if isinstance(events, dict):
+                            events = [events]
+
+                        for ev in events:
+                            etype = ev.get("event_type")
+                            if etype == "book":
+                                asset_id = ev.get("asset_id", "")
+                                asks = ev.get("asks", [])
+                                valid_asks = [
+                                    float(a["price"])
+                                    for a in asks
+                                    if float(a.get("price", 1)) < 0.97
+                                ]
+                                if valid_asks:
+                                    best = min(valid_asks)
+                                    with _clob_prices_lock:
+                                        _clob_prices[asset_id] = best
+                                        _clob_price_ts[asset_id] = time.time()
+                            elif etype == "price_change":
+                                for change in ev.get("price_changes", []):
+                                    if change.get("side") == "ASK":
+                                        asset_id = change.get("asset_id", "")
+                                        price = float(change.get("price", 1))
+                                        if price < 0.97:
+                                            with _clob_prices_lock:
+                                                _clob_prices[asset_id] = price
+                                                _clob_price_ts[asset_id] = time.time()
+            except Exception as e:
+                log.warning("CLOB WS error: %s — reconnecting in 5s", e)
+                await asyncio.sleep(5)
+
+    asyncio.run(_clob_run())
+
+
+def start_clob_daemon():
+    """Start the CLOB WS daemon thread and pre-subscribe to current + next slot tokens."""
+    t = threading.Thread(target=_clob_daemon_thread, daemon=True, name="clob-daemon")
+    t.start()
+    log.info("CLOB WS daemon thread started")
+
+    # Pre-subscribe to current + next 3 slots on startup (15 min window, avoids mid-session sends)
+    now = int(time.time())
+    cur_slot = (now // SLOT_DURATION) * SLOT_DURATION
+    for i in range(4):
+        slot_ts = cur_slot + i * SLOT_DURATION
+        mkt = fetch_market(slot_ts)
+        if mkt:
+            clob_subscribe([mkt["yes_token"], mkt["no_token"]], slot_ts=slot_ts)
+            log.info("CLOB WS pre-subscribed slot=%d", slot_ts)
+
+
+# ── Model loading ──────────────────────────────────────────────────────────────
+def load_model():
+    """Download champion.pkl from HuggingFace if not cached, then load it."""
+    if not MODEL_PATH.exists():
+        log.info("Downloading champion model from HuggingFace (%s)...", HF_REPO)
+        try:
+            from huggingface_hub import hf_hub_download
+            path = hf_hub_download(
+                repo_id=HF_REPO,
+                filename="champion.pkl",
+                repo_type="model",
+                token=HF_TOKEN,
+                local_dir="/tmp",
+                local_dir_use_symlinks=False,
+            )
+            # hf_hub_download saves to /tmp/champion.pkl (or subdir) — normalise
+            import shutil
+            if Path(path) != MODEL_PATH:
+                shutil.copy(path, MODEL_PATH)
+            log.info("Champion model downloaded: %s", MODEL_PATH)
+        except Exception as e:
+            raise RuntimeError(f"Failed to download champion model from HF: {e}") from e
+    with open(MODEL_PATH, "rb") as f:
+        bundle = pickle.load(f)
+    log.info("Model loaded: %d features, WF AUC=%.3f",
+             len(bundle["features"]), bundle.get("wf_auc", 0))
+    return bundle["model"], bundle["features"]
+
+
+# ── Spot features from buffer ──────────────────────────────────────────────────
+def _window_feats(prices, label, wname):
+    if len(prices) < 2:
+        return {f"{label}_{wname}_ret": 0.0,
+                f"{label}_{wname}_vol": 0.0,
+                f"{label}_{wname}_mom": 0.0}
+    px = np.array(prices, dtype=np.float64)
+    ret = float((px[-1] - px[0]) / (px[0] + 1e-8))
+    vol = float(np.std(np.diff(px) / (px[:-1] + 1e-8)))
+    mid = px[len(px) // 2]
+    mom = float((px[-1] - mid) / (mid + 1e-8))
+    return {f"{label}_{wname}_ret": ret,
+            f"{label}_{wname}_vol": vol,
+            f"{label}_{wname}_mom": mom}
+
+def build_spot_features(slot_ts: int) -> dict:
+    feat: dict = {}
+    label_map = {"btcusdt": "btc", "ethusdt": "eth", "solusdt": "sol"}
+    if not SPOT_BUFFER.exists():
+        log.warning("spot_buffer missing — filling zeros")
+        for label in label_map.values():
+            for wname in ["inslot_3m", "pre_3m", "pre_15m", "pre_1h"]:
+                feat.update({f"{label}_{wname}_ret": 0.0,
+                              f"{label}_{wname}_vol": 0.0,
+                              f"{label}_{wname}_mom": 0.0})
+            feat[f"{label}_pct_of_1h_range"] = 0.5
+        return feat
+    try:
+        buf = json.loads(SPOT_BUFFER.read_text())
+    except Exception as e:
+        log.warning("spot_buffer read error: %s", e)
+        return feat
+    age = int(time.time()) - buf.get("updated_at", 0)
+    if age > BUFFER_STALE:
+        log.warning("spot_buffer is %ds stale", age)
+    for sym, label in label_map.items():
+        candles = buf.get(sym, [])
+        ts_arr = np.array([c[0] for c in candles], dtype=np.int64)
+        px_arr = np.array([c[1] for c in candles], dtype=np.float64)
+        def slice_px(lo, hi):
+            mask = (ts_arr >= lo) & (ts_arr < hi)
+            return px_arr[mask].tolist()
+        for wname, (lo, hi) in {
+            "inslot_3m": (slot_ts,       slot_ts + OBSERVE_SECS),
+            "pre_3m":    (slot_ts - 180,  slot_ts),
+            "pre_15m":   (slot_ts - 900,  slot_ts),
+            "pre_1h":    (slot_ts - 3600, slot_ts),
+        }.items():
+            feat.update(_window_feats(slice_px(lo, hi), label, wname))
+        px_1h = slice_px(slot_ts - 3600, slot_ts)
+        if len(px_1h) > 1:
+            lo1h, hi1h = min(px_1h), max(px_1h)
+            feat[f"{label}_pct_of_1h_range"] = float((px_1h[-1] - lo1h) / (hi1h - lo1h + 1e-8))
+        else:
+            feat[f"{label}_pct_of_1h_range"] = 0.5
+    return feat
+
+
+# ── Market helpers ─────────────────────────────────────────────────────────────
+_market_cache: dict[int, dict] = {}   # slot_ts → market dict, avoids hammering Gamma
+
+def fetch_market(slot_ts: int) -> dict | None:
+    if slot_ts in _market_cache:
+        return _market_cache[slot_ts]
+    slug = f"btc-updown-5m-{slot_ts}"
+    try:
+        r = _http.get(f"{GAMMA_HOST}/markets/slug/{slug}", timeout=HTTP_TIMEOUT)
+        if not r.ok:
+            return None
+        m = r.json()
+        if not m or m.get("closed") or m.get("archived"):
+            return None
+        token_ids = m.get("clobTokenIds", "[]")
+        if isinstance(token_ids, str):
+            token_ids = json.loads(token_ids)
+        if len(token_ids) < 2:
+            return None
+        end_str = m.get("endDate", "") or m.get("endDateIso", "")
+        end_ts = int(datetime.fromisoformat(
+            end_str.replace("Z", "+00:00")).timestamp()) if end_str else slot_ts + SLOT_DURATION
+        result = {
+            "condition_id": m.get("conditionId", ""),
+            "yes_token":    token_ids[0],
+            "no_token":     token_ids[1],
+            "end_ts":       end_ts,
+            "slot_ts":      slot_ts,
+        }
+        # Pre-subscribe WS daemon so prices are ready by entry window
+        clob_subscribe([token_ids[0], token_ids[1]], slot_ts=slot_ts)
+        _market_cache[slot_ts] = result
+        return result
+    except Exception as e:
+        log.warning("fetch_market slot=%d: %s", slot_ts, e)
+        return None
+
+def get_ask_price(token_id: str) -> float:
+    """Get best ask (cost to buy) — tries WS cache first, falls back to HTTP /price."""
+    # Fast path: use pre-cached WS price if available
+    ws_price = get_ask_price_ws(token_id)
+    if ws_price is not None:
+        return ws_price
+    # Fallback: HTTP polling
+    try:
+        r = _http.get(f"{CLOB_URL}/price",
+                         params={"token_id": token_id, "side": "BUY"}, timeout=HTTP_TIMEOUT)
+        if r.ok:
+            price = float(r.json().get("price", 0) or 0)
+            if 0 < price < 1:
+                return price
+    except Exception:
+        pass
+    return 0.5
+
+
+def get_market_mid(slot_ts: int) -> tuple[float, float] | tuple[None, None]:
+    """
+    Get current market mid prices (UP, DOWN) from Gamma outcomePrices.
+    More reliable than ask for edge validation — reflects true market consensus.
+    Returns (up_mid, down_mid) or (None, None) on failure.
+    """
+    slug = f"btc-updown-5m-{slot_ts}"
+    try:
+        r = _http.get(f"{GAMMA_HOST}/markets/slug/{slug}", timeout=HTTP_TIMEOUT)
+        if not r.ok:
+            return None, None
+        m = r.json()
+        op = m.get("outcomePrices", "[]")
+        if isinstance(op, str):
+            op = json.loads(op)
+        if op and len(op) >= 2:
+            up_mid   = float(op[0])
+            down_mid = float(op[1])
+            if 0 < up_mid < 1 and 0 < down_mid < 1:
+                return up_mid, down_mid
+    except Exception:
+        pass
+    return None, None
+
+def fetch_inslot_trades(yes_token: str, no_token: str, slot_ts: int) -> list[dict]:
+    # data-api has ~4-5 minute lag — inslot trades are NOT available at t=180s.
+    # Return empty list; build_features will use price_history + spot only.
+    return []
+
+
+def build_features(ticks: list[dict], slot_ts: int, features: list[str]) -> dict | None:
+    """
+    Build real-time features for the v3 model.
+    Uses CLOB prices-history (UP token) + Binance spot buffer + time only.
+    Order flow dropped: data-api has 4-5 min lag, not available at entry time.
+    """
+    # ── Price series from CLOB prices-history ────────────────────────────────
+    # yes_token is not passed here; we need it from the caller context.
+    # The prices-history call happens in the caller (run()) instead.
+    # This function just assembles the feature dict from pre-computed values.
+    # For compatibility, accept ticks param (ignored).
+
+    # Time features
+    dt   = datetime.fromtimestamp(slot_ts, tz=timezone.utc)
+    hour = dt.hour + dt.minute / 60.0
+    dow  = dt.weekday()
+
+    feat: dict = {
+        "hour":     hour,
+        "hour_sin": math.sin(2 * math.pi * hour / 24),
+        "hour_cos": math.cos(2 * math.pi * hour / 24),
+        "dow_sin":  math.sin(2 * math.pi * dow / 7),
+        "dow_cos":  math.cos(2 * math.pi * dow / 7),
+    }
+    feat.update(build_spot_features(slot_ts))
+    for f in features:
+        feat.setdefault(f, 0.0)
+    return feat
+
+
+
+
+
+
+# ── Trades log ─────────────────────────────────────────────────────────────────
+def load_trades() -> list[dict]:
+    if TRADES_FILE.exists():
+        try:
+            return json.loads(TRADES_FILE.read_text())
+        except Exception:
+            pass
+    return []
+
+
+def rebuild_trades_from_chain(proxy_wallet: str) -> list[dict]:
+    """
+    Reconstruct trade history from Polymarket activity API on startup.
+    Prevents data loss across Fly.io restarts (/tmp is ephemeral).
+    Only covers today's 5m BTC slots.
+    """
+    try:
+        r = _http.get(f"{DATA_API}/activity",
+                         params={"user": proxy_wallet, "limit": 100},
+                         timeout=10)  # rebuild is not in critical path — can wait
+        if not r.ok:
+            return []
+        activity = r.json()
+        if not isinstance(activity, list):
+            return []
+
+        # Group trades and redeems by slug
+        trades_by_slug: dict[str, dict] = {}
+        redeems_by_slug: dict[str, float] = {}
+        now = int(time.time())
+        cutoff = now - 86400  # last 24h
+
+        for item in activity:
+            slug = item.get("slug", "")
+            if "btc-updown-5m" not in slug:
+                continue
+            ts = item.get("timestamp", 0)
+            if ts < cutoff:
+                continue
+            try:
+                slot_ts = int(slug.split("-")[-1])
+            except Exception:
+                continue
+
+            if item["type"] == "TRADE":
+                if slug not in trades_by_slug:
+                    trades_by_slug[slug] = {
+                        "slot_ts":    slot_ts,
+                        "direction":  "UP" if item.get("outcome") == "Up" else "DOWN",
+                        "entry_price": float(item.get("price", 0)),
+                        "shares":     0.0,
+                        "actual_cost": 0.0,
+                        "stake_usdc": STAKE_USDC,
+                        "token_id":   item.get("asset", ""),
+                        "order_id":   item.get("transactionHash", "")[:40],
+                        "entered_at": ts,
+                        "confidence": 0.0,
+                        "true_edge":  0.0,
+                        "source":     "chain_rebuild",
+                    }
+                trades_by_slug[slug]["shares"]     += float(item.get("size", 0))
+                trades_by_slug[slug]["actual_cost"] += float(item.get("usdcSize", 0))
+            elif item["type"] == "REDEEM":
+                redeems_by_slug[slug] = float(item.get("usdcSize", 0))
+
+        # Determine status for each slot
+        rebuilt = []
+        for slug, trade in trades_by_slug.items():
+            slot_ts = trade["slot_ts"]
+            redeemed = redeems_by_slug.get(slug, 0)
+            slot_end = slot_ts + SLOT_DURATION + SETTLE_GRACE
+            if redeemed > 0:
+                cost = trade["actual_cost"]
+                pnl  = round(redeemed - cost, 4)
+                trade.update({"status": "settled", "result": "WIN" if pnl > 0 else "LOSS",
+                               "pnl_usdc": pnl, "settled_at": slot_end,
+                               "actual": trade["direction"]})
+            elif now > slot_end:
+                # Past end + grace with no redeem = LOSS
+                trade.update({"status": "settled", "result": "LOSS",
+                               "pnl_usdc": round(-trade["actual_cost"], 4),
+                               "settled_at": slot_end, "actual": "DOWN" if trade["direction"] == "UP" else "UP"})
+            else:
+                trade["status"] = "open"
+            rebuilt.append(trade)
+
+        rebuilt.sort(key=lambda t: t["slot_ts"])
+        return rebuilt
+    except Exception as e:
+        log.warning("rebuild_trades_from_chain failed: %s", e)
+        return []
+
+def save_trades(trades: list[dict]):
+    TRADES_FILE.write_text(json.dumps(trades, indent=2))
+
+
+# ── Settlement ──────────────────────────────────────────────────────────────────
+def settle_trades(trades: list[dict]) -> bool:
+    now     = int(time.time())
+    updated = False
+    for trade in trades:
+        if trade.get("status") != "open":
+            continue
+        if now < trade["slot_ts"] + SLOT_DURATION + SETTLE_GRACE:
+            continue
+        slug = f"btc-updown-5m-{trade['slot_ts']}"
+        resolution = None
+        try:
+            r = _http.get(f"{GAMMA_HOST}/markets/slug/{slug}", timeout=HTTP_TIMEOUT)
+            if r.ok:
+                data = r.json()
+                resolution = data.get("resolution")
+                if resolution is None:
+                    op = data.get("outcomePrices", "[]")
+                    if isinstance(op, str):
+                        op = json.loads(op)
+                    if op and len(op) >= 2:
+                        if float(op[0]) >= 0.99:
+                            resolution = 1.0
+                        elif float(op[1]) >= 0.99:
+                            resolution = 0.0
+        except Exception:
+            pass
+        if resolution is None:
+            continue
+        try:
+            resolution = float(resolution)
+        except (TypeError, ValueError):
+            log.warning("  Unresolvable resolution value: %r — skipping", resolution)
+            continue
+        actual     = "UP" if resolution >= 0.5 else "DOWN"
+        direction  = trade["direction"]
+        entry      = trade["entry_price"]
+        # Use actual_cost if stored (bumped-to-min-5 case), else derive from stake
+        cost       = trade.get("actual_cost") or trade.get("stake_usdc") or STAKE_USDC
+        shares_out = trade.get("shares") or (cost / (entry + 1e-8))
+        if direction == actual:
+            # Deduct taker fee from gross proceeds
+            pnl    = round(shares_out * (1.0 - TAKER_FEE) - cost, 4)
+            result = "WIN"
+        else:
+            pnl, result = round(-cost, 4), "LOSS"
+        trade.update({"status": "settled", "actual": actual,
+                      "result": result, "pnl_usdc": pnl, "settled_at": now})
+        updated = True
+        log.info("SETTLED slot=%d | %s→%s | %s | P&L $%.2f",
+                 trade["slot_ts"], direction, actual, result, pnl)
+    return updated
+
+
+# ── Main loop ───────────────────────────────────────────────────────────────────
+def run(client, model, features):
+    log.info("Live trader started | stake=$%.2f | min_conf=%.0f%% | min_edge=%.0f%%",
+             STAKE_USDC, MIN_CONFIDENCE*100, MIN_EDGE*100)
+
+    # Print balance
+    try:
+        bal  = client.get_balance_allowance(asset_type="COLLATERAL")
+        usdc = float(bal.balance) / 1e6
+        log.info("Wallet balance: $%.2f USDC", usdc)
+    except Exception as e:
+        log.warning("Balance check failed: %s", e)
+
+    # Rebuild trade history from on-chain activity (survives restarts)
+    if not TRADES_FILE.exists():
+        log.info("Rebuilding trade history from chain...")
+        rebuilt = rebuild_trades_from_chain(PROXY_WALLET)
+        if rebuilt:
+            save_trades(rebuilt)
+            settled = [t for t in rebuilt if t.get("status") == "settled"]
+            wins    = [t for t in settled if t.get("result") == "WIN"]
+            pnl     = sum(t.get("pnl_usdc", 0) for t in settled)
+            log.info("Rebuilt %d trades from chain: W%d/L%d P&L=$%.2f",
+                     len(rebuilt), len(wins), len(settled)-len(wins), pnl)
+        else:
+            log.info("No prior trades found on chain")
+
+    while True:
+        now    = int(time.time())
+        trades = load_trades()
+
+        # 1. Settle
+        if settle_trades(trades):
+            save_trades(trades)
+            _print_summary(trades)
+
+        # 2. Enter — only block re-entry for open/settled/error, NOT skipped
+        already = {t["slot_ts"] for t in trades
+                   if t.get("status") in ("open", "settled", "error")}
+        cur_slot = (now // SLOT_DURATION) * SLOT_DURATION
+
+        for slot_ts in [cur_slot - SLOT_DURATION, cur_slot]:
+            t_elapsed = now - slot_ts
+            if not (ENTER_WINDOW[0] <= t_elapsed <= ENTER_WINDOW[1]):
+                continue
+            if slot_ts in already:
+                continue
+
+            log.info("Entry window: slot=%d t=%ds", slot_ts, t_elapsed)
+            market = fetch_market(slot_ts)
+            if not market:
+                log.info("  Market not found")
+                continue
+
+            ticks = fetch_inslot_trades(market["yes_token"], market["no_token"], slot_ts)
+            # ticks is always empty (data-api lag), build_features uses spot+time only
+
+            feat = build_features(ticks, slot_ts, features)
+            if feat is None:
+                continue
+            log.info("  btc_inslot_ret=%.5f eth_inslot_ret=%.5f sol_inslot_ret=%.5f",
+                     feat.get("btc_inslot_3m_ret",0), feat.get("eth_inslot_3m_ret",0),
+                     feat.get("sol_inslot_3m_ret",0))
+
+            X = pd.DataFrame([[feat.get(f, 0.0) for f in features]], columns=features)
+            prob_up = float(model.predict_proba(X)[0][1])
+            direction  = "UP" if prob_up >= 0.5 else "DOWN"
+            confidence = prob_up if direction == "UP" else 1.0 - prob_up
+            log.info("  Prediction: %s  conf=%.1f%%", direction, confidence*100)
+
+            if confidence < MIN_CONFIDENCE:
+                log.info("  Skip — conf %.1f%% < %.0f%%", confidence*100, MIN_CONFIDENCE*100)
+                trades.append({"slot_ts": slot_ts, "direction": direction,
+                                "confidence": round(confidence,4), "status": "skipped",
+                                "reason": f"conf {confidence:.2%} < {MIN_CONFIDENCE:.0%}",
+                                "entered_at": now})
+                save_trades(trades)
+                continue
+
+            token_id   = market["yes_token"] if direction == "UP" else market["no_token"]
+            ask_price  = get_ask_price(token_id)
+            model_prob = prob_up if direction == "UP" else (1.0 - prob_up)
+
+            # Log ask price source and freshness
+            with _clob_prices_lock:
+                ws_ts = _clob_price_ts.get(token_id, 0)
+            ask_age = time.time() - ws_ts if ws_ts else -1
+            ask_src = f"WS {ask_age:.1f}s" if ws_ts else "HTTP"
+
+            # Reject extreme ask prices — token is illiquid, already one-sided, or no edge
+            if not (0.38 <= ask_price <= 0.90):
+                log.info("  Skip — ask $%.3f outside [0.38, 0.90] — market already one-sided", ask_price)
+                trades.append({"slot_ts": slot_ts, "direction": direction,
+                                "confidence": round(confidence, 4),
+                                "entry_price": round(ask_price, 4), "status": "skipped",
+                                "reason": f"ask ${ask_price:.3f} outside valid range [0.10, 0.90]",
+                                "entered_at": now})
+                save_trades(trades)
+                continue
+            edge_vs_ask = model_prob - ask_price
+
+            # Also validate against market mid (outcomePrices) — catches stale ask prices
+            up_mid, down_mid = get_market_mid(slot_ts)
+            market_mid  = up_mid if direction == "UP" else down_mid
+            edge_vs_mid = (model_prob - market_mid) if market_mid else None
+
+            log.info("  BUY %s | ask=$%.3f [%s] edge_ask=%.1f%% | market_mid=$%.3f edge_mid=%.1f%%",
+                     direction, ask_price, ask_src, edge_vs_ask * 100,
+                     market_mid or 0, (edge_vs_mid or 0) * 100)
+
+            # Require edge vs ask >= 10% AND edge vs market mid >= 5%
+            if edge_vs_ask < MIN_EDGE:
+                log.info("  Skip — edge_ask %.1f%% < %.0f%%", edge_vs_ask * 100, MIN_EDGE * 100)
+                trades.append({"slot_ts": slot_ts, "direction": direction,
+                                "confidence": round(confidence, 4),
+                                "entry_price": round(ask_price, 4), "status": "skipped",
+                                "reason": f"edge_ask {edge_vs_ask:.2%} < {MIN_EDGE:.0%}",
+                                "edge_vs_ask": round(edge_vs_ask, 4),
+                                "edge_vs_mid": round(edge_vs_mid, 4) if edge_vs_mid else None,
+                                "entered_at": now})
+                save_trades(trades)
+                continue
+
+            if edge_vs_mid is not None and edge_vs_mid < MIN_EDGE_MID:
+                log.info("  Skip — edge_mid %.1f%% < %.0f%% (market already priced in)",
+                         edge_vs_mid * 100, MIN_EDGE_MID * 100)
+                trades.append({"slot_ts": slot_ts, "direction": direction,
+                                "confidence": round(confidence, 4),
+                                "entry_price": round(ask_price, 4), "status": "skipped",
+                                "reason": f"edge_mid {edge_vs_mid:.2%} < {MIN_EDGE_MID:.0%}",
+                                "edge_vs_ask": round(edge_vs_ask, 4),
+                                "edge_vs_mid": round(edge_vs_mid, 4),
+                                "entered_at": now})
+                save_trades(trades)
+                continue
+
+            true_edge = edge_vs_ask
+
+            # ── Balance check before placing ─────────────────────────────────
+            try:
+                bal  = client.get_balance_allowance(asset_type="COLLATERAL")
+                usdc = float(bal.balance) / 1e6
+                if usdc < STAKE_USDC * 1.05:
+                    log.error("  Insufficient balance $%.2f < $%.2f — skipping", usdc, STAKE_USDC * 1.05)
+                    continue
+            except Exception as e:
+                log.warning("  Balance check failed: %s — proceeding", e)
+
+            # ── Place limit order at the validated ask price ──────────────────
+            # Use limit (not market) to guarantee we pay the price we validated.
+            # Market orders can sweep stale/extreme prices in the book.
+            # CLOB minimum order size = 5 shares — adjust stake if needed.
+            shares = round(STAKE_USDC / ask_price, 2)
+            actual_cost = round(shares * ask_price, 4)
+            if shares < 5.0:
+                # Bump to minimum 5 shares, cap cost at 2x original stake
+                shares = 5.0
+                actual_cost = round(shares * ask_price, 4)
+                if actual_cost > STAKE_USDC * 2:
+                    log.info("  Skip — min 5 shares would cost $%.2f > 2x stake $%.2f",
+                             actual_cost, STAKE_USDC)
+                    trades.append({"slot_ts": slot_ts, "direction": direction,
+                                   "confidence": round(confidence, 4),
+                                   "entry_price": round(ask_price, 4), "status": "skipped",
+                                   "reason": f"min 5 shares cost ${actual_cost:.2f} > 2x stake",
+                                   "entered_at": now})
+                    save_trades(trades)
+                    continue
+                log.info("  Bumped to min 5 shares — cost $%.2f (stake was $%.2f)",
+                         actual_cost, STAKE_USDC)
+            log.info("  Placing LIMIT BUY %s — %.2f shares @ $%.3f | edge_ask=%.1f%% edge_mid=%.1f%%",
+                     direction, shares, ask_price,
+                     edge_vs_ask * 100, (edge_vs_mid or 0) * 100)
+            try:
+                result = client.place_limit_order(
+                    token_id=token_id, side="BUY", price=ask_price, size=shares
+                )
+                order_id = getattr(result, "order_id", None) or str(result)
+                log.info("  Order placed: %s", str(order_id)[:20])
+
+                # Wait up to 30s for fill, then cancel if unfilled
+                filled = False
+                for _ in range(6):
+                    time.sleep(5)
+                    try:
+                        o = client.get_order(order_id=str(order_id))
+                        status = str(getattr(o, "status", "")).upper()
+                        matched = float(getattr(o, "size_matched", 0) or 0)
+                        original = float(getattr(o, "original_size", shares) or shares)
+                        if status in ("FILLED", "MATCHED") or matched >= original * 0.99:
+                            filled = True
+                            log.info("  Order FILLED: %s shares=%.2f cost=$%.2f",
+                                     str(order_id)[:20], shares, actual_cost)
+                            break
+                    except Exception:
+                        pass
+
+                if not filled:
+                    log.info("  Order unfilled after 30s — cancelling")
+                    try:
+                        client.cancel_order(order_id=str(order_id))
+                    except Exception as e:
+                        log.warning("  Cancel failed: %s", e)
+                    trades.append({"slot_ts": slot_ts, "direction": direction,
+                                   "confidence": round(confidence, 4),
+                                   "entry_price": round(ask_price, 4), "status": "skipped",
+                                   "reason": "limit order unfilled in 30s — cancelled",
+                                   "entered_at": now})
+                    save_trades(trades)
+                    continue
+                trades.append({
+                    "slot_ts":     slot_ts,
+                    "direction":   direction,
+                    "confidence":  round(confidence, 4),
+                    "entry_price": round(ask_price, 4),
+                    "shares":      shares,
+                    "actual_cost": actual_cost,
+                    "stake_usdc":  STAKE_USDC,
+                    "token_id":    token_id,
+                    "order_id":    str(order_id)[:40],
+                    "status":      "open",
+                    "entered_at":  now,
+                    "true_edge":   round(true_edge, 4),
+                })
+                save_trades(trades)
+            except Exception as e:
+                log.error("  Order FAILED: %s", e)
+                trades.append({"slot_ts": slot_ts, "direction": direction,
+                                "status": "error", "reason": str(e), "entered_at": now})
+                save_trades(trades)
+
+        time.sleep(10)  # tight loop — 70s entry window needs quick checks
+
+
+def _print_summary(trades):
+    settled = [t for t in trades if t.get("status") == "settled"]
+    wins    = [t for t in settled if t.get("result") == "WIN"]
+    pnl     = sum(t.get("pnl_usdc", 0) for t in settled)
+    wr      = len(wins)/len(settled) if settled else 0
+    log.info("── settled=%d W%d/L%d WR=%.0f%% P&L=$%.2f open=%d",
+             len(settled), len(wins), len(settled)-len(wins), wr*100, pnl,
+             sum(1 for t in trades if t.get("status")=="open"))
+
+
+# ── Entry point ─────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    from polymarket import SecureClient
+    from polymarket.auth import BuilderApiKey
+
+    # Start spot daemon in background
+    start_spot_daemon()
+
+    # Load model
+    model, features = load_model()
+
+    # Init client (same pattern as maker_mm.py)
+    client = SecureClient.create(
+        private_key=PRIVATE_KEY,
+        wallet=PROXY_WALLET,
+        api_key=BuilderApiKey(
+            key=BUILDER_KEY,
+            secret=BUILDER_SECRET,
+            passphrase=BUILDER_PASS,
+        ),
+    )
+    log.info("Client initialized | wallet=%s", PROXY_WALLET)
+
+    # Start CLOB WS daemon (after client init so fetch_market can run)
+    start_clob_daemon()
+
+    run(client, model, features)

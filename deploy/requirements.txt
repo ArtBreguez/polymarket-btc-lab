@@ -1,0 +1,8 @@
+requests==2.32.3
+polymarket-client==0.1.0b1
+lightgbm==4.6.0
+scikit-learn==1.8.0
+pandas==2.2.3
+websockets==13.1
+numpy==1.26.4
+huggingface_hub==0.26.5

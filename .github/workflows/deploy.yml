@@ -1,0 +1,65 @@
+name: Deploy to Fly.io
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/**"
+      - ".github/workflows/deploy.yml"
+  # Also allow manual trigger (e.g. after promoting a new champion)
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Reason for manual deploy"
+        required: false
+        default: "Manual trigger"
+
+jobs:
+  validate-and-deploy:
+    name: Validate model + Deploy
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ML deps
+        run: pip install huggingface_hub lightgbm==4.6.0 scikit-learn==1.8.0 pandas==2.2.3 numpy==1.26.4
+
+      # Gate: validate champion model before deploying
+      - name: Validate champion model
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python scripts/validate_model.py
+
+      # Install flyctl
+      - name: Install flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      # Deploy to Fly
+      - name: Deploy to Fly.io
+        working-directory: deploy
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          flyctl deploy --app polymarket-maker-mm --ha=false --remote-only
+
+      # Verify machine is running
+      - name: Verify deployment
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          sleep 10
+          STATUS=$(flyctl status --app polymarket-maker-mm --json | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Status','unknown'))")
+          echo "App status: $STATUS"
+          if [ "$STATUS" != "running" ]; then
+            echo "❌ App not in running state after deploy!"
+            flyctl logs --app polymarket-maker-mm --no-tail 2>&1 | tail -30
+            exit 1
+          fi
+          echo "✅ Deployed successfully"
