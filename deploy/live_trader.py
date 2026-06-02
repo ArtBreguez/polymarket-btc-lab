@@ -64,7 +64,7 @@ BINANCE_WS      = "wss://stream.binance.com:9443/stream?streams=btcusdt@kline_1m
 BINANCE_REST    = "https://api.binance.com/api/v3"
 
 HTTP_TIMEOUT    = 3    # seconds — tight budget for a 10s loop
-MAX_TRADE_PAGES = 2    # max pages from data-api per token (500/page = 1000 trades max)
+MAX_TRADE_PAGES = 6    # max pages from data-api per token (500/page = 3000 trades max)
 
 SLOT_DURATION   = 300
 OBSERVE_SECS    = 180
@@ -573,7 +573,8 @@ def fetch_inslot_trades(yes_token: str, no_token: str, slot_ts: int) -> list[dic
     """Fetch inslot trades from data-api. Lag is ~90-120s so t=0-60s trades available at t=180s."""
     all_trades = []
     for token_id, outcome_label in [(yes_token, "Up"), (no_token, "Down")]:
-        for offset in range(0, 1500, 500):
+        for page in range(MAX_TRADE_PAGES):
+            offset = page * 500
             try:
                 r = _http.get(f"{DATA_API}/trades",
                     params={"asset": token_id[:40], "limit": 500, "offset": offset},
@@ -810,7 +811,96 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str]) -> dict
 
 
 
-# ── Slot history ring buffer (for zscore/lag features in build_features) ───────
+def _seed_slot_history():
+    """
+    Pre-populate _slot_history with the last _HIST_MAX resolved BTC 5min slots
+    so zscore and lag features are warm from the very first prediction.
+
+    Fetches from Gamma API (public, no auth). For each resolved slot:
+      - up_ratio from outcomePrices (proxy: UP price ≈ market-implied up_ratio)
+      - target from resolution (1=UP, 0=DOWN)
+      - sw filled with [up_ratio]*6 (no per-window data available historically)
+      - pre_ret from Binance spot buffer if available, else 0.0
+
+    Falls back gracefully if API is down or returns no data.
+    """
+    log.info("Seeding slot history from recent resolved markets...")
+    try:
+        now = int(time.time())
+        # Walk backwards through the last 30 slots (2h30min) to find _HIST_MAX resolved ones
+        seeded = 0
+        entries = []
+        for i in range(1, 35):
+            slot_ts = ((now // SLOT_DURATION) - i) * SLOT_DURATION
+            slug = f"btc-updown-5m-{slot_ts}"
+            try:
+                r = _http.get(f"{GAMMA_HOST}/markets/slug/{slug}", timeout=5)
+                if not r.ok:
+                    continue
+                m = r.json()
+                # Need a resolved market
+                op = m.get("outcomePrices", "[]")
+                if isinstance(op, str):
+                    op = json.loads(op)
+                if not op or len(op) < 2:
+                    continue
+                up_price = float(op[0])
+                dn_price = float(op[1])
+                # Only use if clearly resolved (one side >= 0.99)
+                if up_price >= 0.99:
+                    target = 1
+                elif dn_price >= 0.99:
+                    target = 0
+                else:
+                    continue  # not resolved yet
+                # up_ratio proxy: use outcomePrices as implied probability
+                # (close to real up_ratio since market price tracks order flow)
+                up_ratio = up_price
+                sw = [up_ratio] * 6
+
+                # pre_ret from spot buffer if warm
+                pre_ret = 0.0
+                if SPOT_BUFFER.exists():
+                    try:
+                        buf = json.loads(SPOT_BUFFER.read_text())
+                        candles = buf.get("btcusdt", [])
+                        if candles:
+                            ts_arr = [c[0] for c in candles]
+                            px_arr = [c[1] for c in candles]
+                            # find 5m window before slot
+                            seg = [px_arr[j] for j, ts in enumerate(ts_arr)
+                                   if slot_ts - 300 <= ts < slot_ts]
+                            if len(seg) >= 2:
+                                pre_ret = float((seg[-1] - seg[0]) / (seg[0] + 1e-8))
+                    except Exception:
+                        pass
+
+                entries.append({
+                    "slot_ts":  slot_ts,
+                    "up_ratio": up_ratio,
+                    "sw":       sw,
+                    "pre_ret":  pre_ret,
+                    "target":   target,
+                })
+                seeded += 1
+                if seeded >= _HIST_MAX:
+                    break
+            except Exception:
+                continue
+
+        # Insert in chronological order (oldest first)
+        for entry in reversed(entries):
+            _slot_history.append(entry)
+
+        log.info("Slot history seeded: %d entries (oldest=%s, newest=%s)",
+                 len(_slot_history),
+                 str(_slot_history[0]["slot_ts"]) if _slot_history else "—",
+                 str(_slot_history[-1]["slot_ts"]) if _slot_history else "—")
+    except Exception as e:
+        log.warning("_seed_slot_history failed: %s — starting with empty history", e)
+
+
+
 # Each entry: {slot_ts, up_ratio, sw: [6 floats], pre_ret: float, target: int|None}
 # 'target' is filled in by settle_trades() or left None until settlement.
 _slot_history: list[dict] = []
@@ -1017,6 +1107,10 @@ def run(client, model, features):
         else:
             log.info("No prior trades found on chain")
 
+    # Pre-populate _slot_history from recent resolved markets so zscore/lag
+    # features are warm from the first prediction instead of needing ~1h40min.
+    _seed_slot_history()
+
     while True:
         now    = int(time.time())
         trades = load_trades()
@@ -1045,7 +1139,7 @@ def run(client, model, features):
                 continue
 
             ticks = fetch_inslot_trades(market["yes_token"], market["no_token"], slot_ts)
-            # ticks is always empty (data-api lag), build_features uses spot+time only
+            log.info("  Fetched %d inslot ticks (data-api lag ~120s)", len(ticks))
 
             feat = build_features(ticks, slot_ts, features)
             if feat is None:
