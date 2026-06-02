@@ -42,7 +42,7 @@ import requests
 # ── Config ─────────────────────────────────────────────────────────────────────
 ARTIFACTS       = Path("/home/ubuntu/polymarket-btc-lab/artifacts")
 TRADES_FILE     = ARTIFACTS / "paper_trades.json"
-MODEL_PATH      = ARTIFACTS / "btc_model_v3_realtime.pkl"
+MODEL_PATH      = ARTIFACTS / "btc_model_v3b_spot.pkl"
 GAMMA_HOST      = "https://gamma-api.polymarket.com"
 CLOB_HOST       = "https://clob.polymarket.com"
 DATA_API        = "https://data-api.polymarket.com"
@@ -251,17 +251,16 @@ def fetch_price_history(yes_token: str, slot_ts: int) -> list[float]:
 # ── Order flow feature computation (FIXED) ────────────────────────────────────
 def fetch_3min_features(yes_token: str, no_token: str, slot_ts: int) -> dict | None:
     """
-    Build real-time features for the v3 model (price_history + spot + time).
+    Build real-time features for the v3b model (spot + time only).
 
-    v3 uses ONLY features available in real-time at t=180s:
-      - price_first/last/trend/vol from CLOB prices-history (UP token)
+    v3b uses ONLY features available in real-time at t=180s:
       - spot BTC/ETH/SOL from local WS buffer (zero network calls)
       - time features (hour_sin/cos, dow_sin/cos, hour)
 
-    Order flow (up_ratio, vwap, momentum) was DROPPED because data-api has
-    a 4-5 minute lag — inslot trades are NOT available at t=180s entry time.
+    Dropped: price_history (CLOB token prices have near-zero correlation with outcome,
+    and created strong DOWN bias in v3). Order flow also dropped (data-api 4-5min lag).
 
-    NOTE: yes_token / no_token still passed for prices-history fetch.
+    Signal comes from btc/eth/sol inslot_3m_ret (corr ~0.37 with outcome).
     """
     now = int(time.time())
     t_elapsed = now - slot_ts
@@ -269,35 +268,17 @@ def fetch_3min_features(yes_token: str, no_token: str, slot_ts: int) -> dict | N
         log.info("  Slot at t=%ds — waiting for 3-min mark", t_elapsed)
         return None
 
-    # ── Price series from CLOB prices-history (UP token) ─────────────────────
-    log.info("  Fetching UP-token price history...")
-    px_series = fetch_price_history(yes_token, slot_ts)
-    log.info("  Price history points: %d", len(px_series))
-
-    if not px_series:
-        log.warning("  No price history — skip")
-        return None
-
-    px = px_series
-    price_first = float(px[0])
-    price_last  = float(px[-1])
-    price_trend = float(px[-1] - px[0]) if len(px) > 1 else 0.0
-    price_vol   = float(np.std(px)) if len(px) > 1 else 0.0
-
+    # ── Time features ─────────────────────────────────────────────────────────
     dt   = datetime.fromtimestamp(slot_ts, tz=timezone.utc)
     hour = dt.hour + dt.minute / 60.0
     dow  = dt.weekday()
 
     feat = {
-        "price_first":  price_first,
-        "price_last":   price_last,
-        "price_trend":  price_trend,
-        "price_vol":    price_vol,
-        "hour":         hour,
-        "hour_sin":     math.sin(2 * math.pi * hour / 24),
-        "hour_cos":     math.cos(2 * math.pi * hour / 24),
-        "dow_sin":      math.sin(2 * math.pi * dow / 7),
-        "dow_cos":      math.cos(2 * math.pi * dow / 7),
+        "hour":     hour,
+        "hour_sin": math.sin(2 * math.pi * hour / 24),
+        "hour_cos": math.cos(2 * math.pi * hour / 24),
+        "dow_sin":  math.sin(2 * math.pi * dow / 7),
+        "dow_cos":  math.cos(2 * math.pi * dow / 7),
     }
 
     # ── Spot features (from local WS buffer — no network call) ────────────────
@@ -313,10 +294,10 @@ def fetch_3min_features(yes_token: str, no_token: str, slot_ts: int) -> dict | N
             feat[f] = 0.0
 
     log.info(
-        "  Features: price_first=%.3f price_last=%.3f price_trend=%.4f price_vol=%.4f"
-        " btc_inslot_ret=%.5f sol_inslot_mom=%.5f",
-        price_first, price_last, price_trend, price_vol,
-        feat.get("btc_inslot_3m_ret", 0), feat.get("sol_inslot_3m_mom", 0),
+        "  Features: btc_inslot_ret=%.5f eth_inslot_ret=%.5f sol_inslot_ret=%.5f"
+        " btc_inslot_mom=%.5f hour=%.1f",
+        feat.get("btc_inslot_3m_ret", 0), feat.get("eth_inslot_3m_ret", 0),
+        feat.get("sol_inslot_3m_ret", 0), feat.get("btc_inslot_3m_mom", 0), hour,
     )
 
     return feat
@@ -573,14 +554,12 @@ def run() -> None:
             "token_id":     bet_token,
             "status":       "open",
             "entered_at":   now,
-            "model":        "v3",
+            "model":        "v3b",
             # Diagnostic features
-            "price_first":  round(feat.get("price_first", 0), 4),
-            "price_last":   round(feat.get("price_last", 0), 4),
-            "price_trend":  round(feat.get("price_trend", 0), 4),
-            "price_vol":    round(feat.get("price_vol", 0), 4),
             "btc_inslot_3m_ret": round(feat.get("btc_inslot_3m_ret", 0), 6),
-            "sol_inslot_3m_mom": round(feat.get("sol_inslot_3m_mom", 0), 6),
+            "eth_inslot_3m_ret": round(feat.get("eth_inslot_3m_ret", 0), 6),
+            "sol_inslot_3m_ret": round(feat.get("sol_inslot_3m_ret", 0), 6),
+            "btc_inslot_3m_mom": round(feat.get("btc_inslot_3m_mom", 0), 6),
             "true_edge":    round(true_edge, 4),
         }
 
