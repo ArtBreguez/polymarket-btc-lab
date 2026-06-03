@@ -238,6 +238,8 @@ def train_v11():
             ob["ob_imbalance_end"] = open_snap["imb"]
         return ob
 
+    _fetch_errors: list[str] = []  # collect first few errors for diagnosis
+
     def _fetch_ob_for_slug(slug: str, slot_ts: int) -> dict | None:
         """Fetch poly_l2 parquet from pmdata and extract OB features."""
         try:
@@ -246,13 +248,24 @@ def train_v11():
                 headers={"api_key": PMDATA_KEY},
                 timeout=15,
             )
+            if not r.ok:
+                if len(_fetch_errors) < 3:
+                    _fetch_errors.append(f"URL fetch {slug}: HTTP {r.status_code} {r.text[:100]}")
+                return None
             dl_url = r.json().get("download_url")
             if not dl_url:
+                if len(_fetch_errors) < 3:
+                    _fetch_errors.append(f"No download_url for {slug}: {r.text[:100]}")
                 return None
 
-            import io, urllib.request
-            with urllib.request.urlopen(dl_url) as resp:
-                raw = resp.read()
+            # Download parquet via requests (not urllib — more reliable in Modal)
+            import io
+            r2 = requests.get(dl_url, timeout=60)
+            if not r2.ok:
+                if len(_fetch_errors) < 3:
+                    _fetch_errors.append(f"Parquet download {slug}: HTTP {r2.status_code}")
+                return None
+            raw = r2.content
 
             pf = pq.ParquetFile(io.BytesIO(raw))
             batch = next(pf.iter_batches(batch_size=100000))
@@ -261,6 +274,8 @@ def train_v11():
             # Filter to book events only, add t_sec relative to slot_ts
             books = df[df["event_type"] == "book"].copy()
             if len(books) == 0:
+                if len(_fetch_errors) < 3:
+                    _fetch_errors.append(f"No book events for {slug}")
                 return None
 
             books["ts_sec"] = books["timestamp"].astype("int64") / 1e9
@@ -273,6 +288,8 @@ def train_v11():
 
             return _compute_ob_features_from_book_rows(books)
         except Exception as e:
+            if len(_fetch_errors) < 3:
+                _fetch_errors.append(f"Exception {slug}: {type(e).__name__}: {e}")
             return None
 
     # Fetch OB in parallel (20 workers — pmdata can handle it)
@@ -301,6 +318,10 @@ def train_v11():
     log.info("  OB fetch complete: %d/%d markets with real OB (%.1f%%)",
              len(ob_by_market), len(markets_sorted),
              100 * len(ob_by_market) / max(len(markets_sorted), 1))
+    if _fetch_errors:
+        log.warning("  Sample errors (%d):", len(_fetch_errors))
+        for e in _fetch_errors:
+            log.warning("    %s", e)
     if failed > 0:
         log.warning("  %d markets missing OB — will be excluded from training", failed)
 
