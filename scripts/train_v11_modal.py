@@ -40,7 +40,7 @@ image = (
         "optuna>=3.6",
         "huggingface_hub>=0.26",
         "requests>=2.31",
-        "urllib3>=2.0",  # force image rebuild v2
+        "urllib3>=2.0",  # force image rebuild v3
     )
 )
 
@@ -268,7 +268,7 @@ def train_v11():
             if len(books) == 0:
                 return None
 
-            books["ts_sec"] = books["timestamp"].astype("int64") / 1e9
+            books["ts_sec"] = books["timestamp"].astype("int64") / 1e3  # datetime64[ms] → seconds
             books["t_sec"]  = books["ts_sec"] - slot_ts
             books = books[(books["t_sec"] >= 0) & (books["t_sec"] < 180)]
             if len(books) == 0:
