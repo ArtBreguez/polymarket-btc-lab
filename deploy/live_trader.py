@@ -204,7 +204,7 @@ def get_ask_price_ws(token_id: str) -> float | None:
         return None
     age = time.time() - ts
     if age > PRICE_MAX_AGE:
-        log.debug("WS ask for %s is %.1fs old — stale, using HTTP fallback", token_id[:12], age)
+        log.info("  WS ask for %s is %.1fs old (stale) — falling back to /book", token_id[:12], age)
         return None
     return price
 
@@ -555,22 +555,35 @@ def fetch_market(slot_ts: int) -> dict | None:
         return None
 
 def get_ask_price(token_id: str) -> float:
-    """Get best ask (cost to buy) — tries WS cache first, falls back to HTTP /price."""
-    # Fast path: use pre-cached WS price if available
+    """Get best ask (cost to buy) — WS cache first, then REST /book (real order book).
+
+    IMPORTANT: do NOT fall back to /price — that endpoint returns the last traded
+    price, not the current best ask. It can be stale by minutes and causes entries
+    at prices far from the real market (e.g. $0.87 when mid is $0.50).
+    /book always reflects the live order book state.
+    """
+    # Fast path: WS cache (book snapshot + price_change events, <15s)
     ws_price = get_ask_price_ws(token_id)
     if ws_price is not None:
         return ws_price
-    # Fallback: HTTP polling
+
+    # Fallback: REST /book — parse best ask directly from the live order book
     try:
-        r = _http.get(f"{CLOB_URL}/price",
-                         params={"token_id": token_id, "side": "BUY"}, timeout=HTTP_TIMEOUT)
+        r = _http.get(f"{CLOB_URL}/book",
+                      params={"token_id": token_id}, timeout=HTTP_TIMEOUT)
         if r.ok:
-            price = float(r.json().get("price", 0) or 0)
-            if 0 < price < 1:
-                return price
+            book = r.json()
+            asks = book.get("asks", [])
+            best_asks = [float(a["price"]) for a in asks
+                         if float(a.get("price", 1)) < 0.97]
+            if best_asks:
+                best_ask = min(best_asks)
+                log.debug("  get_ask_price /book fallback: %.3f", best_ask)
+                return best_ask
     except Exception as e:
-        log.warning("  get_ask_price HTTP fallback failed: %s — returning 0.0 (will skip trade)", e)
-    return 0.0  # 0.0 is outside [0.38, 0.90] ask filter — guarantees trade is skipped on price failure
+        log.warning("  get_ask_price /book fallback failed: %s — returning 0.0", e)
+
+    return 0.0  # outside [0.38, 0.90] filter — trade will be skipped
 
 
 def get_market_mid(slot_ts: int) -> tuple[float, float] | tuple[None, None]:
