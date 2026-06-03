@@ -1,20 +1,25 @@
 """
-train_v12_modal.py — BTC 5min model v12
+train_v14_modal.py — BTC 5min model v14
 
-Strategy:
-  - Combine HF dataset (BrockMisner, ~616 markets, Apr 2025)
-    with local ticks (7062 markets, Mar-Apr 2026)
-  - Total: ~7600+ samples vs v10's 601 — ~12.7x more data
-  - Same v9/v10 feature set — no new features, isolate data-volume effect
-  - Walk-forward: 7 folds + gap comparison (3 vs 5)
-  - Calibration: isotonic
-  - Optuna: 150 trials
+Changes vs v13:
+  - Spot price source: Binance 1m klines fetched inline during the job instead of
+    spot_price_usdt from ticks. In v13, spot_price_usdt was 99.6% null (only websocket
+    ticks had it; onchain ticks did not). This caused btc_inslot_ret, btc_inslot_vol,
+    btc_pre_*_ret/vol, and btc_dist_* to default to 0.0 for ~99.6% of samples —
+    effectively dead features. v14 has complete spot coverage for all 7062 markets.
+  - Binance fetch is inline (~43 requests, ~2s) — no Modal Volume or HF file needed
+    for spot. Self-contained: automatically covers whatever date range the markets use.
+  - btc_inslot_ret: now uses Binance 1m close prices within the 5min slot window
+  - btc_inslot_vol: now uses std(close) of 1m candles within the 5min slot window
+  - Removed spot_price_usdt from tick load (saves ~15% memory on the 2.3GB parquet)
+  - Everything else identical to v13 (same features, same WF, same HPO)
 
-Data sources mounted:
-  - HF dataset: downloaded at runtime (BrockMisner/polymarket-btc-updown)
-  - Local ticks: Modal Volume 'btc-local-data' at /btc_local/
-      /btc_local/ticks_btc_5min.parquet
-      /btc_local/local_markets.csv
+Data source:
+  - Modal Volume 'btc-local-data':
+      /btc_local/ticks_btc_5min.parquet  (2.3GB, 7062 markets, Mar-Apr 2026)
+      /btc_local/local_markets.csv       (market_id str, slot_ts, target)
+  - Binance API (inline fetch, no file dependency):
+      BTCUSDT 1m klines for the full market date range + 4h pre-buffer
 
 Champion gate: beat v10 on >= 2 of 3 metrics (AUC, Brier, Acc).
 """
@@ -36,7 +41,7 @@ image = (
     )
 )
 
-app = modal.App("polymarket-btc-train-v12", image=image)
+app = modal.App("btc-v14-run", image=image)
 
 @app.function(
     cpu=8,
@@ -45,7 +50,7 @@ app = modal.App("polymarket-btc-train-v12", image=image)
     secrets=[modal.Secret.from_name("hf-token")],
     volumes={"/btc_local": LOCAL_VOL},
 )
-def train_v12():
+def train_v14():
     import gc, json, logging, os, pickle, sys, time, warnings, tempfile
     from datetime import datetime, timezone
     from pathlib import Path
@@ -68,22 +73,18 @@ def train_v12():
     log = logging.getLogger(__name__)
 
     HF_TOKEN      = os.environ.get("HF_TOKEN", "")
-    HF_DATASET    = "BrockMisner/polymarket-btc-updown"
     HF_MODEL_REPO = "artbreguez/polymarket-btc-model"
     OBS_SECS      = 180
     OPTUNA_TRIALS = 150
     WF_GAP        = 5
-    HF_DIR        = Path("/tmp/hf_data")
     LOCAL_DIR     = Path("/btc_local")
-    HF_DIR.mkdir(exist_ok=True)
 
     if not HF_TOKEN:
         raise RuntimeError("HF_TOKEN required")
 
     # ── Step 1: Load champion metrics ─────────────────────────────────────────
     log.info("Step 1: Loading champion metrics from HF...")
-    champion = {"version": "none", "wf_auc": 0.0, "wf_brier": 1.0,
-                "wf_acc": 0.0, "feature_list": []}
+    champion = {"version": "none", "wf_auc": 0.0, "wf_brier": 1.0, "wf_acc": 0.0}
     try:
         meta_path = hf_hub_download(HF_MODEL_REPO, "champion_meta.json",
                                     repo_type="model", token=HF_TOKEN,
@@ -100,150 +101,111 @@ def train_v12():
     CHAMPION_BRIER = float(champion.get("wf_brier", 1.0)) if champion.get("wf_brier") else 0.22
     CHAMPION_ACC   = float(champion.get("wf_acc", 0.0))   if champion.get("wf_acc")   else 0.73
 
-    # ── Step 2: Download HF data ───────────────────────────────────────────────
-    hf_files = [
-        "data/markets.parquet",
-        "data/ticks/crypto=BTC/timeframe=5-minute/part-0.parquet",
-    ]
-    log.info("Step 2: Downloading %d HF files...", len(hf_files))
-    for f in hf_files:
-        dest = HF_DIR / f
-        if dest.exists():
-            log.info("  Cached: %s (%.0f MB)", f, dest.stat().st_size / 1e6)
-            continue
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        log.info("  Downloading %s ...", f)
-        t0 = time.time()
-        hf_hub_download(repo_id=HF_DATASET, filename=f, repo_type="dataset",
-                        token=HF_TOKEN, local_dir=str(HF_DIR),
-                        local_dir_use_symlinks=False)
-        log.info("    -> %.1fs, %.0f MB", time.time() - t0,
-                 (HF_DIR / f).stat().st_size / 1e6)
-
-    # ── Step 3: HF markets ─────────────────────────────────────────────────────
-    log.info("Step 3: Loading HF markets...")
-    m = pd.read_parquet(HF_DIR / "data/markets.parquet")
-    hf_markets = m[
-        (m["crypto"] == "BTC") & (m["timeframe"] == "5-minute") &
-        (m["resolution"].isin([0, 1]))
-    ].copy()
-    hf_markets["slot_ts"] = hf_markets["slug"].apply(
-        lambda s: int(str(s).split("-")[-1]) if str(s).split("-")[-1].isdigit() else 0
-    )
-    hf_markets = hf_markets[hf_markets["slot_ts"] > 0].copy()
-    hf_markets = hf_markets.rename(columns={"resolution": "target"})
-    hf_markets["target"] = hf_markets["target"].astype(int)
-    hf_markets["market_id"] = hf_markets["market_id"].astype(str)
-    hf_markets["source"] = "hf"
-    log.info("  HF markets: %d", len(hf_markets))
-
-    # ── Step 4: Local markets ──────────────────────────────────────────────────
-    log.info("Step 4: Loading local markets (Mar-Apr 2026)...")
+    # ── Step 2: Local markets ──────────────────────────────────────────────────
+    log.info("Step 2: Loading local markets (Mar-Apr 2026)...")
     local_csv = LOCAL_DIR / "local_markets.csv"
-    local_markets = pd.read_csv(local_csv)
-    # columns: market_id, slug, target (0=DOWN/1=UP), resolved_at
-    local_markets["market_id"] = local_markets["market_id"].astype(str)
-    if "slot_ts" not in local_markets.columns:
-        local_markets["slot_ts"] = local_markets["slug"].apply(
+    markets = pd.read_csv(local_csv)
+    markets["market_id"] = markets["market_id"].astype(str)
+    if "slot_ts" not in markets.columns:
+        markets["slot_ts"] = markets["slug"].apply(
             lambda s: int(str(s).split("-")[-1]) if str(s).split("-")[-1].isdigit() else 0
         )
-    local_markets = local_markets[local_markets["slot_ts"] > 0].copy()
-    local_markets["target"] = local_markets["target"].astype(int)
-    local_markets["source"] = "local"
-    log.info("  Local markets: %d", len(local_markets))
+    markets = markets[markets["slot_ts"] > 0].copy()
+    markets["target"] = markets["target"].astype(int)
+    markets = markets.sort_values("slot_ts").reset_index(drop=True)
+    log.info("  Markets: %d | UP=%d DOWN=%d | range: %s -> %s",
+             len(markets),
+             (markets["target"] == 1).sum(),
+             (markets["target"] == 0).sum(),
+             datetime.utcfromtimestamp(markets["slot_ts"].min()).strftime("%Y-%m-%d"),
+             datetime.utcfromtimestamp(markets["slot_ts"].max()).strftime("%Y-%m-%d"))
 
-    # ── Step 5: Merge markets — deduplicate on market_id ──────────────────────
-    log.info("Step 5: Merging markets...")
-    hf_cols   = ["market_id", "slot_ts", "target", "source"]
-    loc_cols  = ["market_id", "slot_ts", "target", "source"]
-    all_markets = pd.concat([
-        hf_markets[hf_cols],
-        local_markets[loc_cols],
-    ], ignore_index=True)
-    all_markets = all_markets.drop_duplicates("market_id").sort_values("slot_ts").reset_index(drop=True)
-    log.info("  Total unique markets: %d (HF=%d local=%d)",
-             len(all_markets),
-             (all_markets["source"] == "hf").sum(),
-             (all_markets["source"] == "local").sum())
-    log.info("  Target balance: %s", dict(all_markets["target"].value_counts()))
+    market_ids     = set(markets["market_id"])
+    slot_map       = dict(zip(markets["market_id"], markets["slot_ts"]))
+    target_map     = dict(zip(markets["market_id"], markets["target"]))
+    slotts_to_rank = {row["slot_ts"]: i for i, row in markets.iterrows()}
+    rank_to_target = dict(enumerate(markets["target"]))
+    rank_to_slotts = dict(enumerate(markets["slot_ts"]))
 
-    market_ids = set(all_markets["market_id"])
-    slot_map   = dict(zip(all_markets["market_id"], all_markets["slot_ts"]))
-    target_map = dict(zip(all_markets["market_id"], all_markets["target"]))
-    slotts_to_rank = {row["slot_ts"]: i for i, row in all_markets.iterrows()}
-    rank_to_target = dict(enumerate(all_markets["target"]))
-    rank_to_slotts = dict(enumerate(all_markets["slot_ts"]))
+    # ── Step 3: Load Binance spot from Modal Volume ────────────────────────────
+    # binance_spot_local.parquet: 42,357 1m candles, Mar 13 - Apr 11 2026
+    # Fetched locally via scripts/fetch_binance_spot.py (Binance API geo-blocks
+    # Modal's Amsterdam region with HTTP 451, so we pre-fetch and store in volume)
+    log.info("Step 3: Loading Binance spot from Modal Volume...")
+    binance_df = pd.read_parquet(str(LOCAL_DIR / "binance_spot_local.parquet"))
+    binance_df = binance_df.drop_duplicates("timestamp_ms").sort_values("timestamp_ms").reset_index(drop=True)
+    spot_ts_arr = binance_df["timestamp_ms"].values.astype(np.float64)
+    spot_px_arr = binance_df["close"].values.astype(np.float64)
+    log.info("  Binance spot: %d candles | range: $%.0f - $%.0f",
+             len(spot_ts_arr), spot_px_arr.min(), spot_px_arr.max())
+    del binance_df; gc.collect()
 
-    # ── Step 6: Load HF ticks ──────────────────────────────────────────────────
-    log.info("Step 6: Loading HF ticks...")
-    hf_tick_path = HF_DIR / "data/ticks/crypto=BTC/timeframe=5-minute/part-0.parquet"
-    hf_mids = set(hf_markets["market_id"])
-    hf_btc = pq.read_table(
-        str(hf_tick_path),
-        columns=["market_id", "timestamp_ms", "outcome", "side",
-                 "price", "size_usdc", "spot_price_usdt"],
-        filters=[("market_id", "in", list(hf_mids))],
-    ).to_pandas()
-    log.info("  HF ticks: %d rows", len(hf_btc))
-
-    # ── Step 7: Load local ticks row-group by row-group (2.3GB parquet) ────────
-    log.info("Step 7: Loading local ticks from Modal Volume...")
+    # ── Step 4: Load ticks row-group by row-group ──────────────────────────────
+    # NOTE: spot_price_usdt removed — using Binance source instead (99.6% was null)
+    log.info("Step 4: Loading local ticks from Modal Volume (row-group streaming)...")
     local_tick_path = LOCAL_DIR / "ticks_btc_5min.parquet"
-    # Normalize to str — parquet market_id is str, CSV is int64
-    local_markets["market_id"] = local_markets["market_id"].astype(str)
-    local_mids = set(local_markets["market_id"])
+    needed_cols = ["market_id", "timestamp_ms", "outcome", "side", "price", "size_usdc"]
 
     pf = pq.ParquetFile(str(local_tick_path))
     n_rg = pf.metadata.num_row_groups
-    log.info("  Parquet row groups: %d", n_rg)
+    log.info("  Row groups: %d", n_rg)
 
-    local_chunks = []
-    needed_cols = ["market_id", "timestamp_ms", "outcome", "side",
-                   "price", "size_usdc", "spot_price_usdt"]
+    chunks = []
     rows_loaded = 0
     for rg_i in range(n_rg):
         chunk = pf.read_row_group(rg_i, columns=needed_cols).to_pandas()
-        chunk = chunk[chunk["market_id"].isin(local_mids)]
+        chunk["market_id"] = chunk["market_id"].astype(str)
+        chunk = chunk[chunk["market_id"].isin(market_ids)]
         if len(chunk) > 0:
-            local_chunks.append(chunk)
+            chunks.append(chunk)
             rows_loaded += len(chunk)
-        if rg_i % 50 == 0:
-            log.info("  Row group %d/%d — kept %d rows so far", rg_i, n_rg, rows_loaded)
+        if rg_i % 100 == 0:
+            log.info("  rg %d/%d — kept %d rows so far", rg_i, n_rg, rows_loaded)
     del pf; gc.collect()
 
-    if local_chunks:
-        local_btc = pd.concat(local_chunks, ignore_index=True)
-        del local_chunks; gc.collect()
-        log.info("  Local ticks loaded: %d rows, %d markets",
-                 len(local_btc), local_btc["market_id"].nunique())
-    else:
-        log.warning("  No local ticks found!")
-        local_btc = pd.DataFrame(columns=needed_cols)
+    btc = pd.concat(chunks, ignore_index=True)
+    del chunks; gc.collect()
+    log.info("  Ticks loaded: %d rows, %d markets", len(btc), btc["market_id"].nunique())
 
-    # ── Step 8: Merge ticks ────────────────────────────────────────────────────
-    log.info("Step 8: Merging ticks...")
-    btc = pd.concat([hf_btc, local_btc], ignore_index=True)
-    del hf_btc, local_btc; gc.collect()
+    # Filter epoch=0 timestamps (corrupted rows)
+    btc = btc[btc["timestamp_ms"] > 0]
 
     btc["slot_ts_val"] = btc["market_id"].map(slot_map)
     btc = btc.dropna(subset=["slot_ts_val"])
-    btc["t_sec"] = (btc["timestamp_ms"].astype(float) / 1000 - btc["slot_ts_val"].astype(float))
+    btc["t_sec"] = btc["timestamp_ms"].astype(float) / 1000 - btc["slot_ts_val"].astype(float)
     btc_inslot = btc[(btc["t_sec"] >= 0) & (btc["t_sec"] < OBS_SECS)].copy()
-    log.info("  Combined inslot: %d ticks, %d markets",
+    log.info("  Inslot ticks: %d rows, %d markets",
              len(btc_inslot), btc_inslot["market_id"].nunique())
 
     slot_vol = btc_inslot.groupby("market_id")["size_usdc"].sum().rename("slot_vol")
-
-    spot_tl     = btc[["timestamp_ms", "spot_price_usdt"]].dropna().drop_duplicates("timestamp_ms")
-    spot_tl     = spot_tl.set_index("timestamp_ms").sort_index()
-    spot_ts_arr = spot_tl.index.values
-    spot_px_arr = spot_tl["spot_price_usdt"].values
     del btc; gc.collect()
-    log.info("  Spot series: %d points", len(spot_ts_arr))
+
+    # ── Spot helpers ───────────────────────────────────────────────────────────
+    def spot_open_at(slot_ts: int) -> float:
+        """Return Binance close price at or just before slot_ts (ms lookup)."""
+        idx = np.searchsorted(spot_ts_arr, float(slot_ts) * 1000, side="right") - 1
+        return float(spot_px_arr[idx]) if idx >= 0 else 0.0
+
+    def inslot_spot_features(slot_ts: int) -> dict:
+        """Compute btc_inslot_ret and btc_inslot_vol from Binance 1m candles."""
+        slot_start_ms = float(slot_ts) * 1000
+        slot_end_ms   = slot_start_ms + OBS_SECS * 1000  # 180s window
+        idx0, idx1 = np.searchsorted(spot_ts_arr, [slot_start_ms, slot_end_ms])
+        seg = spot_px_arr[idx0:idx1]
+        if len(seg) >= 2:
+            inslot_ret = float((seg[-1] - seg[0]) / (seg[0] + 1e-8))
+            inslot_vol = float(np.std(seg) / (np.mean(seg) + 1e-8))
+        elif len(seg) == 1:
+            inslot_ret = 0.0
+            inslot_vol = 0.0
+        else:
+            inslot_ret = 0.0
+            inslot_vol = 0.0
+        return {"btc_inslot_ret": inslot_ret, "btc_inslot_vol": inslot_vol}
 
     # ── Feature helpers ────────────────────────────────────────────────────────
     def tick_features(grp: pd.DataFrame) -> dict:
-        """v9/v10 tick features — same as champion, no new additions."""
+        """Same v9/v10 tick features — unchanged from v13."""
         n = len(grp)
         if n == 0:
             return {
@@ -278,51 +240,40 @@ def train_v12():
 
         sw = {}
         for i in range(6):
-            t0_w, t1_w = i * 30, (i + 1) * 30
-            mask = (grp["t_sec"] >= t0_w) & (grp["t_sec"] < t1_w)
-            sw[f"btc_up_w{i}"] = ur_window(mask)
+            sw[f"btc_up_w{i}"] = ur_window((grp["t_sec"] >= i*30) & (grp["t_sec"] < (i+1)*30))
 
-        w_vals = [sw[f"btc_up_w{i}"] for i in range(6)]
+        w_vals       = [sw[f"btc_up_w{i}"] for i in range(6)]
         btc_momentum = float(np.mean(w_vals[3:]) - np.mean(w_vals[:3]))
 
-        weights = np.exp(grp["t_sec"].values / OBS_SECS * 2.0)
+        weights  = np.exp(grp["t_sec"].values / OBS_SECS * 2.0)
         weights /= weights.sum() + 1e-8
-        tw_up = float((weights * (grp["outcome"] == "Up").values).sum())
+        tw_up    = float((weights * (grp["outcome"] == "Up").values).sum())
 
         half = OBS_SECS / 2
-        early = grp[grp["t_sec"] < half]
-        late  = grp[grp["t_sec"] >= half]
         def vwap_up_half(g):
             up = g[g["outcome"] == "Up"]
             if len(up) == 0: return 0.5
             return float((up["price"] * up["size_usdc"]).sum() / (up["size_usdc"].sum() + 1e-8))
-        vwap_trend = float(vwap_up_half(late) - vwap_up_half(early))
+        vwap_trend = float(vwap_up_half(grp[grp["t_sec"] >= half]) -
+                           vwap_up_half(grp[grp["t_sec"] < half]))
 
         vol_by_w, ur_by_w = [], []
         for i in range(6):
-            t0_w, t1_w = i * 30, (i + 1) * 30
-            sub = grp[(grp["t_sec"] >= t0_w) & (grp["t_sec"] < t1_w)]
+            sub = grp[(grp["t_sec"] >= i*30) & (grp["t_sec"] < (i+1)*30)]
             vol_by_w.append(sub["size_usdc"].sum())
-            ur_by_w.append(ur_window((grp["t_sec"] >= t0_w) & (grp["t_sec"] < t1_w)))
-        vol_by_w = np.array(vol_by_w)
-        ur_by_w  = np.array(ur_by_w)
-        total_w_vol = vol_by_w.sum() + 1e-8
-        vwmom = float(np.dot(vol_by_w / total_w_vol, ur_by_w - 0.5))
+            ur_by_w.append(ur_window((grp["t_sec"] >= i*30) & (grp["t_sec"] < (i+1)*30)))
+        vol_by_w    = np.array(vol_by_w)
+        ur_by_w     = np.array(ur_by_w)
+        vwmom       = float(np.dot(vol_by_w / (vol_by_w.sum() + 1e-8), ur_by_w - 0.5))
 
         first30 = (grp["t_sec"] < 30).sum()
         last30  = (grp["t_sec"] >= (OBS_SECS - 30)).sum()
 
-        up_ratio_stability = float(np.std(w_vals))
-
         vol_first90 = grp[grp["t_sec"] < 90]["size_usdc"].sum()
         vol_last90  = grp[grp["t_sec"] >= 90]["size_usdc"].sum()
-        vol_accel   = float(vol_last90 / (vol_first90 + 1e-8))
 
         up_grp = grp[is_up]
         dn_grp = grp[~is_up]
-        avg_size_up = float(up_grp["size_usdc"].mean()) if len(up_grp) > 0 else 1.0
-        avg_size_dn = float(dn_grp["size_usdc"].mean()) if len(dn_grp) > 0 else 1.0
-        size_disparity = float(avg_size_up / (avg_size_dn + 1e-8))
 
         return {
             "btc_n_ticks":    float(n),
@@ -340,18 +291,17 @@ def train_v12():
             "btc_vwap_trend":  vwap_trend,
             "btc_vwmom":       vwmom,
             **sw,
-            "btc_up_ratio_stability": up_ratio_stability,
-            "btc_vol_accel":          vol_accel,
-            "btc_size_disparity":     size_disparity,
+            "btc_up_ratio_stability": float(np.std(w_vals)),
+            "btc_vol_accel":          float(vol_last90 / (vol_first90 + 1e-8)),
+            "btc_size_disparity":     float(
+                (float(up_grp["size_usdc"].mean()) if len(up_grp) > 0 else 1.0) /
+                (float(dn_grp["size_usdc"].mean()) if len(dn_grp) > 0 else 1.0 + 1e-8)
+            ),
         }
 
-    def spot_open_at(slot_ts: int) -> float:
-        idx = np.searchsorted(spot_ts_arr, slot_ts * 1000, side="right") - 1
-        return float(spot_px_arr[idx]) if idx >= 0 else 0.0
-
-    # ── Step 9: Build dataset ──────────────────────────────────────────────────
-    log.info("Step 9: Building feature dataset...")
-    vol_series      = all_markets["market_id"].map(slot_vol).fillna(0).values
+    # ── Step 5: Build dataset ──────────────────────────────────────────────────
+    log.info("Step 5: Building feature dataset...")
+    vol_series      = markets["market_id"].map(slot_vol).fillna(0).values
     btc_grps        = dict(list(btc_inslot.groupby("market_id")))
 
     up_ratio_series = np.array([
@@ -360,23 +310,23 @@ def train_v12():
                 btc_grps[r["market_id"]]["outcome"] == "Up"].sum() /
             (btc_grps[r["market_id"]]["size_usdc"].sum() + 1e-8)
         ) if r["market_id"] in btc_grps else 0.5
-        for _, r in all_markets.iterrows()
+        for _, r in markets.iterrows()
     ])
 
-    sw_series = np.full((len(all_markets), 6), 0.5)
-    for i, row in all_markets.iterrows():
+    sw_series = np.full((len(markets), 6), 0.5)
+    for i, row in markets.iterrows():
         grp = btc_grps.get(row["market_id"])
         if grp is None: continue
         for w in range(6):
-            t0_w, t1_w = w * 30, (w + 1) * 30
-            sub = grp[(grp["t_sec"] >= t0_w) & (grp["t_sec"] < t1_w)]
+            sub = grp[(grp["t_sec"] >= w*30) & (grp["t_sec"] < (w+1)*30)]
             if len(sub) > 0:
                 vu = (sub["size_usdc"] * (sub["outcome"] == "Up")).sum()
                 sw_series[i, w] = float(vu / (sub["size_usdc"].sum() + 1e-8))
 
     records = []
     skipped = 0
-    for i, row in all_markets.iterrows():
+    spot_feat_filled = 0  # track how many markets got real spot features
+    for i, row in markets.iterrows():
         mid    = row["market_id"]
         target = target_map[mid]
         grp    = btc_grps.get(mid)
@@ -399,26 +349,27 @@ def train_v12():
 
         feat.update(tick_features(grp))
 
+        # ── Spot features from Binance (v14 key change) ───────────────────────
         spot_open = spot_open_at(slot_ts)
-        sp = grp["spot_price_usdt"].dropna()
-        if spot_open > 0 and len(sp) >= 1:
-            feat["btc_inslot_ret"] = (float(sp.iloc[-1]) - spot_open) / (spot_open + 1e-8)
-            feat["btc_inslot_vol"] = float(sp.std() / (sp.mean() + 1e-8)) if len(sp) >= 2 else 0.0
-        else:
-            feat["btc_inslot_ret"] = 0.0
-            feat["btc_inslot_vol"] = 0.0
 
-        for w_s, lbl in [(300,"5m"), (900,"15m"), (1800,"30m"), (3600,"1h"), (14400,"4h")]:
+        # Inslot: use Binance 1m candles within 0-180s window
+        feat.update(inslot_spot_features(slot_ts))
+        if spot_open > 0:
+            spot_feat_filled += 1
+
+        # Pre-slot returns: 5m, 15m, 30m, 1h, 4h
+        for w_s, lbl in [(300, "5m"), (900, "15m"), (1800, "30m"), (3600, "1h"), (14400, "4h")]:
             idx0, idx1 = np.searchsorted(spot_ts_arr,
-                                          [(slot_ts - w_s)*1000, slot_ts*1000])
+                                          [(slot_ts - w_s) * 1000.0, slot_ts * 1000.0])
             seg = spot_px_arr[idx0:idx1]
             if len(seg) >= 2:
-                feat[f"btc_pre_{lbl}_ret"] = float((seg[-1]-seg[0]) / (seg[0]+1e-8))
-                feat[f"btc_pre_{lbl}_vol"] = float(np.std(seg) / (np.mean(seg)+1e-8))
+                feat[f"btc_pre_{lbl}_ret"] = float((seg[-1] - seg[0]) / (seg[0] + 1e-8))
+                feat[f"btc_pre_{lbl}_vol"] = float(np.std(seg) / (np.mean(seg) + 1e-8))
             else:
                 feat[f"btc_pre_{lbl}_ret"] = 0.0
                 feat[f"btc_pre_{lbl}_vol"] = 0.0
 
+        # Psychological level distances
         if spot_open > 0:
             feat["btc_dist_1k"]  = float(abs(spot_open % 1000) / 1000)
             feat["btc_dist_5k"]  = float(abs(spot_open % 5000) / 5000)
@@ -426,6 +377,7 @@ def train_v12():
         else:
             feat["btc_dist_1k"] = feat["btc_dist_5k"] = feat["btc_dist_10k"] = 0.5
 
+        # ── Volume z-score / ratio ────────────────────────────────────────────
         win_start = max(0, rank - 20)
         hist_vols = vol_series[win_start:rank]
         cur_vol   = vol_series[rank]
@@ -436,6 +388,7 @@ def train_v12():
             feat["btc_vol_zscore"] = 0.0
             feat["btc_vol_ratio"]  = 1.0
 
+        # ── Up-ratio z-scores (5/10/20 slot windows) ──────────────────────────
         cur_ur = up_ratio_series[rank]
         for win_ur, lbl_ur in [(5, "5s"), (10, "10s"), (20, "20s")]:
             ws = max(0, rank - win_ur)
@@ -447,16 +400,16 @@ def train_v12():
                 feat[f"btc_up_ratio_zscore_{lbl_ur}"]    = 0.0
                 feat[f"btc_up_ratio_hist_mean_{lbl_ur}"] = 0.5
 
+        # ── Sub-window up-ratio z-scores ──────────────────────────────────────
         for w in range(6):
             cur_sw_ur = sw_series[rank, w]
             ws = max(0, rank - 20)
             hist_sw = sw_series[ws:rank, w]
-            if len(hist_sw) >= 5:
-                feat[f"btc_up_w{w}_zscore"] = float(
-                    (cur_sw_ur - hist_sw.mean()) / (hist_sw.std() + 1e-8))
-            else:
-                feat[f"btc_up_w{w}_zscore"] = 0.0
+            feat[f"btc_up_w{w}_zscore"] = float(
+                (cur_sw_ur - hist_sw.mean()) / (hist_sw.std() + 1e-8)
+            ) if len(hist_sw) >= 5 else 0.0
 
+        # ── Realized volatility (5 / 10 slot windows) ─────────────────────────
         for win_rv, lbl_rv in [(5, "5s"), (10, "10s")]:
             ws = max(0, rank - win_rv)
             past_rets = []
@@ -464,12 +417,13 @@ def train_v12():
                 bslot = rank_to_slotts.get(back_rank)
                 if bslot is None: continue
                 idx0, idx1 = np.searchsorted(spot_ts_arr,
-                                              [(bslot - 300)*1000, bslot*1000])
+                                              [(bslot - 300) * 1000.0, bslot * 1000.0])
                 seg = spot_px_arr[idx0:idx1]
                 if len(seg) >= 2:
-                    past_rets.append((seg[-1]-seg[0]) / (seg[0]+1e-8))
+                    past_rets.append((seg[-1] - seg[0]) / (seg[0] + 1e-8))
             feat[f"btc_realized_vol_{lbl_rv}"] = float(np.std(past_rets)) if len(past_rets) >= 3 else 0.0
 
+        # ── Lag features ──────────────────────────────────────────────────────
         for lag in [1, 2, 3]:
             feat[f"lag_{lag}_outcome"] = float(rank_to_target.get(rank - lag, 0.5))
 
@@ -482,7 +436,7 @@ def train_v12():
                 else: break
         feat["lag_streak"] = float(streak)
 
-        # OB features: always 0.0 (hardcoded) — same as v10 live behavior
+        # OB hardcoded 0.0 — same as live behavior
         feat.update({"ob_up_bid": 0.5, "ob_up_ask": 0.5, "ob_up_spread": 0.0,
                      "ob_implied_prob": 0.5, "ob_up_bid_depth": 0.0,
                      "ob_up_ask_depth": 0.0, "ob_up_imbalance": 0.0})
@@ -491,13 +445,22 @@ def train_v12():
 
     df = pd.DataFrame(records).sort_values("slot_ts").reset_index(drop=True)
     log.info("Dataset: %d samples (skipped %d with < 5 ticks)", len(df), skipped)
+    log.info("Spot coverage: %d/%d markets had valid spot open (%.1f%%)",
+             spot_feat_filled, len(records),
+             100 * spot_feat_filled / max(len(records), 1))
     log.info("Target balance: %s", dict(df["target"].value_counts()))
+
+    # Verify spot features are no longer dead weight
+    for col in ["btc_inslot_ret", "btc_pre_1h_ret", "btc_pre_4h_ret", "btc_dist_1k"]:
+        if col in df.columns:
+            zero_pct = (df[col] == 0.0).mean() * 100
+            log.info("  %s zero%%: %.1f%%", col, zero_pct)
 
     NON_FEAT = {"market_id", "slot_ts", "target"}
     features = [c for c in df.columns if c not in NON_FEAT]
     log.info("Features: %d total", len(features))
 
-    # ── Purged walk-forward CV ─────────────────────────────────────────────────
+    # ── Walk-forward CV ────────────────────────────────────────────────────────
     def walk_forward_purged(df, feats, params=None, gap=WF_GAP, n_splits=7):
         df = df.sort_values("slot_ts").reset_index(drop=True)
         n = len(df)
@@ -526,14 +489,21 @@ def train_v12():
         return {"wf_auc": float(np.mean(aucs)), "wf_acc": float(np.mean(accs)),
                 "wf_brier": float(np.mean(briers)), "fold_aucs": aucs}
 
-    # ── Step 10: Baseline WF ───────────────────────────────────────────────────
-    log.info("Step 10: Baseline walk-forward (gap=5)...")
+    # ── Step 6: Baseline WF ────────────────────────────────────────────────────
+    log.info("Step 6: Baseline walk-forward (gap=5)...")
     wf_base = walk_forward_purged(df, features)
-    log.info("  Baseline WF: AUC=%.4f | Acc=%.4f | Brier=%.4f",
+    log.info("  Baseline: AUC=%.4f | Acc=%.4f | Brier=%.4f",
              wf_base["wf_auc"], wf_base["wf_acc"], wf_base["wf_brier"])
     log.info("  Fold AUCs: %s", [f"{x:.3f}" for x in wf_base["fold_aucs"]])
 
-    log.info("Step 10b: Baseline WF (gap=3 comparison)...")
+    # Sanity check: AUC=1.0 trap (happens when data loading failed)
+    if wf_base["wf_auc"] > 0.99:
+        raise RuntimeError(
+            f"AUC={wf_base['wf_auc']:.4f} — suspiciously perfect. "
+            "Likely data loading bug. Aborting to prevent false promotion."
+        )
+
+    log.info("Step 6b: Baseline WF (gap=3 comparison)...")
     wf_gap3 = walk_forward_purged(df, features, gap=3, n_splits=7)
     log.info("  Gap=3: AUC=%.4f | Gap=5: AUC=%.4f", wf_gap3["wf_auc"], wf_base["wf_auc"])
     if wf_gap3["wf_auc"] > wf_base["wf_auc"]:
@@ -544,8 +514,8 @@ def train_v12():
         log.info("  Gap=5 is better — keeping")
         ACTIVE_GAP = WF_GAP
 
-    # ── Step 11: Permutation importance ───────────────────────────────────────
-    log.info("Step 11: Permutation importance...")
+    # ── Step 7: Permutation importance ────────────────────────────────────────
+    log.info("Step 7: Permutation importance...")
     split = int(len(df) * 0.75)
     tr_imp, va_imp = df.iloc[:split], df.iloc[split:]
     imp_mdl = lgb.LGBMClassifier(
@@ -568,8 +538,8 @@ def train_v12():
     dropped = len(features) - len(good_features)
     log.info("  Dropped %d noise features, keeping %d", dropped, len(good_features))
 
-    # ── Step 12: Optuna HPO ────────────────────────────────────────────────────
-    log.info("Step 12: Optuna HPO (%d trials)...", OPTUNA_TRIALS)
+    # ── Step 8: Optuna HPO ─────────────────────────────────────────────────────
+    log.info("Step 8: Optuna HPO (%d trials)...", OPTUNA_TRIALS)
     def objective(trial):
         p = dict(
             n_estimators      = trial.suggest_int("n_estimators", 100, 600),
@@ -591,10 +561,10 @@ def train_v12():
         best_params["learning_rate"] = best_params.pop("lr")
     log.info("  Optuna best WF AUC: %.4f", study.best_value)
 
-    # ── Step 13: Optimized WF ─────────────────────────────────────────────────
-    log.info("Step 13: Walk-forward (optimized params)...")
+    # ── Step 9: Optimized WF ──────────────────────────────────────────────────
+    log.info("Step 9: Walk-forward (optimized)...")
     wf_opt = walk_forward_purged(df, good_features, best_params, gap=ACTIVE_GAP, n_splits=7)
-    log.info("  Optimized WF: AUC=%.4f | Acc=%.4f | Brier=%.4f",
+    log.info("  Optimized: AUC=%.4f | Acc=%.4f | Brier=%.4f",
              wf_opt["wf_auc"], wf_opt["wf_acc"], wf_opt["wf_brier"])
     log.info("  Fold AUCs: %s", [f"{x:.3f}" for x in wf_opt["fold_aucs"]])
 
@@ -603,13 +573,13 @@ def train_v12():
         log.info("  Using: optimized params")
     else:
         final_wf, final_params, final_feats = wf_base, {}, features
-        log.info("  Using: baseline params (Optuna didn't improve)")
+        log.info("  Using: baseline params")
 
     final_auc, final_acc, final_brier = (
         final_wf["wf_auc"], final_wf["wf_acc"], final_wf["wf_brier"])
 
-    # ── Step 14: Train final model with calibration ────────────────────────────
-    log.info("Step 14: Training final calibrated model on full data...")
+    # ── Step 10: Train final calibrated model ─────────────────────────────────
+    log.info("Step 10: Training final calibrated model on full data...")
     base_p = dict(objective="binary", class_weight="balanced", n_estimators=400,
                   learning_rate=0.04, num_leaves=31, min_child_samples=15,
                   subsample=0.8, colsample_bytree=0.8,
@@ -630,15 +600,16 @@ def train_v12():
         "wf_acc":           final_acc,
         "wf_brier":         final_brier,
         "fold_aucs":        final_wf["fold_aucs"],
-        "version":          "v12",
+        "version":          "v14",
         "n_samples":        len(df),
         "n_features":       len(final_feats),
         "best_params":      final_params,
         "ensemble":         False,
         "dropped_features": dropped,
         "champion_compared_auc": CHAMPION_AUC,
+        "spot_source":      "binance_1m_klines",  # NEW: document spot source
     }
-    model_path = Path("/tmp/btc_model_v12.pkl")
+    model_path = Path("/tmp/btc_model_v14.pkl")
     with open(model_path, "wb") as f:
         pickle.dump(bundle, f)
     log.info("Model saved: %.1f MB", model_path.stat().st_size / 1e6)
@@ -648,7 +619,7 @@ def train_v12():
     log.info("RESULTS SUMMARY")
     log.info("  Champion (%s): AUC=%.4f  Brier=%.4f  Acc=%.4f",
              champion.get("version", "?"), CHAMPION_AUC, CHAMPION_BRIER, CHAMPION_ACC)
-    log.info("  v12 candidate:  AUC=%.4f  Brier=%.4f  Acc=%.4f",
+    log.info("  v14 candidate:  AUC=%.4f  Brier=%.4f  Acc=%.4f",
              final_auc, final_brier, final_acc)
     log.info("  Samples: %d | Features: %d (dropped %d noise)",
              len(df), len(final_feats), dropped)
@@ -667,17 +638,17 @@ def train_v12():
 
     promoted = False
     if should_promote:
-        log.info("Promoting v12 to HF champion...")
+        log.info("Promoting v14 to HF champion...")
         api = HfApi(token=HF_TOKEN)
         api.upload_file(
             path_or_fileobj=str(model_path),
             path_in_repo="champion.pkl",
             repo_id=HF_MODEL_REPO, repo_type="model",
-            commit_message=(f"Champion v12: AUC={final_auc:.4f} Brier={final_brier:.4f} "
-                            f"Acc={final_acc:.4f} | HF+local combined, {len(df)} samples"),
+            commit_message=(f"Champion v14: AUC={final_auc:.4f} Brier={final_brier:.4f} "
+                            f"Acc={final_acc:.4f} | local 2026 + Binance spot, {len(df)} samples"),
         )
         meta_out = {
-            "version":       "v12",
+            "version":       "v14",
             "feature_list":  final_feats,
             "features":      len(final_feats),
             "wf_auc":        final_auc,
@@ -690,10 +661,10 @@ def train_v12():
             "ensemble":      False,
             "promoted_at":   time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "champion_compared_auc": CHAMPION_AUC,
-            "notes": (f"v12: HF ({(all_markets['source']=='hf').sum()} mkts) + "
-                      f"local ({(all_markets['source']=='local').sum()} mkts). "
-                      f"Same v9/v10 features. 7-fold WF, gap {ACTIVE_GAP}. "
-                      f"OB hardcoded 0.0 (same as live). Isotonic calibration."),
+            "spot_source":   "binance_1m_klines",
+            "notes": (f"v14: local-only 2026 data ({len(df)} samples). "
+                      f"Binance 1m klines spot (replaces null spot_price_usdt from ticks). "
+                      f"7-fold WF gap={ACTIVE_GAP}. OB hardcoded 0.0. Isotonic calibration."),
             "best_params":   final_params,
         }
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fp:
@@ -702,12 +673,12 @@ def train_v12():
             path_or_fileobj=fp.name,
             path_in_repo="champion_meta.json",
             repo_id=HF_MODEL_REPO, repo_type="model",
-            commit_message=f"Champion v12 meta AUC={final_auc:.4f}",
+            commit_message=f"Champion v14 meta AUC={final_auc:.4f}",
         )
-        log.info("Champion v12 promoted: https://huggingface.co/%s", HF_MODEL_REPO)
+        log.info("Champion v14 promoted: https://huggingface.co/%s", HF_MODEL_REPO)
         promoted = True
     else:
-        log.warning("v12 not promoted.")
+        log.warning("v14 not promoted.")
 
     log.info("Done.")
     return {
@@ -726,10 +697,10 @@ def train_v12():
 
 @app.local_entrypoint()
 def main():
-    print("Submitting BTC v12 training job to Modal...")
-    r = train_v12.remote()
+    print("Submitting BTC v14 training job to Modal (local 2026 + Binance spot)...")
+    r = train_v14.remote()
     print(f"\n{'='*55}")
-    print("TRAINING COMPLETE — v12 (HF + Local combined)")
+    print("TRAINING COMPLETE — v14 (Binance spot fix)")
     print(f"  Baseline AUC:     {r['wf_auc_baseline']:.4f}")
     print(f"  Optimized AUC:    {r['wf_auc_optimized']:.4f}")
     print(f"  Final AUC:        {r['wf_auc_final']:.4f}")

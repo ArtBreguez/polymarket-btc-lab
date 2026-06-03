@@ -64,7 +64,8 @@ BINANCE_WS      = "wss://stream.binance.com:9443/stream?streams=btcusdt@kline_1m
 BINANCE_REST    = "https://api.binance.com/api/v3"
 
 HTTP_TIMEOUT    = 3    # seconds — tight budget for a 10s loop
-MAX_TRADE_PAGES = 20   # max pages from data-api per token (500/page = 10000 trades max)
+MAX_TRADE_PAGES = 8    # max 8 pages/token × 2 tokens = 16 calls max (~4000 trades/token)
+                       # Keeps fetch_inslot_trades well under 30s even on slow days.
                        # NOTE: data-api returns trades in random order (not chronological),
                        # so we must page through all pages to collect inslot trades.
 
@@ -331,8 +332,14 @@ def _clob_daemon_thread():
                                         price = float(change.get("price", 1))
                                         if price < 0.97:
                                             with _clob_prices_lock:
-                                                _clob_prices[asset_id] = price
-                                                _clob_price_ts[asset_id] = time.time()
+                                                # Only update if this price is <= current best ask.
+                                                # price_change fires on ANY book level change,
+                                                # not just the top-of-book. Storing a deeper
+                                                # level would overwrite a tighter best ask.
+                                                existing = _clob_prices.get(asset_id, 1.0)
+                                                if price <= existing:
+                                                    _clob_prices[asset_id] = price
+                                                    _clob_price_ts[asset_id] = time.time()
             except Exception as e:
                 log.warning("CLOB WS error: %s — reconnecting in 5s", e)
                 await asyncio.sleep(5)
@@ -488,6 +495,20 @@ def build_spot_features(slot_ts: int) -> dict:
     else:
         feat["btc_dist_1k"] = feat["btc_dist_5k"] = feat["btc_dist_10k"] = 0.5
 
+    # 1h/4h ratio — (px_now - px_1h_ago) / (px_now - px_4h_ago)
+    # MUST match training formula exactly: uses absolute price deltas, not % returns.
+    # Guard: if either historical price is unavailable (cold buffer < 4h), return 0.0
+    # so the model receives a neutral value rather than an extreme OOD value.
+    px_now = spot_open  # already computed above from spot buffer at slot_ts
+    seg_1h_start = _seg(slot_ts - 3600, slot_ts - 3600 + 60)
+    seg_4h_start = _seg(slot_ts - 14400, slot_ts - 14400 + 60)
+    px_1h_ago = float(seg_1h_start[0]) if len(seg_1h_start) > 0 else 0.0
+    px_4h_ago = float(seg_4h_start[0]) if len(seg_4h_start) > 0 else 0.0
+    if px_now > 0 and px_1h_ago > 0 and px_4h_ago > 0 and abs(px_now - px_4h_ago) > 1:
+        feat["btc_pre_1h_4h_ratio"] = (px_now - px_1h_ago) / (px_now - px_4h_ago + 1e-9)
+    else:
+        feat["btc_pre_1h_4h_ratio"] = 0.0  # cold buffer or no meaningful 4h move
+
     return feat
 
 
@@ -542,8 +563,8 @@ def get_ask_price(token_id: str) -> float:
             price = float(r.json().get("price", 0) or 0)
             if 0 < price < 1:
                 return price
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("  get_ask_price HTTP fallback failed: %s — returning 0.5 (may cause false edge)", e)
     return 0.5
 
 
@@ -628,7 +649,7 @@ def _build_ob_features(up_token_id: str) -> dict:
       ob_imbalance_end — same as ob_imbalance (single snapshot)
     """
     try:
-        r = requests.get(
+        r = _http.get(
             f"{CLOB_URL}/book",
             params={"token_id": up_token_id},
             timeout=5,
@@ -839,6 +860,10 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
     # populated by _update_slot_history() after each prediction
     hist = _slot_history  # module-level ring buffer
 
+    # Temporal interaction features (v17): hour modulates CLOB signal
+    feat["hour_x_up_ratio"] = cur_up_ratio * (hour / 24.0)
+    feat["hour_x_tw_ur"]    = feat.get("btc_tw_up_ratio", 0.5) * (hour / 24.0)
+
     # Multi-scale up_ratio zscore (5 / 10 / 20 slots lookback)
     for win, lbl in [(5, "5s"), (10, "10s"), (20, "20s")]:
         past = [h["up_ratio"] for h in hist[-win:]] if hist else []
@@ -865,13 +890,25 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
         past_rets = [h.get("pre_ret", 0.0) for h in hist[-win:]] if hist else []
         feat[f"btc_realized_vol_{lbl}"] = float(np.std(past_rets)) if len(past_rets) >= 3 else 0.0
 
-    # Lag outcomes
+    # Lag outcomes (extended to 5 lags for v17+)
     n_hist = len(hist)
-    for lag in [1, 2, 3]:
+    for lag in [1, 2, 3, 4, 5]:
         if n_hist >= lag and hist[-lag].get("target") is not None:
             feat[f"lag_{lag}_outcome"] = float(hist[-lag]["target"])
         else:
             feat[f"lag_{lag}_outcome"] = 0.5
+
+    # prev_slot_up_ratio/n_ticks/vol — continuous lag signals (v16/v17 features)
+    for lag in [1, 2, 3, 4, 5]:
+        if n_hist >= lag:
+            h = hist[-lag]
+            feat[f"prev_slot_up_ratio_{lag}"]  = float(h.get("up_ratio", 0.5))
+            feat[f"prev_slot_n_ticks_{lag}"]   = float(h.get("n_ticks", 0.0))
+            feat[f"prev_slot_vol_{lag}"]        = float(h.get("vol_total", 0.0))
+        else:
+            feat[f"prev_slot_up_ratio_{lag}"]  = 0.5
+            feat[f"prev_slot_n_ticks_{lag}"]   = 0.0
+            feat[f"prev_slot_vol_{lag}"]        = 0.0
 
     # Lag streak
     streak = 0
@@ -946,10 +983,13 @@ def _seed_slot_history():
                     target = 0
                 else:
                     continue  # not resolved yet
-                # up_ratio proxy: use outcomePrices as implied probability
-                # (close to real up_ratio since market price tracks order flow)
-                up_ratio = up_price
-                sw = [up_ratio] * 6
+                # Use neutral 0.5 for up_ratio seed — outcomePrices is 0/1 after
+                # resolution and completely misrepresents tick-based up_ratio
+                # (which ranges 0.2–0.8 during the slot). Starting neutral is
+                # better than feeding extreme out-of-distribution values to
+                # prev_slot_up_ratio_* features.
+                up_ratio = 0.5
+                sw = [0.5] * 6
 
                 # pre_ret from spot buffer if warm
                 pre_ret = 0.0
@@ -1010,11 +1050,13 @@ def _update_slot_history(slot_ts: int, up_ratio: float, sw: list[float],
                 entry["target"] = target
             return
     _slot_history.append({
-        "slot_ts":  slot_ts,
-        "up_ratio": up_ratio,
-        "sw":       sw,
-        "pre_ret":  pre_ret,
-        "target":   target,
+        "slot_ts":   slot_ts,
+        "up_ratio":  up_ratio,
+        "sw":        sw,
+        "pre_ret":   pre_ret,
+        "target":    target,
+        "n_ticks":   0.0,    # filled by _update_slot_history callers
+        "vol_total": 0.0,    # filled by _update_slot_history callers
     })
     if len(_slot_history) > _HIST_MAX:
         _slot_history = _slot_history[-_HIST_MAX:]
@@ -1158,7 +1200,7 @@ def settle_trades(trades: list[dict]) -> bool:
         entry      = trade["entry_price"]
         # Use actual_cost if stored (bumped-to-min-5 case), else derive from stake
         cost       = trade.get("actual_cost") or trade.get("stake_usdc") or STAKE_USDC
-        shares_out = trade.get("shares") or (cost / (entry + 1e-8))
+        shares_out = trade.get("shares") if trade.get("shares") else (cost / (entry + 1e-8))
         if direction == actual:
             # Deduct taker fee from gross proceeds
             pnl    = round(shares_out * (1.0 - TAKER_FEE) - cost, 4)
@@ -1171,6 +1213,47 @@ def settle_trades(trades: list[dict]) -> bool:
         log.info("SETTLED slot=%d | %s→%s | %s | P&L $%.2f",
                  trade["slot_ts"], direction, actual, result, pnl)
     return updated
+
+
+def _backfill_history_targets():
+    """Resolve targets for _slot_history entries that still have target=None.
+    This covers slots that were skipped (low conf / no edge) and thus never
+    went through settle_trades(). Without this, lag_N_outcome stays at 0.5
+    for all skipped slots indefinitely.
+    Only queries Gamma for slots that closed >60s ago (SETTLE_GRACE).
+    Caches successes by updating in-place — idempotent.
+    """
+    now = int(time.time())
+    backfilled = 0
+    for entry in _slot_history:
+        if backfilled >= 5:
+            break  # max 5 Gamma calls per loop iteration to avoid blocking entry window
+        if entry.get("target") is not None:
+            continue
+        slot_ts = entry["slot_ts"]
+        if now < slot_ts + SLOT_DURATION + SETTLE_GRACE:
+            continue  # not resolved yet
+        slug = f"btc-updown-5m-{slot_ts}"
+        try:
+            r = _http.get(f"{GAMMA_HOST}/markets/slug/{slug}", timeout=5)
+            if not r.ok:
+                continue
+            data = r.json()
+            resolution = data.get("resolution")
+            if resolution is None:
+                op = data.get("outcomePrices", "[]")
+                if isinstance(op, str):
+                    op = json.loads(op)
+                if op and len(op) >= 2:
+                    if float(op[0]) >= 0.99:
+                        resolution = 1.0
+                    elif float(op[1]) >= 0.99:
+                        resolution = 0.0
+            if resolution is not None:
+                entry["target"] = 1 if float(resolution) >= 0.5 else 0
+                backfilled += 1
+        except Exception:
+            pass
 
 
 # ── Main loop ───────────────────────────────────────────────────────────────────
@@ -1205,6 +1288,7 @@ def run(client, model, features):
     _seed_slot_history()
 
     while True:
+      try:
         now    = int(time.time())
         trades = load_trades()
 
@@ -1212,6 +1296,12 @@ def run(client, model, features):
         if settle_trades(trades):
             save_trades(trades)
             _print_summary(trades)
+
+        # 1b. Backfill targets for skipped/no-trade slots in _slot_history
+        # settle_trades() only fills targets for slots with open trades.
+        # Slots that were skipped (low confidence / no edge) never get a target,
+        # causing lag_N_outcome to stay at 0.5 indefinitely — degrading lag features.
+        _backfill_history_targets()
 
         # 2. Enter — only block re-entry for open/settled/error, NOT skipped
         already = {t["slot_ts"] for t in trades
@@ -1246,6 +1336,12 @@ def run(client, model, features):
                 sw=[feat.get(f"btc_up_w{i}", 0.5) for i in range(6)],
                 pre_ret=feat.get("btc_pre_5m_ret", 0.0),
             )
+            # Fill in n_ticks and vol_total for prev_slot_* lag features
+            if _slot_history and _slot_history[-1]["slot_ts"] == slot_ts:
+                _slot_history[-1]["n_ticks"]   = float(feat.get("btc_n_ticks", 0.0))
+                _slot_history[-1]["vol_total"]  = float(
+                    feat.get("btc_vol_up", 0.0) + feat.get("btc_vol_dn", 0.0)
+                )
 
             log.info("  btc_up_ratio=%.3f momentum=%.3f tw=%.3f n_ticks=%d",
                      feat.get("btc_up_ratio", 0.5), feat.get("btc_momentum", 0),
@@ -1282,7 +1378,7 @@ def run(client, model, features):
                 trades.append({"slot_ts": slot_ts, "direction": direction,
                                 "confidence": round(confidence, 4),
                                 "entry_price": round(ask_price, 4), "status": "skipped",
-                                "reason": f"ask ${ask_price:.3f} outside valid range [0.10, 0.90]",
+                                "reason": f"ask ${ask_price:.3f} outside valid range [0.38, 0.90]",
                                 "entered_at": now})
                 save_trades(trades)
                 continue
@@ -1325,38 +1421,33 @@ def run(client, model, features):
 
             true_edge = edge_vs_ask
 
-            # ── Balance check before placing ─────────────────────────────────
+            # ── Compute shares + actual cost (CLOB min 5 shares) ───────────
+            # Do this BEFORE balance check so we can validate against real cost.
+            shares = round(STAKE_USDC / ask_price, 2)
+            actual_cost = round(shares * ask_price, 4)
+            if shares < 5.0:
+                # CLOB minimum is 5 shares — always bump, never skip.
+                # Edge check already validated the trade is worth taking.
+                shares = 5.0
+                actual_cost = round(shares * ask_price, 4)
+                log.info("  Bumped to min 5 shares — cost $%.2f (stake was $%.2f)",
+                         actual_cost, STAKE_USDC)
+
+            # ── Balance check against real order cost (not just STAKE_USDC) ──
             try:
                 bal  = client.get_balance_allowance(asset_type="COLLATERAL")
                 usdc = float(bal.balance) / 1e6
-                if usdc < STAKE_USDC * 1.05:
-                    log.error("  Insufficient balance $%.2f < $%.2f — skipping", usdc, STAKE_USDC * 1.05)
+                required = actual_cost * 1.05  # 5% buffer for fees/slippage
+                if usdc < required:
+                    log.error("  Insufficient balance $%.2f < required $%.2f — skipping",
+                              usdc, required)
                     continue
             except Exception as e:
-                log.warning("  Balance check failed: %s — proceeding", e)
+                log.warning("  Balance check FAILED: %s — PROCEEDING WITHOUT CONFIRMATION", e)
 
             # ── Place limit order at the validated ask price ──────────────────
             # Use limit (not market) to guarantee we pay the price we validated.
             # Market orders can sweep stale/extreme prices in the book.
-            # CLOB minimum order size = 5 shares — adjust stake if needed.
-            shares = round(STAKE_USDC / ask_price, 2)
-            actual_cost = round(shares * ask_price, 4)
-            if shares < 5.0:
-                # Bump to minimum 5 shares, cap cost at 2x original stake
-                shares = 5.0
-                actual_cost = round(shares * ask_price, 4)
-                if actual_cost > STAKE_USDC * 2:
-                    log.info("  Skip — min 5 shares would cost $%.2f > 2x stake $%.2f",
-                             actual_cost, STAKE_USDC)
-                    trades.append({"slot_ts": slot_ts, "direction": direction,
-                                   "confidence": round(confidence, 4),
-                                   "entry_price": round(ask_price, 4), "status": "skipped",
-                                   "reason": f"min 5 shares cost ${actual_cost:.2f} > 2x stake",
-                                   "entered_at": now})
-                    save_trades(trades)
-                    continue
-                log.info("  Bumped to min 5 shares — cost $%.2f (stake was $%.2f)",
-                         actual_cost, STAKE_USDC)
             log.info("  Placing LIMIT BUY %s — %.2f shares @ $%.3f | edge_ask=%.1f%% edge_mid=%.1f%%",
                      direction, shares, ask_price,
                      edge_vs_ask * 100, (edge_vs_mid or 0) * 100)
@@ -1369,6 +1460,7 @@ def run(client, model, features):
 
                 # Wait up to 30s for fill, then cancel if unfilled
                 filled = False
+                poll_errors = 0
                 for _ in range(6):
                     time.sleep(5)
                     try:
@@ -1381,20 +1473,69 @@ def run(client, model, features):
                             log.info("  Order FILLED: %s shares=%.2f cost=$%.2f",
                                      str(order_id)[:20], shares, actual_cost)
                             break
-                    except Exception:
-                        pass
+                        poll_errors = 0  # reset on success
+                    except Exception as e:
+                        poll_errors += 1
+                        log.warning("  get_order poll failed (%d/3): %s", poll_errors, e)
+                        if poll_errors >= 3:
+                            # Cannot confirm fill status — do NOT cancel; treat as open
+                            log.error("  get_order failed 3x — recording as open to avoid cancelling a filled order")
+                            filled = True  # conservatively assume filled
+                            break
 
                 if not filled:
                     log.info("  Order unfilled after 30s — cancelling")
+                    cancel_ok = False
                     try:
                         client.cancel_order(order_id=str(order_id))
+                        cancel_ok = True
                     except Exception as e:
-                        log.warning("  Cancel failed: %s", e)
-                    trades.append({"slot_ts": slot_ts, "direction": direction,
-                                   "confidence": round(confidence, 4),
-                                   "entry_price": round(ask_price, 4), "status": "skipped",
-                                   "reason": "limit order unfilled in 30s — cancelled",
-                                   "entered_at": now})
+                        log.warning("  Cancel failed: %s — checking for partial fill", e)
+
+                    # Check one more time for any partial fill before giving up
+                    partial_shares = 0.0
+                    try:
+                        o = client.get_order(order_id=str(order_id))
+                        partial_shares = float(getattr(o, "size_matched", 0) or 0)
+                    except Exception:
+                        pass
+
+                    if partial_shares > 0:
+                        # Partial fill — record as open position
+                        partial_cost = round(partial_shares * ask_price, 4)
+                        log.info("  Partial fill detected: %.2f shares @ $%.3f = $%.2f",
+                                 partial_shares, ask_price, partial_cost)
+                        trades.append({"slot_ts": slot_ts, "direction": direction,
+                                       "confidence": round(confidence, 4),
+                                       "entry_price": round(ask_price, 4),
+                                       "shares": partial_shares,
+                                       "actual_cost": partial_cost,
+                                       "stake_usdc": STAKE_USDC,
+                                       "token_id": token_id,
+                                       "order_id": str(order_id)[:40],
+                                       "status": "open",
+                                       "entered_at": now,
+                                       "true_edge": round(true_edge, 4),
+                                       "note": "partial_fill"})
+                    elif not cancel_ok:
+                        # Cancel failed and no partial — ghost order, must track
+                        log.error("  Ghost order %s — cancel failed and no partial fill. Manual reconciliation needed.",
+                                  str(order_id)[:20])
+                        trades.append({"slot_ts": slot_ts, "direction": direction,
+                                       "confidence": round(confidence, 4),
+                                       "entry_price": round(ask_price, 4),
+                                       "shares": shares,
+                                       "actual_cost": actual_cost,
+                                       "token_id": token_id,
+                                       "order_id": str(order_id)[:40],
+                                       "status": "error_cancel_failed",
+                                       "entered_at": now})
+                    else:
+                        trades.append({"slot_ts": slot_ts, "direction": direction,
+                                       "confidence": round(confidence, 4),
+                                       "entry_price": round(ask_price, 4), "status": "skipped",
+                                       "reason": "limit order unfilled in 30s — cancelled",
+                                       "entered_at": now})
                     save_trades(trades)
                     continue
                 trades.append({
@@ -1419,6 +1560,9 @@ def run(client, model, features):
                 save_trades(trades)
 
         time.sleep(10)  # tight loop — 70s entry window needs quick checks
+      except Exception as e:
+          log.error("Main loop unhandled exception: %s", e, exc_info=True)
+          time.sleep(5)  # brief pause before retrying to avoid tight crash loop
 
 
 def _print_summary(trades):
