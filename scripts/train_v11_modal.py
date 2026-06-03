@@ -40,6 +40,7 @@ image = (
         "optuna>=3.6",
         "huggingface_hub>=0.26",
         "requests>=2.31",
+        "urllib3>=2.0",  # force image rebuild
     )
 )
 
