@@ -330,16 +330,21 @@ def _clob_daemon_thread():
                                     if change.get("side") == "ASK":
                                         asset_id = change.get("asset_id", "")
                                         price = float(change.get("price", 1))
-                                        if price < 0.97:
-                                            with _clob_prices_lock:
-                                                # Only update if this price is <= current best ask.
-                                                # price_change fires on ANY book level change,
-                                                # not just the top-of-book. Storing a deeper
-                                                # level would overwrite a tighter best ask.
-                                                existing = _clob_prices.get(asset_id, 1.0)
-                                                if price <= existing:
-                                                    _clob_prices[asset_id] = price
-                                                    _clob_price_ts[asset_id] = time.time()
+                                        with _clob_prices_lock:
+                                            # price_change fires on ANY book level change,
+                                            # not just top-of-book. Two cases:
+                                            # (a) price <= existing: tighter ask or same level — update.
+                                            # (b) price > existing: could mean best offer was pulled
+                                            #     and book worsened. Invalidate cache so HTTP
+                                            #     fallback is used until next book snapshot.
+                                            existing = _clob_prices.get(asset_id, 1.0)
+                                            if price < 0.97 and price <= existing:
+                                                _clob_prices[asset_id] = price
+                                                _clob_price_ts[asset_id] = time.time()
+                                            elif price > existing:
+                                                # Best ask rose — invalidate to force HTTP fallback
+                                                _clob_prices.pop(asset_id, None)
+                                                _clob_price_ts.pop(asset_id, None)
             except Exception as e:
                 log.warning("CLOB WS error: %s — reconnecting in 5s", e)
                 await asyncio.sleep(5)
@@ -564,8 +569,8 @@ def get_ask_price(token_id: str) -> float:
             if 0 < price < 1:
                 return price
     except Exception as e:
-        log.warning("  get_ask_price HTTP fallback failed: %s — returning 0.5 (may cause false edge)", e)
-    return 0.5
+        log.warning("  get_ask_price HTTP fallback failed: %s — returning 0.0 (will skip trade)", e)
+    return 0.0  # 0.0 is outside [0.38, 0.90] ask filter — guarantees trade is skipped on price failure
 
 
 def get_market_mid(slot_ts: int) -> tuple[float, float] | tuple[None, None]:
@@ -762,13 +767,17 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
         w_vals = [sw[f"btc_up_w{i}"] for i in range(6)]
         btc_momentum = float(np.mean(w_vals[3:]) - np.mean(w_vals[:3]))
 
-        # Time-weighted order flow: exp decay toward slot end
+        # Time-weighted order flow — MUST match training formula exactly:
+        # w = exp(-0.02 * (OBS - t_sec))  → more weight on recent ticks
+        # tw_up = weighted_avg(is_up * size_usdc) / weighted_avg(size_usdc)
+        # Both time AND volume weighted (training uses size_usdc as secondary weight)
         if n > 0:
-            t_secs  = np.array([t["t_sec"] for t in ticks], dtype=np.float64)
-            is_up_v = np.array([1.0 if t.get("outcome") == "Up" else 0.0 for t in ticks])
-            weights = np.exp(t_secs / OBS * 2.0)
-            weights /= weights.sum() + 1e-8
-            tw_up = float((weights * is_up_v).sum())
+            t_secs   = np.array([t["t_sec"] for t in ticks], dtype=np.float64)
+            is_up_v  = np.array([1.0 if t.get("outcome") == "Up" else 0.0 for t in ticks])
+            vol_v    = np.array([t.get("size_usdc", 0.0) for t in ticks], dtype=np.float64)
+            w_exp    = np.exp(-0.02 * (OBS - t_secs))
+            denom    = float(np.average(vol_v, weights=w_exp) + 1e-9)
+            tw_up    = float(np.average(is_up_v * vol_v, weights=w_exp) / denom)
         else:
             tw_up = 0.5
 
@@ -1308,7 +1317,7 @@ def run(client, model, features):
                    if t.get("status") in ("open", "settled", "error")}
         cur_slot = (now // SLOT_DURATION) * SLOT_DURATION
 
-        for slot_ts in [cur_slot - SLOT_DURATION, cur_slot]:
+        for slot_ts in [cur_slot]:  # prev-slot check removed: t_elapsed would be 300-599, outside ENTER_WINDOW [170,240]
             t_elapsed = now - slot_ts
             if not (ENTER_WINDOW[0] <= t_elapsed <= ENTER_WINDOW[1]):
                 continue
