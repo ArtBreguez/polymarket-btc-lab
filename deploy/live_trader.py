@@ -611,7 +611,77 @@ def fetch_inslot_trades(yes_token: str, no_token: str, slot_ts: int) -> list[dic
     return all_trades
 
 
-def build_features(ticks: list[dict], slot_ts: int, features: list[str]) -> dict | None:
+def _build_ob_features(up_token_id: str) -> dict:
+    """
+    Fetch the current order book from CLOB REST and compute OB features.
+    Identical computation to training (pmdata poly_l2 book snapshots).
+    Returns 8 features. On failure returns empty dict (model uses 0.0 fallback).
+
+    Features (all computable from CLOB REST /book?token_id=...):
+      ob_mid           — (best_ask + best_bid) / 2
+      ob_spread        — best_ask - best_bid
+      ob_imbalance     — (best_bid_size - best_ask_size) / (bid + ask)
+      ob_depth_ratio   — bid_depth_5c / ask_depth_5c
+      ob_bid_depth_5c  — bid size within 5c of mid, normalized by total bid
+      ob_ask_depth_5c  — ask size within 5c of mid, normalized by total ask
+      ob_mid_drift     — 0.0 at live time (only one snapshot available)
+      ob_imbalance_end — same as ob_imbalance (single snapshot)
+    """
+    try:
+        r = requests.get(
+            f"{CLOB_URL}/book",
+            params={"token_id": up_token_id},
+            timeout=5,
+        )
+        if not r.ok:
+            return {}
+        book = r.json()
+
+        asks = book.get("asks", [])
+        bids = book.get("bids", [])
+        if not asks or not bids:
+            return {}
+
+        # Sort: asks ascending by price, bids descending
+        asks_sorted = sorted(asks, key=lambda x: float(x["price"]))
+        bids_sorted = sorted(bids, key=lambda x: float(x["price"]), reverse=True)
+
+        best_ask = float(asks_sorted[0]["price"])
+        best_bid = float(bids_sorted[0]["price"])
+        best_ask_sz = float(asks_sorted[0]["size"])
+        best_bid_sz = float(bids_sorted[0]["size"])
+        mid    = (best_ask + best_bid) / 2
+        spread = best_ask - best_bid
+
+        # Imbalance at best level
+        imbalance = float((best_bid_sz - best_ask_sz) / (best_bid_sz + best_ask_sz + 1e-8))
+
+        # Depth within 5c of mid, normalized by total depth
+        total_bid = sum(float(b["size"]) for b in bids) + 1e-8
+        total_ask = sum(float(a["size"]) for a in asks) + 1e-8
+        bid_depth_5c = sum(float(b["size"]) for b in bids
+                           if float(b["price"]) >= mid - 0.05) / total_bid
+        ask_depth_5c = sum(float(a["size"]) for a in asks
+                           if float(a["price"]) <= mid + 0.05) / total_ask
+        depth_ratio  = float(bid_depth_5c / (ask_depth_5c + 1e-8))
+
+        return {
+            "ob_mid":           float(mid),
+            "ob_spread":        float(spread),
+            "ob_imbalance":     float(imbalance),
+            "ob_depth_ratio":   float(depth_ratio),
+            "ob_bid_depth_5c":  float(bid_depth_5c),
+            "ob_ask_depth_5c":  float(ask_depth_5c),
+            "ob_mid_drift":     0.0,   # single snapshot — no drift measurable live
+            "ob_imbalance_end": float(imbalance),  # same snapshot
+        }
+    except Exception as e:
+        log.warning("OB fetch failed for %s: %s", up_token_id[:20], e)
+        return {}
+
+
+def build_features(ticks: list[dict], slot_ts: int, features: list[str],
+                   up_token_id: str = "") -> dict | None:
     """
     Build real-time features matching train_v8_modal.py tick_features_v8() exactly.
 
@@ -815,16 +885,11 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str]) -> dict
                 break
     feat["lag_streak"] = float(streak)
 
-    # ── OB features: not available live → fill with neutral defaults ───────────
-    # In training, ob_up_bid ≈ market mid price (implied prob proxy).
-    # Best live approximation: use Gamma outcomePrices (already fetched for edge check).
-    # Fill with 0.5/0 — model was trained with real OB so these will be slightly off,
-    # but it's better than zeros which were the training default for missing OB.
-    feat.update({
-        "ob_up_bid": 0.5, "ob_up_ask": 0.5, "ob_up_spread": 0.0,
-        "ob_implied_prob": 0.5, "ob_up_bid_depth": 0.0,
-        "ob_up_ask_depth": 0.0, "ob_up_imbalance": 0.0,
-    })
+    # ── OB features: fetch real order book via CLOB REST ──────────────────────
+    # Identical computation to training (pmdata poly_l2 book snapshots).
+    # Called once per slot at ~t=150s (after tick observation window ends).
+    # up_token_id must be passed in; on failure fills with None (market excluded).
+    feat.update(_build_ob_features(up_token_id))
 
     # ── Spot features ──────────────────────────────────────────────────────────
     feat.update(build_spot_features(slot_ts))
@@ -1169,7 +1234,8 @@ def run(client, model, features):
             ticks = fetch_inslot_trades(market["yes_token"], market["no_token"], slot_ts)
             log.info("  Fetched %d inslot ticks (data-api lag ~120s)", len(ticks))
 
-            feat = build_features(ticks, slot_ts, features)
+            feat = build_features(ticks, slot_ts, features,
+                                   up_token_id=market["yes_token"])
             if feat is None:
                 continue
 
