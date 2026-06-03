@@ -593,12 +593,15 @@ def fetch_inslot_trades(yes_token: str, no_token: str, slot_ts: int) -> list[dic
                         ts //= 1000
                     t_sec = ts - slot_ts
                     if 0 <= t_sec < OBSERVE_SECS:
+                        _price = float(t.get("price", 0) or 0)
+                        _size  = float(t.get("size", 0) or 0)
                         all_trades.append({
-                            "outcome": t.get("outcome", outcome_label),
-                            "side":    t.get("side", "BUY"),
-                            "price":   float(t.get("price", 0) or 0),
-                            "size":    float(t.get("size", 0) or 0),
-                            "t_sec":   t_sec,
+                            "outcome":   t.get("outcome", outcome_label),
+                            "side":      t.get("side", "BUY"),
+                            "price":     _price,
+                            "size":      _size,
+                            "size_usdc": _price * _size,  # dollar volume — matches training features.py
+                            "t_sec":     t_sec,
                         })
                 # NOTE: data-api returns trades in random order, NOT chronological.
                 # Do NOT break early based on min_ts — it would skip inslot trades
@@ -643,18 +646,18 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str]) -> dict
     # ── Order flow from inslot ticks ───────────────────────────────────────────
     if ticks:
         n      = len(ticks)
-        vol_up = sum(t["size"] for t in ticks if t.get("outcome") == "Up")
-        vol_dn = sum(t["size"] for t in ticks if t.get("outcome") == "Down")
+        vol_up = sum(t["size_usdc"] for t in ticks if t.get("outcome") == "Up")
+        vol_dn = sum(t["size_usdc"] for t in ticks if t.get("outcome") == "Down")
         total  = vol_up + vol_dn + 1e-8
 
         up_tks = [t for t in ticks if t.get("outcome") == "Up"]
         dn_tks = [t for t in ticks if t.get("outcome") == "Down"]
-        vwap_up = sum(t["price"] * t["size"] for t in up_tks) / (vol_up + 1e-8) if up_tks else 0.5
-        vwap_dn = sum(t["price"] * t["size"] for t in dn_tks) / (vol_dn + 1e-8) if dn_tks else 0.5
+        vwap_up = sum(t["price"] * t["size_usdc"] for t in up_tks) / (vol_up + 1e-8) if up_tks else 0.5
+        vwap_dn = sum(t["price"] * t["size_usdc"] for t in dn_tks) / (vol_dn + 1e-8) if dn_tks else 0.5
 
         def _ur_w(subset: list[dict]) -> float:
-            vu = sum(t["size"] for t in subset if t.get("outcome") == "Up")
-            tt = sum(t["size"] for t in subset) + 1e-8
+            vu = sum(t["size_usdc"] for t in subset if t.get("outcome") == "Up")
+            tt = sum(t["size_usdc"] for t in subset) + 1e-8
             return float(vu / tt)
 
         # 6x30s sub-windows
@@ -685,13 +688,13 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str]) -> dict
         def _vwap_up_half(grp: list[dict]) -> float:
             up = [t for t in grp if t.get("outcome") == "Up"]
             if not up: return 0.5
-            return float(sum(t["price"] * t["size"] for t in up) /
-                         (sum(t["size"] for t in up) + 1e-8))
+            return float(sum(t["price"] * t["size_usdc"] for t in up) /
+                         (sum(t["size_usdc"] for t in up) + 1e-8))
         vwap_trend = float(_vwap_up_half(late) - _vwap_up_half(early))
 
         # Volume-weighted momentum across 6 windows
         vol_by_w = np.array([
-            sum(t["size"] for t in ticks if i*30 <= t["t_sec"] < (i+1)*30)
+            sum(t["size_usdc"] for t in ticks if i*30 <= t["t_sec"] < (i+1)*30)
             for i in range(6)
         ], dtype=np.float64)
         ur_by_w  = np.array([sw[f"btc_up_w{i}"] for i in range(6)], dtype=np.float64)
@@ -709,15 +712,15 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str]) -> dict
         up_ratio_stability = float(np.std(w_vals_list))
 
         # Volume acceleration: last 90s vs first 90s
-        vol_first90 = sum(t["size"] for t in ticks if t["t_sec"] < 90)
-        vol_last90  = sum(t["size"] for t in ticks if t["t_sec"] >= 90)
+        vol_first90 = sum(t["size_usdc"] for t in ticks if t["t_sec"] < 90)
+        vol_last90  = sum(t["size_usdc"] for t in ticks if t["t_sec"] >= 90)
         vol_accel   = float(vol_last90 / (vol_first90 + 1e-8))
 
         # Size disparity: avg trade size Up vs Down
         up_tks_v9   = [t for t in ticks if t.get("outcome") == "Up"]
         dn_tks_v9   = [t for t in ticks if t.get("outcome") == "Down"]
-        avg_up_sz   = float(sum(t["size"] for t in up_tks_v9) / (len(up_tks_v9) + 1e-8))
-        avg_dn_sz   = float(sum(t["size"] for t in dn_tks_v9) / (len(dn_tks_v9) + 1e-8))
+        avg_up_sz   = float(sum(t["size_usdc"] for t in up_tks_v9) / (len(up_tks_v9) + 1e-8))
+        avg_dn_sz   = float(sum(t["size_usdc"] for t in dn_tks_v9) / (len(dn_tks_v9) + 1e-8))
         size_disparity = float(avg_up_sz / (avg_dn_sz + 1e-8))
 
         feat.update({
