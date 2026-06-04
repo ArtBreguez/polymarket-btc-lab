@@ -633,7 +633,13 @@ def get_market_mid(slot_ts: int) -> tuple[float, float] | tuple[None, None]:
     return None, None
 
 def fetch_inslot_trades(yes_token: str, no_token: str, slot_ts: int) -> list[dict]:
-    """Fetch inslot trades from data-api. Lag is ~90-120s so t=0-60s trades available at t=180s."""
+    """Fetch inslot trades from data-api. Lag is ~90-120s so t=0-60s trades available at t=180s.
+
+    IMPORTANT: The data-api returns trades for ALL markets using the same token ID,
+    not just our BTC 5-min market. We filter by slug to exclude contamination from
+    ETH, SOL, BNB, daily BTC, and other markets that share the same token.
+    """
+    expected_slug = f"btc-updown-5m-{slot_ts}"
     all_trades = []
     for token_id, outcome_label in [(yes_token, "Up"), (no_token, "Down")]:
         for page in range(MAX_TRADE_PAGES):
@@ -649,6 +655,11 @@ def fetch_inslot_trades(yes_token: str, no_token: str, slot_ts: int) -> list[dic
                     break
                 # Filter to inslot window [slot_ts, slot_ts+OBS_SECS)
                 for t in batch:
+                    # CRITICAL: skip trades from other markets sharing this token ID
+                    trade_slug = t.get("slug", "")
+                    if trade_slug and trade_slug != expected_slug:
+                        continue
+
                     ts = int(t.get("timestamp", 0))
                     if ts > 1e12:
                         ts //= 1000
@@ -914,7 +925,7 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
         if len(past) >= 3:
             mu, sd = float(np.mean(past)), float(np.std(past))
             z = float((cur_up_ratio - mu) / (sd + 1e-6))
-            feat[f"btc_up_ratio_zscore_{lbl}"]    = float(np.clip(z, -10, 10))
+            feat[f"btc_up_ratio_zscore_{lbl}"]    = float(np.clip(z, -5, 5))
             feat[f"btc_up_ratio_hist_mean_{lbl}"] = mu
         else:
             feat[f"btc_up_ratio_zscore_{lbl}"]    = 0.0
@@ -926,7 +937,7 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
     if len(past_ur_20) >= 3:
         mu20_ur = float(np.mean(past_ur_20))
         sd20_ur = float(np.std(past_ur_20)) + 1e-6
-        feat["btc_up_w5_zscore"] = float(np.clip((feat.get("btc_up_w5", 0.5) - mu20_ur) / sd20_ur, -10, 10))
+        feat["btc_up_w5_zscore"] = float(np.clip((feat.get("btc_up_w5", 0.5) - mu20_ur) / sd20_ur, -5, 5))
     else:
         feat["btc_up_w5_zscore"] = 0.0
     # Other window zscores (not in v18 top features, but keep for compatibility)
@@ -937,7 +948,7 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
         past_sw = [h["sw"][i] for h in hist[-20:] if "sw" in h] if hist else []
         if len(past_sw) >= 5:
             mu, sd = float(np.mean(past_sw)), float(np.std(past_sw))
-            feat[f"btc_up_w{i}_zscore"] = float((cur_sws[i] - mu) / (sd + 1e-8))
+            feat[f"btc_up_w{i}_zscore"] = float(np.clip((cur_sws[i] - mu) / (sd + 1e-8), -5, 5))
         else:
             feat[f"btc_up_w{i}_zscore"] = 0.0
 
