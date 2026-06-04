@@ -1008,6 +1008,55 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
 
 
 
+def _fetch_seed_up_ratio(slot_ts: int, market_data: dict) -> float:
+    """Fetch real up_ratio for a past slot from data-api trades.
+
+    Uses a single page of trades (500) per token, filtered by slug.
+    Returns 0.5 on failure (neutral fallback).
+    """
+    slug = f"btc-updown-5m-{slot_ts}"
+    token_ids = market_data.get("clobTokenIds", "[]")
+    if isinstance(token_ids, str):
+        token_ids = json.loads(token_ids)
+    if len(token_ids) < 2:
+        return 0.5
+
+    vol_up = 0.0
+    vol_dn = 0.0
+    for token_id in token_ids[:2]:
+        try:
+            r = _http.get(f"{DATA_API}/trades",
+                          params={"asset": token_id, "limit": 500},
+                          timeout=5)
+            if not r.ok:
+                continue
+            for t in r.json():
+                if not isinstance(t, dict):
+                    continue
+                if t.get("slug", "") != slug:
+                    continue
+                ts = int(t.get("timestamp", 0))
+                if ts > 1e12:
+                    ts //= 1000
+                if not (0 <= ts - slot_ts < OBSERVE_SECS):
+                    continue
+                outcome = t.get("outcome", "")
+                price = float(t.get("price", 0) or 0)
+                size = float(t.get("size", 0) or 0)
+                usdc = price * size
+                if outcome == "Up":
+                    vol_up += usdc
+                elif outcome == "Down":
+                    vol_dn += usdc
+        except Exception:
+            continue
+
+    total = vol_up + vol_dn
+    if total > 0:
+        return vol_up / total
+    return 0.5
+
+
 def _seed_slot_history():
     """
     Pre-populate _slot_history with the last _HIST_MAX resolved BTC 5min slots
@@ -1050,18 +1099,10 @@ def _seed_slot_history():
                     target = 0
                 else:
                     continue  # not resolved yet
-                # Seed with target-correlated up_ratio + variance.
-                # Real up_ratio: mean ~0.50, std ~0.15. Using 0.5 for ALL slots
-                # creates std=0 → zscore = (x-0.5)/1e-6 → explosion → clipped ±5
-                # → PREDICTION_SANITY blocks for ~25 min after restart.
-                # Fix: UP-won slots lean bullish (0.55-0.65), DOWN lean bearish
-                # (0.35-0.45). This gives realistic variance from slot 1.
-                import random
-                if target == 1:  # UP won
-                    up_ratio = 0.5 + random.uniform(0.05, 0.15)
-                else:            # DOWN won
-                    up_ratio = 0.5 - random.uniform(0.05, 0.15)
-                sw = [max(0.1, min(0.9, up_ratio + random.uniform(-0.05, 0.05))) for _ in range(6)]
+                # Fetch REAL up_ratio from tick data for this slot.
+                # This avoids zscore explosion from constant seed values.
+                up_ratio = _fetch_seed_up_ratio(slot_ts, m)
+                sw = [up_ratio] * 6  # approximate per-window with overall ratio
 
                 # pre_ret from spot buffer if warm
                 pre_ret = 0.0
