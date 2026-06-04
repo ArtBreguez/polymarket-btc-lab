@@ -657,7 +657,7 @@ def fetch_inslot_trades(yes_token: str, no_token: str, slot_ts: int) -> list[dic
                         _price = float(t.get("price", 0) or 0)
                         _size  = float(t.get("size", 0) or 0)
                         all_trades.append({
-                            "outcome":   t.get("outcome", outcome_label),
+                            "outcome":   outcome_label,  # Force Up/Down — API may return Yes/No
                             "side":      t.get("side", "BUY"),
                             "price":     _price,
                             "size":      _size,
@@ -913,7 +913,8 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
         past = [h["up_ratio"] for h in hist[-win:]] if hist else []
         if len(past) >= 3:
             mu, sd = float(np.mean(past)), float(np.std(past))
-            feat[f"btc_up_ratio_zscore_{lbl}"]    = float((cur_up_ratio - mu) / (sd + 1e-8))
+            z = float((cur_up_ratio - mu) / (sd + 1e-6))
+            feat[f"btc_up_ratio_zscore_{lbl}"]    = float(np.clip(z, -10, 10))
             feat[f"btc_up_ratio_hist_mean_{lbl}"] = mu
         else:
             feat[f"btc_up_ratio_zscore_{lbl}"]    = 0.0
@@ -925,7 +926,7 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
     if len(past_ur_20) >= 3:
         mu20_ur = float(np.mean(past_ur_20))
         sd20_ur = float(np.std(past_ur_20)) + 1e-6
-        feat["btc_up_w5_zscore"] = float((feat.get("btc_up_w5", 0.5) - mu20_ur) / sd20_ur)
+        feat["btc_up_w5_zscore"] = float(np.clip((feat.get("btc_up_w5", 0.5) - mu20_ur) / sd20_ur, -10, 10))
     else:
         feat["btc_up_w5_zscore"] = 0.0
     # Other window zscores (not in v18 top features, but keep for compatibility)
