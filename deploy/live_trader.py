@@ -47,6 +47,7 @@ from pathlib import Path
 import asyncio
 import numpy as np
 import pandas as pd
+from data_quality_gate import DataQualityGate
 import requests
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -564,7 +565,7 @@ def fetch_market(slot_ts: int) -> dict | None:
         return None
 
 def get_ask_price(token_id: str) -> float:
-    """Get best ask (cost to buy) — WS cache first, then REST /book (real order book).
+    """Get best ask (cost to buy) — WS cache first, then REST /book with retry.
 
     IMPORTANT: do NOT fall back to /price — that endpoint returns the last traded
     price, not the current best ask. It can be stale by minutes and causes entries
@@ -576,22 +577,36 @@ def get_ask_price(token_id: str) -> float:
     if ws_price is not None:
         return ws_price
 
-    # Fallback: REST /book — parse best ask directly from the live order book
-    try:
-        r = _http.get(f"{CLOB_URL}/book",
-                      params={"token_id": token_id}, timeout=HTTP_TIMEOUT)
-        if r.ok:
+    # Fallback: REST /book with retry — parse best ask from live order book
+    for attempt in range(3):
+        try:
+            r = _http.get(f"{CLOB_URL}/book",
+                          params={"token_id": token_id}, timeout=HTTP_TIMEOUT + 2)
+            if not r.ok:
+                log.warning("  get_ask_price /book HTTP %d (attempt %d/3)", r.status_code, attempt + 1)
+                time.sleep(0.5 * (attempt + 1))
+                continue
             book = r.json()
             asks = book.get("asks", [])
+            if not asks:
+                log.warning("  get_ask_price /book empty asks (attempt %d/3)", attempt + 1)
+                time.sleep(0.5 * (attempt + 1))
+                continue
             best_asks = [float(a["price"]) for a in asks
                          if float(a.get("price", 1)) < 0.97]
             if best_asks:
                 best_ask = min(best_asks)
-                log.debug("  get_ask_price /book fallback: %.3f", best_ask)
+                log.info("  get_ask_price /book fallback: %.3f (attempt %d)", best_ask, attempt + 1)
                 return best_ask
-    except Exception as e:
-        log.warning("  get_ask_price /book fallback failed: %s — returning 0.0", e)
+            else:
+                log.warning("  get_ask_price /book all asks >= 0.97 (attempt %d/3)", attempt + 1)
+                time.sleep(0.5 * (attempt + 1))
+                continue
+        except Exception as e:
+            log.warning("  get_ask_price /book exception (attempt %d/3): %s", attempt + 1, e)
+            time.sleep(0.5 * (attempt + 1))
 
+    log.warning("  get_ask_price FAILED all 3 attempts for %s — returning 0.0", token_id[:16])
     return 0.0  # outside [0.38, 0.90] filter — trade will be skipped
 
 
@@ -1300,8 +1315,10 @@ def _backfill_history_targets():
 
 # ── Main loop ───────────────────────────────────────────────────────────────────
 def run(client, model, features):
+    gate = DataQualityGate(features_list=features, warmup_slots=3)
     log.info("Live trader started | stake=$%.2f | min_conf=%.0f%% | min_edge=%.0f%%",
              STAKE_USDC, MIN_CONFIDENCE*100, MIN_EDGE*100)
+    log.info("DataQualityGate active — warming up for %d slots", gate.warmup_slots)
 
     # Print balance
     try:
@@ -1366,9 +1383,26 @@ def run(client, model, features):
             ticks = fetch_inslot_trades(market["yes_token"], market["no_token"], slot_ts)
             log.info("  Fetched %d inslot ticks (data-api lag ~120s)", len(ticks))
 
+            # ── GATE 0: Cold start protection ──────────────────────────
+            if not gate.is_warm():
+                gate.record_slot_observed()
+                continue
+
+            # ── GATE 1: Data completeness ──────────────────────────────
+            ok, reason = gate.check_data_completeness(ticks, SPOT_BUFFER, slot_ts)
+            if not ok:
+                log.info("  Skip — DATA GATE: %s", reason)
+                continue
+
             feat = build_features(ticks, slot_ts, features,
                                    up_token_id=market["yes_token"])
             if feat is None:
+                continue
+
+            # ── GATE 2: Feature sanity ─────────────────────────────────
+            ok, reason = gate.check_feature_sanity(feat)
+            if not ok:
+                log.warning("  Skip — FEATURE GATE: %s", reason)
                 continue
 
             # Push this slot into history ring buffer (target unknown until settlement)
@@ -1394,6 +1428,12 @@ def run(client, model, features):
             direction  = "UP" if prob_up >= 0.5 else "DOWN"
             confidence = prob_up if direction == "UP" else 1.0 - prob_up
             log.info("  Prediction: %s  conf=%.1f%%", direction, confidence*100)
+
+            # ── GATE 3: Prediction sanity ──────────────────────────────
+            ok, reason = gate.check_prediction_sanity(prob_up, feat)
+            if not ok:
+                log.warning("  Skip — PREDICTION GATE: %s", reason)
+                continue
 
             if confidence < MIN_CONFIDENCE:
                 log.info("  Skip — conf %.1f%% < %.0f%%", confidence*100, MIN_CONFIDENCE*100)
