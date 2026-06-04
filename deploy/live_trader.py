@@ -610,8 +610,15 @@ def get_ask_price(token_id: str) -> float:
 
 def get_market_mid(slot_ts: int) -> tuple[float, float] | tuple[None, None]:
     """
-    Get current market mid prices (UP, DOWN) from Gamma outcomePrices.
-    More reliable than ask for edge validation — reflects true market consensus.
+    Get current market mid prices (UP, DOWN) from the CLOB order book.
+
+    BUG FIX (2026-06-04): Previously used Gamma outcomePrices, but those start
+    at ~0.50/0.50 for every new BTC 5-min market and rarely update during the
+    active slot.  Real book midpoints diverge wildly (e.g. book UP mid=0.12 while
+    Gamma says 0.50), causing the ask-vs-mid divergence check to block almost
+    every trade.  Now we compute mid = (best_bid + best_ask) / 2 directly from
+    the CLOB /book endpoint, which is always live.
+
     Returns (up_mid, down_mid) or (None, None) on failure.
     """
     slug = f"btc-updown-5m-{slot_ts}"
@@ -620,14 +627,45 @@ def get_market_mid(slot_ts: int) -> tuple[float, float] | tuple[None, None]:
         if not r.ok:
             return None, None
         m = r.json()
-        op = m.get("outcomePrices", "[]")
-        if isinstance(op, str):
-            op = json.loads(op)
-        if op and len(op) >= 2:
-            up_mid   = float(op[0])
-            down_mid = float(op[1])
-            if 0 < up_mid < 1 and 0 < down_mid < 1:
-                return up_mid, down_mid
+        ctids = m.get("clobTokenIds", "[]")
+        if isinstance(ctids, str):
+            ctids = json.loads(ctids)
+        if not ctids or len(ctids) < 2:
+            return None, None
+
+        up_token, dn_token = ctids[0], ctids[1]
+        mids = []
+        for tid in [up_token, dn_token]:
+            try:
+                rb = _http.get(f"{CLOB_URL}/book",
+                               params={"token_id": tid}, timeout=HTTP_TIMEOUT + 2)
+                if not rb.ok:
+                    mids.append(None)
+                    continue
+                book = rb.json()
+                asks = [float(a["price"]) for a in book.get("asks", [])
+                        if 0 < float(a.get("price", 0)) < 0.99]
+                bids = [float(b["price"]) for b in book.get("bids", [])
+                        if 0 < float(b.get("price", 0)) < 0.99]
+                if asks and bids:
+                    mids.append((min(asks) + max(bids)) / 2.0)
+                elif asks:
+                    mids.append(min(asks))       # no bids, use best ask as proxy
+                elif bids:
+                    mids.append(max(bids))       # no asks, use best bid as proxy
+                else:
+                    mids.append(None)
+            except Exception:
+                mids.append(None)
+
+        up_mid, dn_mid = mids[0], mids[1]
+        if up_mid is not None and dn_mid is not None:
+            return up_mid, dn_mid
+        # If only one side available, derive the other (binary market: up + dn ≈ 1)
+        if up_mid is not None:
+            return up_mid, 1.0 - up_mid
+        if dn_mid is not None:
+            return 1.0 - dn_mid, dn_mid
     except Exception:
         pass
     return None, None
