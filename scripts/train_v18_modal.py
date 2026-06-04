@@ -112,42 +112,16 @@ def train_v18():
     all_slot_ts     = markets["slot_ts"].values
     all_mids        = markets["market_id"].values
 
-    # ── Step 3: Binance spot (inline fetch for full Mar-Jun 2026 range) ───
-    log.info("Step 3: Fetching Binance spot...")
-    import urllib.request as urlreq
-
-    slot_min = int(markets["slot_ts"].min())
-    slot_max = int(markets["slot_ts"].max())
-    fetch_start_ms = (slot_min - 4 * 3600) * 1000
-    fetch_end_ms   = (slot_max + 5 * 60 + 60) * 1000
-
-    candles = []
-    cur_ms  = fetch_start_ms
-    while cur_ms < fetch_end_ms:
-        url = (
-            f"https://api.binance.com/api/v3/klines?"
-            f"symbol=BTCUSDT&interval=1m"
-            f"&startTime={cur_ms}&limit=1000"
-        )
-        try:
-            with urlreq.urlopen(url, timeout=15) as resp:
-                batch = json.loads(resp.read())
-        except Exception as e:
-            log.warning("Binance fetch error at %d: %s — retrying", cur_ms, e)
-            time.sleep(2)
-            continue
-        if not batch:
-            break
-        candles.extend(batch)
-        cur_ms = int(batch[-1][0]) + 60_000
-        time.sleep(0.15)
-
-    candle_arr  = np.array([[int(c[0]) // 1000, float(c[4])] for c in candles])
-    candle_arr  = candle_arr[np.argsort(candle_arr[:, 0])]
-    _, idx      = np.unique(candle_arr[:, 0], return_index=True)
-    candle_arr  = candle_arr[idx]
-    spot_ts_arr = candle_arr[:, 0].astype(np.int64)
-    spot_px_arr = candle_arr[:, 1].astype(np.float64)
+    # ── Step 3: Binance spot (from pre-fetched parquet on Volume) ─────────
+    log.info("Step 3: Loading Binance spot from Volume...")
+    spot_path = LOCAL_DIR / "binance_spot_full.parquet"
+    if not spot_path.exists():
+        # Fallback to older file
+        spot_path = LOCAL_DIR / "binance_spot_local.parquet"
+    spot_df = pd.read_parquet(str(spot_path))
+    spot_df = spot_df.sort_values("timestamp_ms").drop_duplicates("timestamp_ms")
+    spot_ts_arr = (spot_df["timestamp_ms"].values // 1000).astype(np.int64)
+    spot_px_arr = spot_df["close"].values.astype(np.float64)
     log.info("Binance spot: %d candles (%.0f days)",
              len(spot_ts_arr), (spot_ts_arr[-1] - spot_ts_arr[0]) / 86400)
 

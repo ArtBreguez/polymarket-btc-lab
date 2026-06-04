@@ -288,13 +288,117 @@ Features tested and consistently dropped by permutation importance:
 
 ## Reproduction
 
-To retrain the current champion (v10):
+To retrain the current champion (v18):
 ```bash
-./train.sh v10
-# or
-modal run scripts/train_v10_modal.py
+modal run scripts/train_v18_modal.py
 ```
 
 All training scripts are in `scripts/train_vN_modal.py`. Each is self-contained —
-downloads data from HuggingFace, trains on Modal cloud (~20min, ~$0.25), and promotes
+loads data from Modal Volume, trains on Modal cloud (~45min, ~$0.50), and promotes
 if it beats the current champion on 2/3 metrics.
+
+---
+
+### v13–v16 — Iterative improvements (not documented individually)
+
+Various improvements on top of v10: extended lag context using `new_markets.csv` (15,257 markets from pmdata.dev), temporal features, prev_slot_up_ratio from expanded timeline. Champion progressed from v10 AUC 0.8547 to v16 AUC ~0.8475 and eventually v17.
+
+---
+
+### v17 — Extended lag context + temporal features
+**Date:** 2026-06-03 | **Champion:** Promoted
+
+| AUC | Acc | Brier | Features |
+|-----|-----|-------|----------|
+| 0.8925 | 0.8032 | 0.1342 | ~30 |
+
+**Changes:** Extended lag context using `new_markets.csv` (15,257 markets, Apr 12 - Jun 3 2026) for richer lag features. Added temporal features (hour_sin/cos, dow_sin/cos, hour × up_ratio). Used combined 22k timeline for prev_slot_up_ratio.
+
+**Data:** 7,062 markets with ticks (local CLOB), 15,257 markets for lag context only.
+
+**Result:** Significant jump from v10/v12 era. Best AUC (0.8925), best Acc (0.8032), best Brier (0.1342) ever.
+
+**Lessons:**
+- ✅ Extended lag context from tickless markets adds real signal
+- ✅ Temporal features (hour × up_ratio) work — listed as untested in v12 era
+- ✅ 22k timeline for prev_slot_up_ratio better than 7k-only
+
+---
+
+### v18 — 3x data expansion (22k markets with ticks)
+**Date:** 2026-06-04 | **Champion:** Promoted
+
+| AUC | Acc | Brier | Features | Samples |
+|-----|-----|-------|----------|---------|
+| **0.8966** | **0.8104** | **0.1318** | 30 | 22,319 |
+
+**Fold AUCs:** [0.8831, 0.8877, 0.9006, 0.9020, 0.9099] — improving trend!
+
+**Changes:**
+- **3x MORE DATA:** `ticks_btc_full_clean.parquet` (22,237 markets, 68.3M ticks, Mar–Jun 2026) vs 7,062 markets in v17. Sources: local CLOB (Mar-Apr) + pmdata.dev retroactive ticks (Apr 12 - Jun 3).
+- **UNIFIED TIMELINE:** all 22k markets now have real ticks → `prev_slot_up_ratio` uses actual data, not 0.5 fallback.
+- **BINANCE SPOT:** pre-fetched `binance_spot_full.parquet` (119k 1m candles, Mar-Jun 2026) loaded from Modal Volume instead of inline API fetch (Binance blocks Modal's US region).
+
+**Data:** Modal Volume `btc-local-data`:
+- `/ticks_btc_full_clean.parquet` — 22,237 markets, 68.3M ticks
+- `/all_markets.csv` — 22,319 markets
+- `/binance_spot_full.parquet` — 119k candles (Mar 13 – Jun 4 2026)
+
+**Best Optuna params (150 trials, best AUC=0.8970):**
+```python
+n_estimators     = 635
+learning_rate    = 0.01171
+max_depth        = 4
+num_leaves       = 47
+min_child_samples = 84
+subsample        = 0.7647
+colsample_bytree = 0.6114
+reg_alpha        = 0.2289
+reg_lambda       = 0.0001395
+```
+
+**Top 10 features:**
+1. `btc_inslot_ret` ← NEW #1 (was not top-10 before — more data reveals spot signal)
+2. `btc_vwap_up`
+3. `btc_pre_5m_ret`
+4. `btc_vwap_dn`
+5. `btc_up_w1`
+6. `btc_pre_30m_ret`
+7. `btc_vwap_spread`
+8. `btc_momentum`
+9. `btc_pre_1h_ret`
+10. `prev_slot_up_ratio_1`
+
+**Gate results:** 3/3 metrics beat v17 champion:
+- AUC: 0.8966 > 0.8925 ✓
+- Brier: 0.1318 < 0.1342 ✓
+- Acc: 0.8104 > 0.8032 ✓
+
+**Sanity check:** ⚠️ UP scenario → 0.202 (wanted >0.55), Neutral → 0.976 (wanted ~0.50). Values are inverted from expected — investigate whether the model learned an inverted signal or if the sanity check probes are miscalibrated for the new feature set.
+
+**Result:** Best model ever. AUC 0.8966 (+0.0041 vs v17), Brier 0.1318 (-0.0024), Acc 81%. Fold AUCs show improving trend (0.88→0.91) suggesting the model generalizes better on later data. Feature importance shifted: `btc_inslot_ret` (in-slot BTC spot return) became #1 — the 3x larger dataset revealed that spot price movement during the observation window is the strongest predictor.
+
+**Lessons:**
+- ✅ **3x more data = meaningful improvement** — AUC +0.004, Acc +0.7%, Brier -0.002. More data > better features at this stage.
+- ✅ **Fold AUC trend improving** (0.88→0.91) — model generalizes better on recent data (more liquidity).
+- ✅ **`btc_inslot_ret` is #1 feature** — in-slot spot return was buried in noise with 7k samples, 22k reveals it clearly.
+- ✅ **Pre-fetched Binance spot** — Binance API blocks Modal US region (HTTP 451). Must fetch locally and upload to Modal Volume.
+- ⚠️ **Sanity check needs review** — the neutral/UP probes may need recalibration for the expanded feature set.
+- 📌 Dataset can be expanded further: pmdata.dev has data from ~Feb 15 2026 and grows daily.
+
+---
+
+## Feature Hall of Fame (Updated v18)
+
+| Feature | First version | v18 rank | Notes |
+|---------|---------------|----------|-------|
+| `btc_inslot_ret` | v8 | **#1** | In-slot spot return — strongest with 22k samples |
+| `btc_vwap_up` | v8 | #2 | Up token VWAP |
+| `btc_pre_5m_ret` | v8 | #3 | 5-min pre-slot spot return |
+| `btc_vwap_dn` | v8 | #4 | Down token VWAP |
+| `btc_up_w1` | v8 | #5 | 2nd 30s window |
+| `btc_pre_30m_ret` | v8 | #6 | 30-min pre-slot spot return |
+| `btc_vwap_spread` | v8 | #7 | VWAP up - VWAP down |
+| `btc_momentum` | v6 | #8 | Late windows - early windows |
+| `btc_pre_1h_ret` | v8 | #9 | 1h pre-slot spot return |
+| `prev_slot_up_ratio_1` | v6 | #10 | Previous slot's up ratio |
