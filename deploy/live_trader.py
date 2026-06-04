@@ -668,7 +668,7 @@ def fetch_inslot_trades(yes_token: str, no_token: str, slot_ts: int) -> list[dic
                         _price = float(t.get("price", 0) or 0)
                         _size  = float(t.get("size", 0) or 0)
                         all_trades.append({
-                            "outcome":   outcome_label,  # Force Up/Down — API may return Yes/No
+                            "outcome":   t.get("outcome", outcome_label),  # API returns Up/Down for BTC 5m markets
                             "side":      t.get("side", "BUY"),
                             "price":     _price,
                             "size":      _size,
