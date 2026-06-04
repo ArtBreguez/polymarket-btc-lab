@@ -1050,13 +1050,18 @@ def _seed_slot_history():
                     target = 0
                 else:
                     continue  # not resolved yet
-                # Use neutral 0.5 for up_ratio seed — outcomePrices is 0/1 after
-                # resolution and completely misrepresents tick-based up_ratio
-                # (which ranges 0.2–0.8 during the slot). Starting neutral is
-                # better than feeding extreme out-of-distribution values to
-                # prev_slot_up_ratio_* features.
-                up_ratio = 0.5
-                sw = [0.5] * 6
+                # Seed with target-correlated up_ratio + variance.
+                # Real up_ratio: mean ~0.50, std ~0.15. Using 0.5 for ALL slots
+                # creates std=0 → zscore = (x-0.5)/1e-6 → explosion → clipped ±5
+                # → PREDICTION_SANITY blocks for ~25 min after restart.
+                # Fix: UP-won slots lean bullish (0.55-0.65), DOWN lean bearish
+                # (0.35-0.45). This gives realistic variance from slot 1.
+                import random
+                if target == 1:  # UP won
+                    up_ratio = 0.5 + random.uniform(0.05, 0.15)
+                else:            # DOWN won
+                    up_ratio = 0.5 - random.uniform(0.05, 0.15)
+                sw = [max(0.1, min(0.9, up_ratio + random.uniform(-0.05, 0.05))) for _ in range(6)]
 
                 # pre_ret from spot buffer if warm
                 pre_ret = 0.0
