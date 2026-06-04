@@ -501,14 +501,12 @@ def build_spot_features(slot_ts: int) -> dict:
             feat[f"btc_pre_{lbl}_ret"] = 0.0
         feat[f"btc_pre_{lbl}_vol"] = 0.0  # vol not used in v18 top features
 
-    # Round-number proximity (use slot_open price)
-    idx = np.searchsorted(ts_arr, slot_ts, side="right") - 1
-    spot_open = float(px_arr[idx]) if idx >= 0 else 0.0
-    if spot_open > 0:
-        px_k = spot_open / 1000
+    # Round-number proximity (use obs-end price to match training)
+    if px_obs_end > 0:
+        px_k = px_obs_end / 1000
         feat["btc_dist_1k"]  = float(min(px_k - math.floor(px_k), math.ceil(px_k) - px_k))
-        feat["btc_dist_5k"]  = float(abs(spot_open % 5000) / 5000)
-        feat["btc_dist_10k"] = float(abs(spot_open % 10000) / 10000)
+        feat["btc_dist_5k"]  = float(abs(px_obs_end % 5000) / 5000)
+        feat["btc_dist_10k"] = float(abs(px_obs_end % 10000) / 10000)
     else:
         feat["btc_dist_1k"] = feat["btc_dist_5k"] = feat["btc_dist_10k"] = 0.5
 
@@ -895,7 +893,7 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
             "btc_buy_ratio": 0.5, "btc_avg_size": 0.0, "btc_momentum": 0.0,
             "btc_tw_up_ratio": 0.5, "btc_vwap_trend": 0.0,
             "btc_vwmom": 0.0, "btc_tick_accel": 0.0,
-            "btc_up_ratio_stability": 0.0, "btc_vol_accel": 1.0, "btc_size_disparity": 1.0,
+            "btc_up_ratio_stability": 0.0, "btc_vol_accel": 1.0, "btc_size_disparity": 0.0,
             "btc_signal_conviction": 0.0, "btc_momentum_vol_sync": 0.0,
             **{f"btc_up_w{i}": 0.5 for i in range(6)},
         })
