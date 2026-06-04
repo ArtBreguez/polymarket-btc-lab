@@ -288,9 +288,9 @@ Features tested and consistently dropped by permutation importance:
 
 ## Reproduction
 
-To retrain the current champion (v18):
+To retrain the current champion (v19):
 ```bash
-modal run scripts/train_v18_modal.py
+modal run scripts/train_v19_modal.py
 ```
 
 All training scripts are in `scripts/train_vN_modal.py`. Each is self-contained —
@@ -388,7 +388,40 @@ reg_lambda       = 0.0001395
 
 ---
 
-## Feature Hall of Fame (Updated v18)
+### v19 — L2 Orderbook features (book + price_change from poly_l2)
+**Date:** 2026-06-04 | **Champion:** Promoted (3/3)
+
+**Changes:**
+- Added ~20 L2 orderbook features from pmdata poly_l2 (book snapshots + price_change events)
+- Pre-computed OB features for 22,189 markets (ob_features_full.parquet on Modal Volume)
+- Two-stage pipeline: fetch_ob_features_modal.py → train_v19_modal.py
+- 5 cross-domain interaction features (OB × CLOB: imb×ur, depth×momentum, etc.)
+- Feature selection expanded to top 40 (vs 30 in v18)
+
+**Results:**
+| Metric | v18 (champion) | v19 | Δ |
+|--------|----------------|-----|---|
+| AUC    | 0.8966         | **0.9000** | +0.0034 |
+| Brier  | 0.1318         | **0.1291** | -0.0027 |
+| Acc    | 0.8104         | **0.8127** | +0.0023 |
+
+**Gate:** 3/3 ✓ AUC ✓ Brier ✓ Acc
+**Sanity:** UP=0.897 > Neutral=0.453 > DOWN=0.099 ✓
+
+**OB Features added:**
+- Book snapshots (~2,700/slot): ob_mid, ob_spread, ob_imbalance, ob_depth_ratio, ob_bid/ask_depth_5c, ob_total_depth, ob_weighted_imb, ob_mid_drift, ob_imbalance_end, ob_spread_end, ob_depth_change, ob_imb_momentum, ob_imb_w0/w1/w2
+- Price changes (~68,000/slot): ob_pc_up_ratio, ob_pc_volatility, ob_pc_count, ob_fill_imbalance
+- Cross-domain: x_imb_x_ur, x_depth_x_momentum, x_spread_x_vol, x_ob_drift_x_inslot, x_fill_imb_x_buy
+
+**Takeaways:**
+- 🎯 Crossed AUC 0.90 barrier — OB features add real signal
+- L2 depth imbalance and BBO dynamics complement CLOB flow features
+- Two-stage pre-compute pattern (fetch→Volume→train) works well for expensive per-market API data
+- Markets missing OB data (~0.6% failure rate) filled with neutral defaults — no exclusion needed
+
+---
+
+## Feature Hall of Fame (Updated v19)
 
 | Feature | First version | v18 rank | Notes |
 |---------|---------------|----------|-------|
