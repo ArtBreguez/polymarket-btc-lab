@@ -485,30 +485,39 @@ def build_spot_features(slot_ts: int) -> dict:
     seg_inslot = _seg(slot_ts, slot_ts + OBSERVE_SECS)
     feat["btc_inslot_ret"], feat["btc_inslot_vol"] = _ret_vol(seg_inslot)
 
-    # Pre-slot windows
+    # Pre-slot windows — MUST use px at observation end (slot_ts + OBS_SECS)
+    # to match training: spot_at(obs_end_ts) vs spot_at(slot_ts - window)
+    obs_end_ts = slot_ts + OBSERVE_SECS
+    idx_obs = np.searchsorted(ts_arr, obs_end_ts, side="right") - 1
+    px_obs_end = float(px_arr[idx_obs]) if idx_obs >= 0 else 0.0
+
     for w_s, lbl in [(300, "5m"), (900, "15m"), (1800, "30m"), (3600, "1h"), (14400, "4h")]:
-        seg = _seg(slot_ts - w_s, slot_ts)
-        feat[f"btc_pre_{lbl}_ret"], feat[f"btc_pre_{lbl}_vol"] = _ret_vol(seg)
+        idx_h = np.searchsorted(ts_arr, slot_ts - w_s, side="right") - 1
+        px_h = float(px_arr[idx_h]) if idx_h >= 0 else 0.0
+        if px_h > 0 and px_obs_end > 0:
+            feat[f"btc_pre_{lbl}_ret"] = float(px_obs_end / px_h - 1)
+        else:
+            feat[f"btc_pre_{lbl}_ret"] = 0.0
+        feat[f"btc_pre_{lbl}_vol"] = 0.0  # vol not used in v18 top features
 
     # Round-number proximity (use slot_open price)
     idx = np.searchsorted(ts_arr, slot_ts, side="right") - 1
     spot_open = float(px_arr[idx]) if idx >= 0 else 0.0
     if spot_open > 0:
-        feat["btc_dist_1k"]  = float(abs(spot_open % 1000) / 1000)
+        px_k = spot_open / 1000
+        feat["btc_dist_1k"]  = float(min(px_k - math.floor(px_k), math.ceil(px_k) - px_k))
         feat["btc_dist_5k"]  = float(abs(spot_open % 5000) / 5000)
         feat["btc_dist_10k"] = float(abs(spot_open % 10000) / 10000)
     else:
         feat["btc_dist_1k"] = feat["btc_dist_5k"] = feat["btc_dist_10k"] = 0.5
 
     # 1h/4h ratio — (px_now - px_1h_ago) / (px_now - px_4h_ago)
-    # MUST match training formula exactly: uses absolute price deltas, not % returns.
-    # Guard: if either historical price is unavailable (cold buffer < 4h), return 0.0
-    # so the model receives a neutral value rather than an extreme OOD value.
-    px_now = spot_open  # already computed above from spot buffer at slot_ts
-    seg_1h_start = _seg(slot_ts - 3600, slot_ts - 3600 + 60)
-    seg_4h_start = _seg(slot_ts - 14400, slot_ts - 14400 + 60)
-    px_1h_ago = float(seg_1h_start[0]) if len(seg_1h_start) > 0 else 0.0
-    px_4h_ago = float(seg_4h_start[0]) if len(seg_4h_start) > 0 else 0.0
+    # MUST use px at observation end (slot_ts + OBS_SECS) to match training
+    px_now = px_obs_end  # use observation-end price, not slot-start
+    idx_1h = np.searchsorted(ts_arr, slot_ts - 3600, side="right") - 1
+    idx_4h = np.searchsorted(ts_arr, slot_ts - 14400, side="right") - 1
+    px_1h_ago = float(px_arr[idx_1h]) if idx_1h >= 0 else 0.0
+    px_4h_ago = float(px_arr[idx_4h]) if idx_4h >= 0 else 0.0
     if px_now > 0 and px_1h_ago > 0 and px_4h_ago > 0 and abs(px_now - px_4h_ago) > 1:
         feat["btc_pre_1h_4h_ratio"] = (px_now - px_1h_ago) / (px_now - px_4h_ago + 1e-9)
     else:
@@ -834,7 +843,7 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
         dn_tks_v9   = [t for t in ticks if t.get("outcome") == "Down"]
         avg_up_sz   = float(sum(t["size_usdc"] for t in up_tks_v9) / (len(up_tks_v9) + 1e-8))
         avg_dn_sz   = float(sum(t["size_usdc"] for t in dn_tks_v9) / (len(dn_tks_v9) + 1e-8))
-        size_disparity = float(avg_up_sz / (avg_dn_sz + 1e-8))
+        size_disparity = float(avg_up_sz - avg_dn_sz)
 
         feat.update({
             "btc_n_ticks":     float(n),
@@ -845,7 +854,7 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
             "btc_vwap_up":     float(vwap_up),
             "btc_vwap_dn":     float(vwap_dn),
             "btc_vwap_spread": float(vwap_up - vwap_dn),
-            "btc_buy_ratio":   float(sum(1 for t in ticks if t.get("side") == "BUY") / (n + 1e-8)),
+            "btc_buy_ratio":   float(sum(t["size_usdc"] for t in ticks if t.get("side") == "BUY") / (total + 1e-8)),
             "btc_avg_size":    float(total / n),
             "btc_momentum":    btc_momentum,
             "btc_tw_up_ratio": tw_up,
@@ -897,9 +906,20 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
             feat[f"btc_up_ratio_zscore_{lbl}"]    = 0.0
             feat[f"btc_up_ratio_hist_mean_{lbl}"] = 0.5
 
-    # Per-sub-window zscore vs last 20 slots
+    # Per-sub-window zscore vs last 20 slots — use overall up_ratio stats
+    # Training uses mu20/sd20 from up_ratio history for btc_up_w5_zscore
+    past_ur_20 = [h["up_ratio"] for h in hist[-20:]] if hist else []
+    if len(past_ur_20) >= 3:
+        mu20_ur = float(np.mean(past_ur_20))
+        sd20_ur = float(np.std(past_ur_20)) + 1e-6
+        feat["btc_up_w5_zscore"] = float((feat.get("btc_up_w5", 0.5) - mu20_ur) / sd20_ur)
+    else:
+        feat["btc_up_w5_zscore"] = 0.0
+    # Other window zscores (not in v18 top features, but keep for compatibility)
     cur_sws = [feat.get(f"btc_up_w{i}", 0.5) for i in range(6)]
     for i in range(6):
+        if i == 5:
+            continue  # already computed above
         past_sw = [h["sw"][i] for h in hist[-20:] if "sw" in h] if hist else []
         if len(past_sw) >= 5:
             mu, sd = float(np.mean(past_sw)), float(np.std(past_sw))

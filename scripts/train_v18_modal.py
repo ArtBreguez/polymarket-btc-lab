@@ -460,22 +460,74 @@ def train_v18():
              "✓" if beats_acc else "✗",
              score)
 
-    # Sanity check
-    neutral  = np.array([[0.5] * len(top_features)], dtype=np.float32)
-    up_feats = {f: 0.0 for f in top_features}
-    up_feats["btc_up_ratio"]    = 0.85
-    up_feats["btc_tw_up_ratio"] = 0.85
-    up_feats["btc_up_w5"]       = 0.85 if "btc_up_w5" in top_features else 0.5
+    # Sanity check – build proper baseline per feature type
+    def _neutral_value(fname):
+        """Return the correct neutral value for a given feature name."""
+        if "dist_1k" in fname:
+            return 0.25
+        if "dollar_vol" in fname:
+            return 5000.0
+        if "ticks" in fname:
+            return 100.0
+        if "up_ratio" in fname or "vwap_up" in fname or "vwap_dn" in fname or "buy_ratio" in fname:
+            return 0.5
+        if "vwap_spread" in fname:
+            return 0.0
+        if any(k in fname for k in ("_ret", "zscore", "z_", "sin_", "cos_",
+                                     "streak", "momentum", "stability",
+                                     "disparity", "conviction", "signal")):
+            return 0.0
+        # default for anything else (ratio-like)
+        return 0.0
+
+    baseline = {f: _neutral_value(f) for f in top_features}
+
+    # UP probe – mildly bullish scenario
+    up_overrides = {
+        "btc_up_ratio": 0.75, "btc_tw_up_ratio": 0.75,
+        "btc_vwap_up": 0.55, "btc_vwap_dn": 0.45, "btc_vwap_spread": 0.10,
+        "btc_momentum": 0.05, "btc_inslot_ret": 0.001,
+        "btc_pre_5m_ret": 0.0005, "btc_signal_conviction": 0.7,
+        "btc_buy_ratio": 0.6,
+    }
+    up_feats = dict(baseline)
+    for k, v in up_overrides.items():
+        if k in up_feats:
+            up_feats[k] = v
+    for f in top_features:
+        if f.startswith("btc_up_w"):
+            up_feats[f] = 0.65
+
+    # DOWN probe – mirror of UP
+    down_overrides = {
+        "btc_up_ratio": 0.25, "btc_tw_up_ratio": 0.25,
+        "btc_vwap_up": 0.45, "btc_vwap_dn": 0.55, "btc_vwap_spread": -0.10,
+        "btc_momentum": -0.05, "btc_inslot_ret": -0.001,
+        "btc_pre_5m_ret": -0.0005, "btc_signal_conviction": 0.7,
+        "btc_buy_ratio": 0.4,
+    }
+    down_feats = dict(baseline)
+    for k, v in down_overrides.items():
+        if k in down_feats:
+            down_feats[k] = v
+    for f in top_features:
+        if f.startswith("btc_up_w"):
+            down_feats[f] = 0.35
 
     final_base  = lgb.LGBMClassifier(**best_params)
     final_model = CalibratedClassifierCV(final_base, cv=3, method="isotonic")
     final_model.fit(X_sel, y)
 
     up_arr    = pd.DataFrame([up_feats])[top_features].values.astype(np.float32)
+    neut_arr  = pd.DataFrame([baseline])[top_features].values.astype(np.float32)
+    down_arr  = pd.DataFrame([down_feats])[top_features].values.astype(np.float32)
     prob_up   = final_model.predict_proba(up_arr)[0, 1]
-    prob_neut = final_model.predict_proba(neutral)[0, 1]
-    log.info("Sanity: UP scenario → %.3f (want >0.55) | Neutral → %.3f (want ~0.50)",
-             prob_up, prob_neut)
+    prob_neut = final_model.predict_proba(neut_arr)[0, 1]
+    prob_down = final_model.predict_proba(down_arr)[0, 1]
+    log.info("Sanity: UP → %.3f | Neutral → %.3f | DOWN → %.3f", prob_up, prob_neut, prob_down)
+    assert prob_up > prob_neut > prob_down, (
+        f"Sanity gate FAILED: UP={prob_up:.3f} Neutral={prob_neut:.3f} DOWN={prob_down:.3f}"
+    )
 
     # ── Step 10: Save & promote ───────────────────────────────────────────
     if score < 2:
