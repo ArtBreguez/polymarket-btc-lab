@@ -1641,16 +1641,10 @@ def run(client, model, features):
             true_edge = edge_vs_ask
 
             # ── Compute shares + actual cost (CLOB min 5 shares) ───────────
-            # Do this BEFORE balance check so we can validate against real cost.
-            shares = round(STAKE_USDC / ask_price, 2)
+            # Testing phase: always use minimum 5 shares to conserve balance.
+            shares = 5.0
             actual_cost = round(shares * ask_price, 4)
-            if shares < 5.0:
-                # CLOB minimum is 5 shares — always bump, never skip.
-                # Edge check already validated the trade is worth taking.
-                shares = 5.0
-                actual_cost = round(shares * ask_price, 4)
-                log.info("  Bumped to min 5 shares — cost $%.2f (stake was $%.2f)",
-                         actual_cost, STAKE_USDC)
+            log.info("  Min 5 shares @ $%.3f — cost $%.2f", ask_price, actual_cost)
 
             # ── Balance check against real order cost (not just STAKE_USDC) ──
             try:
