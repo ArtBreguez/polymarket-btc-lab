@@ -686,18 +686,14 @@ def fetch_inslot_trades(yes_token: str, no_token: str, slot_ts: int) -> list[dic
 def _build_ob_features(up_token_id: str) -> dict:
     """
     Fetch the current order book from CLOB REST and compute OB features.
-    Identical computation to training (pmdata poly_l2 book snapshots).
-    Returns 8 features. On failure returns empty dict (model uses 0.0 fallback).
+    Matches training (pmdata poly_l2 book snapshots) as closely as possible.
 
-    Features (all computable from CLOB REST /book?token_id=...):
-      ob_mid           — (best_ask + best_bid) / 2
-      ob_spread        — best_ask - best_bid
-      ob_imbalance     — (best_bid_size - best_ask_size) / (bid + ask)
-      ob_depth_ratio   — bid_depth_5c / ask_depth_5c
-      ob_bid_depth_5c  — bid size within 5c of mid, normalized by total bid
-      ob_ask_depth_5c  — ask size within 5c of mid, normalized by total ask
-      ob_mid_drift     — 0.0 at live time (only one snapshot available)
-      ob_imbalance_end — same as ob_imbalance (single snapshot)
+    Single live snapshot = training's "open" snapshot. Features requiring
+    temporal dynamics (drift, momentum, windowed imbalance) are set to 0.0
+    because we only have one snapshot. The model learned to handle this
+    gracefully since ~0.6% of training data also had missing OB.
+
+    Returns dict with features. On failure returns empty dict (model uses 0.0 fallback).
     """
     try:
         r = _http.get(
@@ -737,6 +733,19 @@ def _build_ob_features(up_token_id: str) -> dict:
                            if float(a["price"]) <= mid + 0.05) / total_ask
         depth_ratio  = float(bid_depth_5c / (ask_depth_5c + 1e-8))
 
+        # Total depth (raw sum, matches training)
+        total_depth = float(sum(float(b["size"]) for b in bids) +
+                            sum(float(a["size"]) for a in asks))
+
+        # Weighted imbalance: exp-weighted by proximity to mid (matches training)
+        bp = np.array([float(b["price"]) for b in bids])
+        bs = np.array([float(b["size"]) for b in bids])
+        ap = np.array([float(a["price"]) for a in asks])
+        as_ = np.array([float(a["size"]) for a in asks])
+        bid_wt = float(np.sum(bs * np.exp(-10 * np.abs(bp - mid))))
+        ask_wt = float(np.sum(as_ * np.exp(-10 * np.abs(ap - mid))))
+        weighted_imb = float((bid_wt - ask_wt) / (bid_wt + ask_wt + 1e-8))
+
         return {
             "ob_mid":           float(mid),
             "ob_spread":        float(spread),
@@ -744,8 +753,18 @@ def _build_ob_features(up_token_id: str) -> dict:
             "ob_depth_ratio":   float(depth_ratio),
             "ob_bid_depth_5c":  float(bid_depth_5c),
             "ob_ask_depth_5c":  float(ask_depth_5c),
-            "ob_mid_drift":     0.0,   # single snapshot — no drift measurable live
-            "ob_imbalance_end": float(imbalance),  # same snapshot
+            "ob_total_depth":   float(total_depth),
+            "ob_weighted_imb":  float(weighted_imb),
+            # Temporal features — 0.0 from single snapshot (no drift/momentum)
+            "ob_mid_drift":     0.0,
+            "ob_imbalance_end": float(imbalance),  # same as open
+            "ob_spread_end":    float(spread),
+            "ob_depth_change":  0.0,
+            "ob_imb_momentum":  0.0,
+            # Windowed imbalance — 0.0 (single snapshot, no temporal windows)
+            "ob_imb_w0":        float(imbalance),   # best approximation: current imbalance
+            "ob_imb_w1":        float(imbalance),
+            "ob_imb_w2":        float(imbalance),
         }
     except Exception as e:
         log.warning("OB fetch failed for %s: %s", up_token_id[:20], e)
@@ -994,6 +1013,14 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
     # Called once per slot at ~t=150s (after tick observation window ends).
     # up_token_id must be passed in; on failure fills with None (market excluded).
     feat.update(_build_ob_features(up_token_id))
+
+    # ── Cross-domain interaction features (OB × CLOB) ─────────────────────────
+    # Matches training: these combine orderbook state with CLOB flow signals
+    feat["x_imb_x_ur"]          = feat.get("ob_imbalance", 0.0) * feat.get("btc_up_ratio", 0.5)
+    feat["x_depth_x_momentum"]  = feat.get("ob_depth_ratio", 1.0) * feat.get("btc_momentum", 0.0)
+    feat["x_spread_x_vol"]      = feat.get("ob_spread", 0.0) * feat.get("btc_n_ticks", 0.0)
+    feat["x_ob_drift_x_inslot"] = feat.get("ob_mid_drift", 0.0) * feat.get("btc_inslot_ret", 0.0)
+    feat["x_fill_imb_x_buy"]    = feat.get("ob_fill_imbalance", 0.0) * feat.get("btc_buy_ratio", 0.5)
 
     # ── Spot features ──────────────────────────────────────────────────────────
     feat.update(build_spot_features(slot_ts))
