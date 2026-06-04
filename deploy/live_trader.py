@@ -462,7 +462,8 @@ def build_spot_features(slot_ts: int) -> dict:
 
     age = int(time.time()) - buf.get("updated_at", 0)
     if age > BUFFER_STALE:
-        log.warning("spot_buffer is %ds stale", age)
+        log.warning("spot_buffer is %ds stale — using zeros", age)
+        return zeros
 
     candles = buf.get("btcusdt", [])
     if not candles:
@@ -1120,9 +1121,18 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
     # ── Spot features ──────────────────────────────────────────────────────────
     feat.update(build_spot_features(slot_ts))
 
-    # ── Final: fill any remaining model features with 0 ───────────────────────
+    # ── Final: fill any remaining model features with context-aware defaults ────
+    # ob_mid should be ~0.5 (binary market midpoint), not 0.0
+    # ob_ask_depth_5c should be ~0.5 (neutral), not 0.0
+    _neutral_defaults = {
+        "ob_mid": 0.5,
+        "ob_ask_depth_5c": 0.5,
+        "ob_bid_depth_5c": 0.5,
+        "ob_depth_ratio": 1.0,
+    }
     for f in features:
-        feat.setdefault(f, 0.0)
+        if f not in feat:
+            feat[f] = _neutral_defaults.get(f, 0.0)
     return feat
 
 
