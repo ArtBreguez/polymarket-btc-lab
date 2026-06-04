@@ -217,18 +217,18 @@ def _clob_daemon_thread():
     async def _clob_run():
         while True:
             try:
-                # No ping_interval — Polymarket WS server doesn't support WS-level pings
-                # and will drop the connection if it receives an unexpected frame.
+                # Enable WS ping/pong (RFC 6455) — keeps connection alive through
+                # proxies/load balancers that kill idle TCP after 60-120s.
+                # If Polymarket rejects pings, the 30s keepalive below handles it.
                 async with websockets.connect(
-                    CLOB_WS_URL, ping_interval=None, close_timeout=5
+                    CLOB_WS_URL, ping_interval=20, ping_timeout=10, close_timeout=5
                 ) as ws:
                     log.info("CLOB WS daemon connected")
                     last_send = time.time()
 
-                    # Clear stale prices on reconnect — book snapshots arrive fresh below
-                    with _clob_prices_lock:
-                        _clob_prices.clear()
-                        _clob_price_ts.clear()
+                    # DON'T clear prices on reconnect — PRICE_MAX_AGE already handles
+                    # staleness. Clearing forces immediate HTTP fallback for ALL tokens
+                    # even if prices were updated <5s ago.
 
                     # Prune stale tokens — only keep current + next 3 slots
                     now_ts = int(time.time())
@@ -286,9 +286,9 @@ def _clob_daemon_thread():
                                 log.info("CLOB WS subscribed %d new tokens", len(new_tokens))
                                 last_send = time.time()
 
-                        # Keepalive: re-subscribe active tokens every 8 min to prevent
-                        # server-side idle timeout (~11 min observed on Polymarket WS)
-                        if time.time() - last_send >= 480:
+                        # Keepalive: re-subscribe active tokens every 30s to prevent
+                        # proxy/LB idle timeout (60-120s) and server-side timeout (~11 min)
+                        if time.time() - last_send >= 30:
                             with _clob_prices_lock:
                                 active = list(_clob_subscribed)
                             if active:
@@ -684,7 +684,8 @@ def fetch_inslot_trades(yes_token: str, no_token: str, slot_ts: int) -> list[dic
             offset = page * 500
             try:
                 r = _http.get(f"{DATA_API}/trades",
-                    params={"asset": token_id, "limit": 500, "offset": offset},
+                    params={"asset": token_id, "limit": 500, "offset": offset,
+                            "_t": int(time.time())},  # cache-bust Cloudflare CDN (5min TTL)
                     timeout=HTTP_TIMEOUT)
                 if not r.ok:
                     break
@@ -721,18 +722,16 @@ def fetch_inslot_trades(yes_token: str, no_token: str, slot_ts: int) -> list[dic
     return all_trades
 
 
-def _build_ob_features(up_token_id: str) -> dict:
-    """
-    Fetch the current order book from CLOB REST and compute OB features.
-    Matches training (pmdata poly_l2 book snapshots) as closely as possible.
 
-    Single live snapshot = training's "open" snapshot. Features requiring
-    temporal dynamics (drift, momentum, windowed imbalance) are set to 0.0
-    because we only have one snapshot. The model learned to handle this
-    gracefully since ~0.6% of training data also had missing OB.
+# ── OB snapshot cache for temporal features ──────────────────────────────
+# Stores the first OB snapshot of each slot so we can compute drift/momentum
+# between the "open" (first poll ~t=170s) and "close" (current poll) snapshots.
+_ob_open_cache: dict[str, dict] = {}   # token_id -> {mid, imbalance, imb_w_values, ts}
+_ob_last_slot: int = 0                 # track slot changes to clear cache
 
-    Returns dict with features. On failure returns empty dict (model uses 0.0 fallback).
-    """
+
+def _fetch_ob_snapshot(up_token_id: str) -> dict | None:
+    """Fetch raw OB metrics from CLOB REST. Returns dict or None on failure."""
     try:
         r = _http.get(
             f"{CLOB_URL}/book",
@@ -740,28 +739,86 @@ def _build_ob_features(up_token_id: str) -> dict:
             timeout=5,
         )
         if not r.ok:
-            return {}
+            return None
         book = r.json()
-
         asks = book.get("asks", [])
         bids = book.get("bids", [])
         if not asks or not bids:
-            return {}
-
-        # Sort: asks ascending by price, bids descending
+            return None
         asks_sorted = sorted(asks, key=lambda x: float(x["price"]))
         bids_sorted = sorted(bids, key=lambda x: float(x["price"]), reverse=True)
-
         best_ask = float(asks_sorted[0]["price"])
         best_bid = float(bids_sorted[0]["price"])
         best_ask_sz = float(asks_sorted[0]["size"])
         best_bid_sz = float(bids_sorted[0]["size"])
-        mid    = (best_ask + best_bid) / 2
+        mid = (best_ask + best_bid) / 2
         spread = best_ask - best_bid
-
-        # Imbalance at best level
         imbalance = float((best_bid_sz - best_ask_sz) / (best_bid_sz + best_ask_sz + 1e-8))
+        return {
+            "asks_sorted": asks_sorted, "bids_sorted": bids_sorted,
+            "asks": asks, "bids": bids,
+            "best_ask": best_ask, "best_bid": best_bid,
+            "best_ask_sz": best_ask_sz, "best_bid_sz": best_bid_sz,
+            "mid": mid, "spread": spread, "imbalance": imbalance,
+            "ts": time.time(),
+        }
+    except Exception as e:
+        log.warning("OB snapshot fetch failed for %s: %s", up_token_id[:20], e)
+        return None
 
+
+def _build_ob_features(up_token_id: str) -> dict:
+    """
+    Fetch the current order book from CLOB REST and compute OB features.
+    Matches training (pmdata poly_l2 book snapshots) as closely as possible.
+
+    Uses two snapshots for temporal features:
+      - "open" snapshot: cached from first poll of the entry window
+      - "close" snapshot: current poll
+    This lets us compute real ob_mid_drift, ob_imb_momentum, and windowed
+    imbalance (ob_imb_w0/w1/w2) — top-5 features that were previously 0.0.
+
+    Returns dict with features. On failure returns empty dict (model uses 0.0 fallback).
+    """
+    snap = _fetch_ob_snapshot(up_token_id)
+    if snap is None:
+        return {}
+
+    # ── Cache open snapshot (first poll of entry window) ──────────────
+    if up_token_id not in _ob_open_cache:
+        _ob_open_cache[up_token_id] = {
+            "mid": snap["mid"],
+            "imbalance": snap["imbalance"],
+            "ts": snap["ts"],
+        }
+
+    open_snap = _ob_open_cache[up_token_id]
+
+    # ── Temporal features from open vs close ──────────────────────────
+    ob_mid_drift   = float(snap["mid"] - open_snap["mid"])
+    ob_imb_momentum = float(snap["imbalance"] - open_snap["imbalance"])
+
+    # Windowed imbalance: split the time range into 3 windows
+    # open=w0, interpolated midpoint=w1, close=w2
+    ob_imb_w0 = float(open_snap["imbalance"])
+    ob_imb_w2 = float(snap["imbalance"])
+    ob_imb_w1 = float((ob_imb_w0 + ob_imb_w2) / 2.0)  # interpolated middle
+
+    # Use close snapshot for all other features
+    book = snap
+    asks = book["asks"]
+    bids = book["bids"]
+    asks_sorted = book["asks_sorted"]
+    bids_sorted = book["bids_sorted"]
+    best_ask = book["best_ask"]
+    best_bid = book["best_bid"]
+    best_ask_sz = book["best_ask_sz"]
+    best_bid_sz = book["best_bid_sz"]
+    mid    = book["mid"]
+    spread = book["spread"]
+    imbalance = book["imbalance"]
+
+    try:
         # Depth within 5c of mid, normalized by total depth
         total_bid = sum(float(b["size"]) for b in bids) + 1e-8
         total_ask = sum(float(a["size"]) for a in asks) + 1e-8
@@ -793,16 +850,16 @@ def _build_ob_features(up_token_id: str) -> dict:
             "ob_ask_depth_5c":  float(ask_depth_5c),
             "ob_total_depth":   float(total_depth),
             "ob_weighted_imb":  float(weighted_imb),
-            # Temporal features — 0.0 from single snapshot (no drift/momentum)
-            "ob_mid_drift":     0.0,
-            "ob_imbalance_end": float(imbalance),  # same as open
+            # Temporal features — real values from open vs close snapshots
+            "ob_mid_drift":     ob_mid_drift,
+            "ob_imbalance_end": float(imbalance),
             "ob_spread_end":    float(spread),
             "ob_depth_change":  0.0,
-            "ob_imb_momentum":  0.0,
-            # Windowed imbalance — 0.0 (single snapshot, no temporal windows)
-            "ob_imb_w0":        float(imbalance),   # best approximation: current imbalance
-            "ob_imb_w1":        float(imbalance),
-            "ob_imb_w2":        float(imbalance),
+            "ob_imb_momentum":  ob_imb_momentum,
+            # Windowed imbalance — open/mid/close
+            "ob_imb_w0":        ob_imb_w0,
+            "ob_imb_w1":        ob_imb_w1,
+            "ob_imb_w2":        ob_imb_w2,
         }
     except Exception as e:
         log.warning("OB fetch failed for %s: %s", up_token_id[:20], e)
@@ -1487,6 +1544,12 @@ def run(client, model, features):
         already = {t["slot_ts"] for t in trades
                    if t.get("status") in ("open", "settled", "error")}
         cur_slot = (now // SLOT_DURATION) * SLOT_DURATION
+
+        # Clear OB open snapshot cache when slot changes (new observation window)
+        global _ob_last_slot
+        if cur_slot != _ob_last_slot:
+            _ob_open_cache.clear()
+            _ob_last_slot = cur_slot
 
         for slot_ts in [cur_slot]:  # prev-slot check removed: t_elapsed would be 300-599, outside ENTER_WINDOW [170,240]
             t_elapsed = now - slot_ts
