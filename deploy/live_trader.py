@@ -1591,7 +1591,9 @@ def run(client, model, features):
                 log.warning("  build_features returned None (took %.0fms)", t_feat_ms)
                 continue
             log.info("  build_features OK (%.0fms) — %d/%d features non-zero",
-                     t_feat_ms, sum(1 for v in feat.values() if v != 0.0), len(feat))
+                     t_feat_ms,
+                     sum(1 for f in features if feat.get(f, 0.0) != 0.0),
+                     len(features))
 
             # ── GATE 2: Feature sanity ─────────────────────────────────
             ok, reason = gate.check_feature_sanity(feat)
