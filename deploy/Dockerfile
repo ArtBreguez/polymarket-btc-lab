@@ -7,6 +7,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY live_trader.py .
+COPY ws_manager.py .
 COPY data_quality_gate.py .
 
 # Model is downloaded from HuggingFace at startup via HF_TOKEN secret.

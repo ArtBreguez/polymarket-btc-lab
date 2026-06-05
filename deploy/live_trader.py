@@ -1549,10 +1549,36 @@ def run(client, model, features):
     # features are warm from the first prediction instead of needing ~1h40min.
     _seed_slot_history()
 
+    _loop_count = 0
     while True:
       try:
         now    = int(time.time())
+        _loop_count += 1
         trades = load_trades()
+
+        # ── Debug: WS health every 30 loops (~5 min) ─────────────────
+        if _loop_count % 30 == 1:
+            if _spot_ws_manager:
+                sh = _spot_ws_manager.health()
+                log.info("WS-HEALTH [binance-spot] connected=%s uptime=%ds msgs=%d rate=%d/min disconnects=%d zombies=%d",
+                         sh["connected"], sh["current_uptime_s"], sh["total_messages"],
+                         sh["msgs_per_min"], sh["total_disconnects"], sh["zombie_kills"])
+            if _clob_ws_manager:
+                ch = _clob_ws_manager.health()
+                log.info("WS-HEALTH [clob] connected=%s uptime=%ds msgs=%d rate=%d/min disconnects=%d zombies=%d",
+                         ch["connected"], ch["current_uptime_s"], ch["total_messages"],
+                         ch["msgs_per_min"], ch["total_disconnects"], ch["zombie_kills"])
+            # Spot buffer freshness
+            if SPOT_BUFFER.exists():
+                try:
+                    buf_data = json.loads(SPOT_BUFFER.read_text())
+                    buf_age = now - buf_data.get("updated_at", 0)
+                    btc_len = len(buf_data.get("btcusdt", []))
+                    log.info("SPOT-BUFFER age=%ds btc_candles=%d", buf_age, btc_len)
+                except Exception as e:
+                    log.warning("SPOT-BUFFER read error: %s", e)
+            else:
+                log.warning("SPOT-BUFFER missing!")
 
         # 1. Settle
         if settle_trades(trades):
@@ -1603,10 +1629,15 @@ def run(client, model, features):
                 log.info("  Skip — DATA GATE: %s", reason)
                 continue
 
+            t_feat_start = time.time()
             feat = build_features(ticks, slot_ts, features,
                                    up_token_id=market["yes_token"])
+            t_feat_ms = (time.time() - t_feat_start) * 1000
             if feat is None:
+                log.warning("  build_features returned None (took %.0fms)", t_feat_ms)
                 continue
+            log.info("  build_features OK (%.0fms) — %d/%d features non-zero",
+                     t_feat_ms, sum(1 for v in feat.values() if v != 0.0), len(feat))
 
             # ── GATE 2: Feature sanity ─────────────────────────────────
             ok, reason = gate.check_feature_sanity(feat)
@@ -1654,7 +1685,10 @@ def run(client, model, features):
                 continue
 
             token_id   = market["yes_token"] if direction == "UP" else market["no_token"]
+            t_ask_start = time.time()
             ask_price  = get_ask_price(token_id)
+            t_ask_ms = (time.time() - t_ask_start) * 1000
+            log.info("  get_ask_price: $%.3f (took %.0fms)", ask_price, t_ask_ms)
             model_prob = prob_up if direction == "UP" else (1.0 - prob_up)
 
             # Log ask price source and freshness
@@ -1880,6 +1914,32 @@ def _print_summary(trades):
 if __name__ == "__main__":
     from polymarket import SecureClient
     from polymarket.auth import BuilderApiKey
+
+    # ── Startup diagnostics ──────────────────────────────────────────────
+    log.info("=" * 60)
+    log.info("BTC Live Trader starting up")
+    log.info("=" * 60)
+    log.info("Python: %s", __import__('sys').version.split()[0])
+    log.info("Platform: %s", __import__('platform').platform())
+
+    import importlib.metadata as _meta
+    for _pkg in ["websockets", "lightgbm", "scikit-learn", "pandas", "numpy"]:
+        try:
+            log.info("  %s==%s", _pkg, _meta.version(_pkg))
+        except Exception:
+            log.warning("  %s: NOT INSTALLED", _pkg)
+
+    # Log config (secrets masked)
+    log.info("Config: GAMMA_HOST=%s", GAMMA_HOST)
+    log.info("Config: CLOB_URL=%s", CLOB_URL)
+    log.info("Config: CLOB_WS_URL=%s", CLOB_WS_URL)
+    log.info("Config: BINANCE_WS=%s...", BINANCE_WS[:50])
+    log.info("Config: HF_REPO=%s", HF_REPO)
+    log.info("Config: PROXY_WALLET=%s", PROXY_WALLET)
+    log.info("Config: MIN_CONFIDENCE=%.0f%% MIN_EDGE=%.0f%% MIN_EDGE_MID=%.0f%%",
+             MIN_CONFIDENCE * 100, MIN_EDGE * 100, MIN_EDGE_MID * 100)
+    log.info("Config: ENTER_WINDOW=%s SLOT_DURATION=%ds", ENTER_WINDOW, SLOT_DURATION)
+    log.info("=" * 60)
 
     # Start spot daemon in background
     start_spot_daemon()
