@@ -989,10 +989,7 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
     dt   = datetime.fromtimestamp(slot_ts, tz=timezone.utc)
     hour = dt.hour + dt.minute / 60.0
     feat: dict = {
-        "hour_sin": math.sin(2 * math.pi * hour / 24),
-        "hour_cos": math.cos(2 * math.pi * hour / 24),
-        "dow_sin":  math.sin(2 * math.pi * dt.weekday() / 7),
-        "dow_cos":  math.cos(2 * math.pi * dt.weekday() / 7),
+        # v21: only hour_x_up_ratio uses hour (computed below); calendar features pruned
     }
 
     # ── Order flow from inslot ticks ───────────────────────────────────────────
@@ -1023,54 +1020,10 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
         w_vals = [sw[f"btc_up_w{i}"] for i in range(6)]
         btc_momentum = float(np.mean(w_vals[3:]) - np.mean(w_vals[:3]))
 
-        # Time-weighted order flow — MUST match training formula exactly:
-        # w = exp(-0.02 * (OBS - t_sec))  → more weight on recent ticks
-        # tw_up = weighted_avg(is_up * size_usdc) / weighted_avg(size_usdc)
-        # Both time AND volume weighted (training uses size_usdc as secondary weight)
-        if n > 0:
-            t_secs   = np.array([t["t_sec"] for t in ticks], dtype=np.float64)
-            is_up_v  = np.array([1.0 if t.get("outcome") == "Up" else 0.0 for t in ticks])
-            vol_v    = np.array([t.get("size_usdc", 0.0) for t in ticks], dtype=np.float64)
-            w_exp    = np.exp(-0.02 * (OBS - t_secs))
-            denom    = float(np.average(vol_v, weights=w_exp) + 1e-9)
-            tw_up    = float(np.average(is_up_v * vol_v, weights=w_exp) / denom)
-        else:
-            tw_up = 0.5
-
-        # VWAP trend: early half vs late half
-        half = OBS / 2
-        early = [t for t in ticks if t["t_sec"] < half]
-        late  = [t for t in ticks if t["t_sec"] >= half]
-        def _vwap_up_half(grp: list[dict]) -> float:
-            up = [t for t in grp if t.get("outcome") == "Up"]
-            if not up: return 0.5
-            return float(sum(t["price"] * t["size_usdc"] for t in up) /
-                         (sum(t["size_usdc"] for t in up) + 1e-8))
-        vwap_trend = float(_vwap_up_half(late) - _vwap_up_half(early))
-
-        # Volume-weighted momentum across 6 windows
-        vol_by_w = np.array([
-            sum(t["size_usdc"] for t in ticks if i*30 <= t["t_sec"] < (i+1)*30)
-            for i in range(6)
-        ], dtype=np.float64)
-        ur_by_w  = np.array([sw[f"btc_up_w{i}"] for i in range(6)], dtype=np.float64)
-        tw_vol   = vol_by_w.sum() + 1e-8
-        vwmom    = float(np.dot(vol_by_w / tw_vol, ur_by_w - 0.5))
-
-        # Tick acceleration: last 30s vs first 30s
-        first30 = sum(1 for t in ticks if t["t_sec"] < 30)
-        last30  = sum(1 for t in ticks if t["t_sec"] >= OBS - 30)
-        tick_accel = float((last30 - first30) / (first30 + 1e-8))
-
         # ── v9 features ────────────────────────────────────────────────────────
-        # Signal consistency across 6 windows
+        # Signal consistency across 6 windows (needed by btc_signal_conviction)
         w_vals_list = [sw[f"btc_up_w{i}"] for i in range(6)]
         up_ratio_stability = float(np.std(w_vals_list))
-
-        # Volume acceleration: last 90s vs first 90s
-        vol_first90 = sum(t["size_usdc"] for t in ticks if t["t_sec"] < 90)
-        vol_last90  = sum(t["size_usdc"] for t in ticks if t["t_sec"] >= 90)
-        vol_accel   = float(vol_last90 / (vol_first90 + 1e-8))
 
         # Size disparity: avg trade size Up vs Down
         up_tks_v9   = [t for t in ticks if t.get("outcome") == "Up"]
@@ -1080,42 +1033,27 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
         size_disparity = float(avg_up_sz - avg_dn_sz)
 
         feat.update({
-            "btc_n_ticks":     float(n),
-            "btc_vol_up":      float(vol_up),
-            "btc_vol_dn":      float(vol_dn),
-            "btc_vol_ratio":   float(vol_up / (vol_dn + 1e-8)),
             "btc_up_ratio":    float(vol_up / total),
             "btc_vwap_up":     float(vwap_up),
             "btc_vwap_dn":     float(vwap_dn),
             "btc_vwap_spread": float(vwap_up - vwap_dn),
             "btc_buy_ratio":   float(sum(t["size_usdc"] for t in ticks if t.get("side") == "BUY") / (total + 1e-8)),
-            "btc_avg_size":    float(total / n),
             "btc_momentum":    btc_momentum,
-            "btc_tw_up_ratio": tw_up,
-            "btc_vwap_trend":  vwap_trend,
-            "btc_vwmom":       vwmom,
-            "btc_tick_accel":  tick_accel,
             # v9
-            "btc_up_ratio_stability": up_ratio_stability,
-            "btc_vol_accel":          vol_accel,
             "btc_size_disparity":     size_disparity,
             # v10 interaction features
             "btc_signal_conviction":  float((vol_up / total) * (1.0 - up_ratio_stability)),
-            "btc_momentum_vol_sync":  float(btc_momentum * vol_accel),
             **sw,
         })
         cur_up_ratio = float(vol_up / total)
     else:
-        # No ticks — neutral fill
+        # No ticks — neutral fill (only v21 features)
         feat.update({
-            "btc_n_ticks": 0.0, "btc_vol_up": 0.0, "btc_vol_dn": 0.0,
-            "btc_vol_ratio": 1.0, "btc_up_ratio": 0.5,
+            "btc_up_ratio": 0.5,
             "btc_vwap_up": 0.5, "btc_vwap_dn": 0.5, "btc_vwap_spread": 0.0,
-            "btc_buy_ratio": 0.5, "btc_avg_size": 0.0, "btc_momentum": 0.0,
-            "btc_tw_up_ratio": 0.5, "btc_vwap_trend": 0.0,
-            "btc_vwmom": 0.0, "btc_tick_accel": 0.0,
-            "btc_up_ratio_stability": 0.0, "btc_vol_accel": 1.0, "btc_size_disparity": 0.0,
-            "btc_signal_conviction": 0.0, "btc_momentum_vol_sync": 0.0,
+            "btc_buy_ratio": 0.5, "btc_momentum": 0.0,
+            "btc_size_disparity": 0.0,
+            "btc_signal_conviction": 0.0,
             **{f"btc_up_w{i}": 0.5 for i in range(6)},
         })
         cur_up_ratio = 0.5
@@ -1127,77 +1065,15 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
 
     # Temporal interaction features (v17): hour modulates CLOB signal
     feat["hour_x_up_ratio"] = cur_up_ratio * (hour / 24.0)
-    feat["hour_x_tw_ur"]    = feat.get("btc_tw_up_ratio", 0.5) * (hour / 24.0)
 
-    # Multi-scale up_ratio zscore (5 / 10 / 20 slots lookback)
-    for win, lbl in [(5, "5s"), (10, "10s"), (20, "20s")]:
-        past = [h["up_ratio"] for h in hist[-win:]] if hist else []
-        if len(past) >= 3:
-            mu, sd = float(np.mean(past)), float(np.std(past))
-            z = float((cur_up_ratio - mu) / (sd + 1e-6))
-            feat[f"btc_up_ratio_zscore_{lbl}"]    = float(np.clip(z, -5, 5))
-            feat[f"btc_up_ratio_hist_mean_{lbl}"] = mu
-        else:
-            feat[f"btc_up_ratio_zscore_{lbl}"]    = 0.0
-            feat[f"btc_up_ratio_hist_mean_{lbl}"] = 0.5
-
-    # Per-sub-window zscore vs last 20 slots — use overall up_ratio stats
-    # Training uses mu20/sd20 from up_ratio history for btc_up_w5_zscore
-    past_ur_20 = [h["up_ratio"] for h in hist[-20:]] if hist else []
-    if len(past_ur_20) >= 3:
-        mu20_ur = float(np.mean(past_ur_20))
-        sd20_ur = float(np.std(past_ur_20)) + 1e-6
-        feat["btc_up_w5_zscore"] = float(np.clip((feat.get("btc_up_w5", 0.5) - mu20_ur) / sd20_ur, -5, 5))
-    else:
-        feat["btc_up_w5_zscore"] = 0.0
-    # Other window zscores (not in v18 top features, but keep for compatibility)
-    cur_sws = [feat.get(f"btc_up_w{i}", 0.5) for i in range(6)]
-    for i in range(6):
-        if i == 5:
-            continue  # already computed above
-        past_sw = [h["sw"][i] for h in hist[-20:] if "sw" in h] if hist else []
-        if len(past_sw) >= 5:
-            mu, sd = float(np.mean(past_sw)), float(np.std(past_sw))
-            feat[f"btc_up_w{i}_zscore"] = float(np.clip((cur_sws[i] - mu) / (sd + 1e-8), -5, 5))
-        else:
-            feat[f"btc_up_w{i}_zscore"] = 0.0
-
-    # Realized vol (std of pre-slot returns over last 5/10 slots)
-    for win, lbl in [(5, "5s"), (10, "10s")]:
-        past_rets = [h.get("pre_ret", 0.0) for h in hist[-win:]] if hist else []
-        feat[f"btc_realized_vol_{lbl}"] = float(np.std(past_rets)) if len(past_rets) >= 3 else 0.0
-
-    # Lag outcomes (extended to 5 lags for v17+)
+    # prev_slot_up_ratio — continuous lag signals (v21 uses 1,2,3,5)
     n_hist = len(hist)
-    for lag in [1, 2, 3, 4, 5]:
-        if n_hist >= lag and hist[-lag].get("target") is not None:
-            feat[f"lag_{lag}_outcome"] = float(hist[-lag]["target"])
-        else:
-            feat[f"lag_{lag}_outcome"] = 0.5
-
-    # prev_slot_up_ratio/n_ticks/vol — continuous lag signals (v16/v17 features)
-    for lag in [1, 2, 3, 4, 5]:
+    for lag in [1, 2, 3, 5]:
         if n_hist >= lag:
             h = hist[-lag]
             feat[f"prev_slot_up_ratio_{lag}"]  = float(h.get("up_ratio", 0.5))
-            feat[f"prev_slot_n_ticks_{lag}"]   = float(h.get("n_ticks", 0.0))
-            feat[f"prev_slot_vol_{lag}"]        = float(h.get("vol_total", 0.0))
         else:
             feat[f"prev_slot_up_ratio_{lag}"]  = 0.5
-            feat[f"prev_slot_n_ticks_{lag}"]   = 0.0
-            feat[f"prev_slot_vol_{lag}"]        = 0.0
-
-    # Lag streak
-    streak = 0
-    if n_hist >= 1 and hist[-1].get("target") is not None:
-        last_val = hist[-1]["target"]
-        for back in range(1, min(n_hist + 1, 6)):
-            v = hist[-back].get("target")
-            if v == last_val and v is not None:
-                streak += 1
-            else:
-                break
-    feat["lag_streak"] = float(streak)
 
     # ── OB features: fetch real order book via CLOB REST ──────────────────────
     # Identical computation to training (pmdata poly_l2 book snapshots).
@@ -1205,13 +1081,11 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
     # up_token_id must be passed in; on failure fills with None (market excluded).
     feat.update(_build_ob_features(up_token_id))
 
-    # ── Cross-domain interaction features (OB × CLOB) ─────────────────────────
-    # Matches training: these combine orderbook state with CLOB flow signals
+    # ── Cross-domain interaction features (OB x CLOB) ─────────────────────────
+    # v21 uses: x_imb_x_ur, x_depth_x_momentum, x_ob_drift_x_inslot
     feat["x_imb_x_ur"]          = feat.get("ob_imbalance", 0.0) * feat.get("btc_up_ratio", 0.5)
     feat["x_depth_x_momentum"]  = feat.get("ob_depth_ratio", 1.0) * feat.get("btc_momentum", 0.0)
-    feat["x_spread_x_vol"]      = feat.get("ob_spread", 0.0) * feat.get("btc_n_ticks", 0.0)
     feat["x_ob_drift_x_inslot"] = feat.get("ob_mid_drift", 0.0) * feat.get("btc_inslot_ret", 0.0)
-    feat["x_fill_imb_x_buy"]    = feat.get("ob_fill_imbalance", 0.0) * feat.get("btc_buy_ratio", 0.5)
 
     # ── Spot features ──────────────────────────────────────────────────────────
     feat.update(build_spot_features(slot_ts))
