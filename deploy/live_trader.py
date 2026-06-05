@@ -427,7 +427,7 @@ def start_clob_daemon():
             ping_interval=None,
             ping_timeout=None,
             close_timeout=5.0,
-            zombie_timeout=60.0,       # Server pings every ~30s, so 60s without data = zombie
+            zombie_timeout=120.0,      # Raised from 60s: one-sided markets can go minutes without data msgs. Active ping/pong probe in ws_manager prevents true zombies.
             health_log_interval=300.0,  # log health every 5 min
         ),
     )

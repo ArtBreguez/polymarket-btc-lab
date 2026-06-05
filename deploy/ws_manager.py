@@ -439,7 +439,13 @@ class WebSocketManager:
         log.info("[%s] Server closed connection gracefully", self.name)
 
     async def _zombie_watchdog(self, ws) -> None:
-        """Periodically check if the connection is zombie (connected but no data)."""
+        """Periodically check if the connection is zombie (connected but no data).
+
+        ACTIVE zombie detection: before killing, sends a protocol-level ping
+        and waits for pong. If pong comes back, the connection is alive — just
+        no *data* messages (common on illiquid/one-sided markets). Only kills
+        if ping also fails (true zombie: connection silently dead).
+        """
         # Wait a bit before first check to allow initial messages
         await asyncio.sleep(self.config.zombie_timeout)
         while True:
@@ -448,12 +454,28 @@ class WebSocketManager:
                 continue  # Haven't received first message yet
             age = time.time() - self.metrics.last_message_at
             if age > self.config.zombie_timeout:
-                log.warning(
-                    "[%s] Zombie detected — no message for %.0fs (threshold: %.0fs). Force closing.",
-                    self.name,
-                    age,
-                    self.config.zombie_timeout,
-                )
-                self.metrics.record_zombie_kill()
-                await ws.close(code=4000, reason="zombie-timeout")
-                return
+                # ACTIVE CHECK: ping/pong probe before killing
+                try:
+                    pong = await ws.ping()
+                    await asyncio.wait_for(pong, timeout=10.0)
+                    # Pong received — connection is alive, just no data messages.
+                    # This is normal on illiquid/one-sided markets. Reset the
+                    # last_message_at so we don't spam this check every 5s.
+                    log.info(
+                        "[%s] No data for %.0fs but ping/pong OK — connection alive (market quiet)",
+                        self.name,
+                        age,
+                    )
+                    with self.metrics._lock:
+                        self.metrics.last_message_at = time.time()
+                    continue
+                except (asyncio.TimeoutError, Exception) as e:
+                    log.warning(
+                        "[%s] Zombie confirmed — no message for %.0fs AND ping failed (%s). Force closing.",
+                        self.name,
+                        age,
+                        e,
+                    )
+                    self.metrics.record_zombie_kill()
+                    await ws.close(code=4000, reason="zombie-timeout")
+                    return
