@@ -1725,10 +1725,10 @@ def run(client, model, features):
             true_edge = edge_vs_ask
 
             # ── Compute shares + actual cost (CLOB min 5 shares) ───────────
-            # Testing phase: always use minimum 5 shares to conserve balance.
-            shares = 5.0
+            # Gradual scale-up: 8 shares (was 5 during testing phase).
+            shares = 8.0
             actual_cost = round(shares * ask_price, 4)
-            log.info("  Min 5 shares @ $%.3f — cost $%.2f", ask_price, actual_cost)
+            log.info("  %d shares @ $%.3f — cost $%.2f", int(shares), ask_price, actual_cost)
 
             # ── Balance check against real order cost (not just STAKE_USDC) ──
             try:

@@ -7,16 +7,18 @@ __pycache__/
 dist/
 build/
 
+# Secrets
+.env
+.env.*
+
 # Data — large parquet files, never commit
 data/
 artifacts/*.parquet
 artifacts/*.pkl
 artifacts/*.csv
 
-# Paper trades and research output — keep locally only
-# (uncomment below to also exclude these)
-# artifacts/paper_trades.json
-# artifacts/research_v2_report.json
+# Logs
+*.log
 
 # Spot buffer (runtime file)
 /tmp/spot_buffer.json
@@ -26,3 +28,4 @@ artifacts/*.csv
 
 # OS
 .DS_Store
+Thumbs.db
