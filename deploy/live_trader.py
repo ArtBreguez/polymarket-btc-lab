@@ -418,10 +418,16 @@ def start_clob_daemon():
         on_message=_clob_on_message,
         on_connect=_clob_on_connect,
         config=WSConfig(
-            ping_interval=20.0,
-            ping_timeout=10.0,
+            # CRITICAL: ping_interval=None lets the Polymarket server control
+            # ping/pong. Their server sends pings every ~30s; the websockets lib
+            # automatically responds with pong even with ping_interval=None.
+            # Client-initiated pings (ping_interval=20) cause "double-ping"
+            # conflict → server drops connection every ~60s (code 1006).
+            # Ref: https://github.com/Polymarket/py-clob-client/issues/82
+            ping_interval=None,
+            ping_timeout=None,
             close_timeout=5.0,
-            zombie_timeout=45.0,       # CLOB should send updates within 45s if subscribed
+            zombie_timeout=60.0,       # Server pings every ~30s, so 60s without data = zombie
             health_log_interval=300.0,  # log health every 5 min
         ),
     )

@@ -62,9 +62,11 @@ class WSConfig:
     jitter_range: float = 0.3          # ±30% randomization on delays
 
     # Ping/pong (RFC 6455 keepalive)
-    ping_interval: float = 20.0        # send ping every N seconds
-    ping_timeout: float = 10.0         # wait N seconds for pong
-    close_timeout: float = 5.0         # graceful close timeout
+    # Set to None to let the SERVER control ping/pong (recommended for Polymarket).
+    # The websockets lib still responds to server pings even with None.
+    ping_interval: Optional[float] = 20.0
+    ping_timeout: Optional[float] = 10.0
+    close_timeout: float = 5.0
 
     # Zombie detection
     zombie_timeout: float = 45.0       # no message for N seconds → force reconnect
