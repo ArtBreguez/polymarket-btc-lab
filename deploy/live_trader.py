@@ -163,6 +163,34 @@ async def _spot_on_connect(ws) -> None:
     pass
 
 
+def _spot_rest_poll():
+    """Fallback: poll Binance REST API for latest klines when WS is blocked.
+
+    Runs in a background thread, polls every 30s. This handles the case where
+    Binance WS returns HTTP 451 (geo-blocked) from certain cloud regions.
+    """
+    while True:
+        try:
+            for sym in _spot_buffers:
+                limit = 5  # just the latest candles, seed already loaded history
+                r = _http.get(f"{BINANCE_REST}/klines",
+                              params={"symbol": sym.upper(), "interval": "1m", "limit": limit},
+                              timeout=HTTP_TIMEOUT + 2)
+                if r.ok:
+                    for k in r.json():
+                        ts_s = k[0] // 1000
+                        close = float(k[4])
+                        dq = _spot_buffers[sym]
+                        if dq and dq[-1][0] == ts_s:
+                            dq[-1][1] = close
+                        elif not dq or ts_s > dq[-1][0]:
+                            dq.append([ts_s, close])
+                    _write_spot_buffer()
+        except Exception as e:
+            log.warning("Spot REST poll error: %s", e)
+        time.sleep(30)
+
+
 _spot_ws_manager: WebSocketManager | None = None
 
 def start_spot_daemon():
@@ -184,6 +212,11 @@ def start_spot_daemon():
     )
     _spot_ws_manager.start()
     log.info("Spot daemon started (ws_manager)")
+
+    # Start REST fallback poller for when WS is geo-blocked (HTTP 451)
+    rest_thread = threading.Thread(target=_spot_rest_poll, daemon=True, name="spot-rest-poll")
+    rest_thread.start()
+    log.info("Spot REST fallback poller started (every 30s)")
 
     # Wait up to 10s for initial seed
     for _ in range(10):
@@ -340,7 +373,22 @@ async def _clob_on_message(msg) -> None:
 
     # Drain pending subscriptions from external threads
     if _clob_ws_manager:
-        _clob_drain_and_subscribe(_clob_ws_manager)
+        pending: list[tuple[str, int]] = []
+        while True:
+            try:
+                pending.append(_subscribe_queue.get_nowait())
+            except _queue_mod.Empty:
+                break
+        if pending:
+            new_tokens = [t for t, _ in pending if t not in _clob_subscribed]
+            if new_tokens:
+                _clob_subscribed.update(new_tokens)
+                for t, s in pending:
+                    if s:
+                        _token_slot[t] = s
+                # Use async send — we're already in the event loop
+                await _clob_ws_manager.send({"type": "Market", "assets_ids": new_tokens})
+                log.info("CLOB WS subscribed %d new tokens", len(new_tokens))
 
     # Keepalive: re-subscribe active tokens every 30s to prevent
     # proxy/LB idle timeout (60-120s) and server-side timeout (~11 min)
@@ -349,7 +397,7 @@ async def _clob_on_message(msg) -> None:
         with _clob_prices_lock:
             active = list(_clob_subscribed)
         if active:
-            _clob_ws_manager.send_sync({"type": "Market", "assets_ids": active})
+            await _clob_ws_manager.send({"type": "Market", "assets_ids": active})
             log.info("CLOB WS keepalive — re-subscribed %d tokens", len(active))
         _clob_last_keepalive = now
 
