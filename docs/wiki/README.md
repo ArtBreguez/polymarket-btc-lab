@@ -24,14 +24,14 @@ This project builds and operates a machine-learning system that predicts the out
 
 ---
 
-## Current State (v18 Champion)
+## Current State (v21 Champion)
 
 | Metric | Value |
 |--------|-------|
-| Walk-Forward AUC | 0.8966 |
-| Brier Score | 0.1318 |
-| Accuracy (0.5 threshold) | 0.8104 |
-| Training markets | 22,237 |
+| Walk-Forward AUC | 0.9002 |
+| Brier Score | 0.1290 |
+| Accuracy (0.5 threshold) | 0.8134 |
+| Training markets | 22,319 |
 | Feature count | 30 |
 | Model | LightGBM + isotonic calibration |
 | Data coverage | Feb 15, 2026 – present |
@@ -43,8 +43,8 @@ This project builds and operates a machine-learning system that predicts the out
 
 ### Train a new model version
 ```bash
-# Run v18 training on Modal (requires MODAL_TOKEN_ID + MODAL_TOKEN_SECRET)
-modal run scripts/train_v18_modal.py
+# Run v21 training on Modal (requires MODAL_TOKEN_ID + MODAL_TOKEN_SECRET)
+modal run scripts/train_v21_modal.py
 
 # Or use the convenience wrapper
 bash train.sh

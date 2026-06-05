@@ -57,28 +57,28 @@ If any check fails, CI blocks deployment.
 
 ---
 
-## Champion Progression: v4 → v18
+## Champion Progression: v4 → v21
 
 | Version | AUC | Acc | Brier | Features | Samples | Key Change |
 |---------|-----|-----|-------|----------|---------|------------|
 | v4 | 0.843 | — | — | ~40 | 601 | Multi-crypto baseline (ETH/SOL — later removed) |
 | v5 | 0.8553 | — | — | — | 601 | BTC-only, OB ts_ms fix |
-| v6 | 0.8559 | 0.7738 | **0.1562** | — | 601 | Lag outcomes, purged WF gap=5 |
-| v7 | 0.8536 | 0.7598 | 0.1593 | — | 601 | Time-weighted flow, VWAP trend, ensemble tested & rejected |
+| v6 | 0.8559 | 0.7738 | 0.1562 | — | 601 | Lag outcomes, purged WF gap=5 |
 | v8 | 0.8529 | 0.7802 | 0.1707 | 63 | 601 | 6x30s sub-windows, multi-scale zscore |
-| v9 | 0.8519 | 0.7842 | 0.1809 | 27 | 601 | Sigmoid calibration (worse Brier — reverted) |
-| v10 | **0.8547** | **0.7902** | **0.1554** | 31 | 601 | Isotonic back, interaction features, gate fix |
-| v11 | 0.8533 | 0.7839 | 0.1585 | 22 | 601 | price_percentile + final_burst (both dropped) |
-| v12 | 0.8542 | 0.7762 | 0.1634 | 38 | 601 | 7-fold WF (worse — reverted to 5) |
-| v13-v16 | ~0.85 | — | — | ~30 | 601+ | Iterative improvements, expanded lag context |
+| v10 | 0.8547 | 0.7902 | 0.1554 | 31 | 601 | Isotonic calibration, interaction features, gate fix |
 | v17 | 0.8925 | 0.8032 | 0.1342 | ~30 | 7,062 | Extended lag context + temporal features |
-| **v18** | **0.8966** | **0.8104** | **0.1318** | **30** | **22,319** | 3x data expansion, pre-fetched Binance spot |
+| v18 | 0.8966 | 0.8104 | 0.1318 | 30 | 22,319 | 3x data expansion, pre-fetched Binance spot |
+| v19 | 0.9000 | 0.8127 | 0.1291 | 40 | 22,319 | L2 orderbook features (real OB data from pmdata.dev) |
+| v20 | — | — | — | — | — | FAILED: pmdata API key expired, 0/3 gate |
+| **v21** | **0.9002** | **0.8134** | **0.1290** | **30** | **22,319** | **Ablation: pruned 10 low-value features, 3/3 gate** |
 
 Key inflection points:
 - **v5**: BTC-only scope established
 - **v10**: Gate bug fixed, interaction features, isotonic calibration locked in
 - **v17**: Extended lag context from 15k tickless markets
 - **v18**: 3x data expansion (22k markets, 68M ticks) — more data > better features
+- **v19**: L2 orderbook features — real market microstructure data
+- **v21**: Feature ablation — fewer features, same performance, less overfit risk
 
 ---
 

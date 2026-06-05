@@ -421,17 +421,100 @@ reg_lambda       = 0.0001395
 
 ---
 
-## Feature Hall of Fame (Updated v19)
+## Feature Hall of Fame (Updated v21)
 
-| Feature | First version | v18 rank | Notes |
+| Feature | First version | v21 rank | Notes |
 |---------|---------------|----------|-------|
-| `btc_inslot_ret` | v8 | **#1** | In-slot spot return — strongest with 22k samples |
-| `btc_vwap_up` | v8 | #2 | Up token VWAP |
+| `btc_inslot_ret` | v8 | **#1** | In-slot spot return — strongest signal |
+| `ob_mid_drift` | v19 | **#2** | OB midpoint drift open→close — L2 feature |
 | `btc_pre_5m_ret` | v8 | #3 | 5-min pre-slot spot return |
-| `btc_vwap_dn` | v8 | #4 | Down token VWAP |
-| `btc_up_w1` | v8 | #5 | 2nd 30s window |
-| `btc_pre_30m_ret` | v8 | #6 | 30-min pre-slot spot return |
-| `btc_vwap_spread` | v8 | #7 | VWAP up - VWAP down |
-| `btc_momentum` | v6 | #8 | Late windows - early windows |
-| `btc_pre_1h_ret` | v8 | #9 | 1h pre-slot spot return |
-| `prev_slot_up_ratio_1` | v6 | #10 | Previous slot's up ratio |
+| `btc_vwap_up` | v8 | #4 | Up token VWAP |
+| `x_ob_drift_x_inslot` | v19 | #5 | Interaction: OB drift × inslot return |
+| `btc_up_w1` | v8 | #6 | 2nd 30s window |
+| `btc_pre_30m_ret` | v8 | #7 | 30-min pre-slot spot return |
+| `ob_weighted_imb` | v19 | #8 | Weighted OB imbalance |
+| `btc_vwap_dn` | v8 | #9 | Down token VWAP |
+| `ob_mid` | v19 | #10 | OB midpoint price |
+
+### Feature Graveyard (Pruned in v21)
+
+| Feature | Removed in | Reason |
+|---------|-----------|--------|
+| `ob_total_depth` | v21 | 0.7% importance, absolute value leak |
+| `btc_up_ratio_zscore_5s` | v21 | Noisy short zscore, needs warm history |
+| `btc_up_ratio_zscore_20s` | v21 | Noisy long zscore, needs warm history |
+| `btc_pre_1h_4h_ratio` | v21 | Cold buffer issues in live |
+| `btc_up_w0` | v21 | Earliest window = most noise |
+| `prev_slot_up_ratio_4` | v21 | 4 slots back, mostly noise |
+| `btc_dist_1k` | v21 | Weak round-number signal |
+| `hour_x_tw_ur` | v21 | Temporal overfit risk |
+| `ob_imb_w1` | v21 | Interpolated in live (not measured) |
+| `hour_cos` | v21 | Calendar overfit risk |
+
+---
+
+## v20: Dataset Expansion Attempt (FAILED)
+
+**Date:** 2026-06-04
+**Result:** NOT PROMOTED (0/3 gate)
+
+Attempted to expand dataset using pmdata.dev API for additional markets.
+API key was expired ("API key is invalid or expired"), resulting in 0 new
+markets fetched. The v20 model trained on the same data as v19 with
+slightly different hyperparameters, failed to beat the champion on any metric.
+
+**Lesson:** Always verify API credentials before running expansion pipelines.
+
+---
+
+## v21: Feature Ablation & Pruning (CURRENT CHAMPION)
+
+**Date:** 2026-06-05
+**Result:** PROMOTED (3/3 gate) — 30 features, AUC=0.9002
+
+### Motivation
+
+v19 used 40 features but ~10 had <1.5% importance and some had live data
+quality issues (interpolated OB, cold zscore buffers, temporal overfit).
+Goal: remove features that don't contribute without losing performance.
+
+### Methodology: Ablation Study
+
+1. Ranked all 40 features by LightGBM importance (gain)
+2. Trained 3 variants with Optuna (150 trials each):
+   - **40 features** (baseline): AUC=0.9002, Brier=0.1289, Acc=81.33%
+   - **35 features** (top 35): AUC=0.9001, Brier=0.1290, Acc=81.23%
+   - **30 features** (top 30): AUC=0.9002, Brier=0.1290, Acc=81.34%
+3. Walk-forward evaluation (5 folds) for all variants
+4. Selected 30-feature variant: matched 40-feat AUC with better accuracy
+
+### Results
+
+| Metric | v19 (champion) | v21 (30 feat) | Delta |
+|--------|---------------|---------------|-------|
+| AUC | 0.9000 | 0.9002 | +0.0002 |
+| Brier | 0.1291 | 0.1290 | -0.0001 |
+| Accuracy | 81.27% | 81.34% | +0.07% |
+| Features | 40 | 30 | -25% |
+
+### Impact on Live System
+
+- Removed 137 lines of dead feature computation from live_trader.py
+- Faster build_features: fewer numpy operations per slot
+- Cleaner codebase: no more interpolated/synthetic feature paths
+- No loss in prediction quality
+
+### Best Hyperparameters (Optuna, 150 trials)
+
+```
+n_estimators: 460
+learning_rate: 0.0129
+max_depth: 6
+num_leaves: 58
+min_child_samples: 95
+subsample: 0.602
+colsample_bytree: 0.603
+reg_alpha: 0.0056
+reg_lambda: 0.0234
+```
+

@@ -1,224 +1,138 @@
-# polymarket-btc-lab
+# Polymarket BTC 5-Min Prediction Lab
 
-ML pipeline for predicting UP/DOWN outcomes on Polymarket BTC 5-minute binary markets.
+ML pipeline for predicting Bitcoin 5-minute Up/Down markets on Polymarket. Trains LightGBM models on CLOB order flow + L2 orderbook + Binance spot data, deploys to Fly.io for live trading.
 
-**Signal source:** Polymarket CLOB order flow (first 3 minutes of each 5-minute slot)  
-**Model:** LightGBM, trained on Modal.com cloud GPU  
-**Champion:** v8 — AUC 0.8529, Acc 0.7802 (63 features, purged walk-forward CV)  
-**Live deployment:** Fly.io (`polymarket-maker-mm`), auto-deployed via GitHub Actions
+## Current Champion: v21
 
----
+| Metric | Value |
+|--------|-------|
+| Walk-Forward AUC | 0.9002 |
+| Walk-Forward Brier | 0.1290 |
+| Walk-Forward Accuracy | 81.34% |
+| Features | 30 (pruned from 40 via ablation study) |
+| Training samples | 22,319 markets |
+| Dataset range | Mar 13 - Jun 3, 2026 (83 days) |
+| Ticks | 68.3M clean trades |
 
-## Overview
-
-Each Polymarket BTC 5-minute market resolves UP or DOWN based on the Chainlink oracle price at slot end. This pipeline:
-
-1. Ingests order flow ticks from the Polymarket CLOB during `[t=0, t=180s)` of each slot
-2. Computes 63 features (sub-window flow, multi-scale zscore, VWAP, realized vol, lag outcomes, spot context)
-3. Trains a LightGBM classifier with Optuna-tuned hyperparameters using purged walk-forward CV
-4. Promotes the winning model to HuggingFace if it beats the current champion
-5. Deploys the live trader to Fly.io, which places orders at `t=170–240s` of each slot
-
----
-
-## Repository Structure
+## Architecture
 
 ```
-scripts/
-  train_v5_modal.py        # v5: BTC-only, OB ts_ms fix, Optuna WF objective
-  train_v6_modal.py        # v6: lagged outcomes (lag1/2/3), lag streak, purged WF gap=5
-  train_v7_modal.py        # v7: realized vol, tw_up_ratio, vwap_trend
-  train_v8_modal.py        # v8: CURRENT — 6x30s sub-windows, multi-scale zscore
-  promote_champion.py      # sanity-check + upload local pkl to HF as champion
-  validate_model.py        # CI validation (called by GitHub Actions)
-  build_dataset_modal.py   # dataset exploration utilities
-
-deploy/
-  live_trader.py           # live prediction + order placement (Fly.io)
-  Dockerfile
-  fly.toml
-  requirements.txt
-
-src/btc_lab/
-  features.py              # feature computation (shared between training and live)
-  plugin.py                # BtcUpDownPlugin for pmlab framework
-  config.py                # paths and constants
-
-tests/
-  test_features.py
-
-.github/workflows/
-  ci.yml                   # validate_model.py on every push
-  deploy.yml               # deploy to Fly.io when champion.pkl changes on HF
-
-artifacts/                 # local model pkls and datasets (gitignored)
+Polymarket CLOB ──┐
+                  ├── live_trader.py ──> Predictions ──> Orders
+Binance Spot ─────┘        │
+                     30 features
+                     LightGBM + Isotonic calibration
 ```
 
----
+**Data sources (live):**
+- CLOB WebSocket: real-time Up/Down trades (order flow)
+- CLOB REST API: L2 orderbook snapshots (mid, spread, imbalance, depth)
+- Binance REST: BTC/USDT 1-minute candles (spot returns, volatility)
 
-## Quick Start
+**Data sources (training):**
+- Polymarket Data API: historical ticks for 22k+ markets
+- pmdata.dev: L2 orderbook snapshots (pre-computed features)
+- Binance API: historical 1-minute OHLCV candles
+
+## Features (v21 — 30 features)
+
+| Category | Count | Examples |
+|----------|-------|---------|
+| CLOB tick flow | 10 | btc_up_ratio, btc_vwap_up/dn, btc_momentum, btc_buy_ratio |
+| L2 orderbook | 7 | ob_mid, ob_mid_drift, ob_weighted_imb, ob_imb_w0/w2 |
+| Binance spot | 5 | btc_inslot_ret, btc_pre_5m/30m/1h/4h_ret |
+| Lag history | 4 | prev_slot_up_ratio_1/2/3/5 |
+| Cross-domain | 3 | x_ob_drift_x_inslot, x_depth_x_momentum, x_imb_x_ur |
+| Temporal | 1 | hour_x_up_ratio |
+
+See [docs/wiki/02-feature-engineering.md](docs/wiki/02-feature-engineering.md) for full catalog.
+
+## Training Pipeline
+
+1. Load dataset from Modal Volume (22k markets, 68M ticks, OB features, Binance spot)
+2. Build 30 features per market (tick aggregation + spot returns + OB snapshots)
+3. Optuna hyperparameter search (150 trials, LightGBM)
+4. Walk-forward validation (5 time-series folds, gap=5)
+5. Isotonic calibration (CalibratedClassifierCV, cv=3)
+6. Promotion gate: must beat champion on 2/3 metrics (AUC, Brier, Accuracy)
+7. Upload to HuggingFace on promotion
+
+Runs on Modal (8 CPU, 32GB RAM). Training time: ~40 min.
 
 ```bash
-uv sync
+# Train new version
+modal run scripts/train_v21_modal.py
 ```
 
-**Train** (runs on Modal cloud, ~15 min, ~$0.20):
+## Live Trading
+
+Deployed on Fly.io (Amsterdam, `polymarket-maker-mm`).
+
+**Flow:** Every 5-min slot, observe 180s of CLOB trades → build features → predict → place order if confidence > 60% and edge > 10%.
+
+**Safety layers (DataQualityGate):**
+1. Data completeness (min 50 ticks, 3/6 sub-windows)
+2. Feature sanity (finite values, bounded ranges)
+3. Prediction sanity (reject > 99% or < 1%)
+4. Execution gate (ask price in [0.10, 0.95], circuit breaker WR < 40%)
+5. Cold start protection (warmup 3 slots after restart)
+
+**WebSocket resilience (ws_manager.py):**
+- Exponential backoff with jitter (5s → 60s max)
+- Active zombie detection (ping/pong probe before killing)
+- Binance REST fallback (WS blocked in EU, HTTP 451)
+
 ```bash
-modal run scripts/train_v8_modal.py
+# Deploy
+cd deploy && fly deploy --app polymarket-maker-mm --remote-only
 ```
 
-**Promote** a local model to HuggingFace champion:
-```bash
-python scripts/promote_champion.py --model artifacts/btc_model_v8.pkl
+## Project Structure
+
+```
+polymarket-btc-lab/
+├── deploy/
+│   ├── live_trader.py          # Live trading bot (v21, 30 features)
+│   ├── ws_manager.py           # Resilient WebSocket manager
+│   ├── data_quality_gate.py    # 5-layer safety gate
+│   ├── Dockerfile
+│   └── fly.toml
+├── scripts/
+│   ├── train_v21_modal.py      # Current training script (champion)
+│   ├── train_v19_modal.py      # Previous version
+│   ├── fetch_ob_features_modal.py
+│   └── fetch_ticks_modal.py
+├── tests/
+│   └── test_ws_manager.py      # 41 tests
+├── docs/
+│   ├── EXPERIMENTS.md           # Version history (v4 → v21)
+│   ├── PIPELINE.md              # Pipeline deep-dive
+│   └── wiki/                    # Technical wiki (8 pages)
+└── README.md
 ```
 
-**Live trader** is auto-deployed to Fly.io via GitHub Actions when `champion.pkl` changes on HuggingFace. No manual deploy step needed.
+## HuggingFace
 
----
+- **Model + Data:** [artbreguez/polymarket-btc-model](https://huggingface.co/artbreguez/polymarket-btc-model)
+  - `champion.pkl` — trained model bundle (LightGBM + calibration + feature list)
+  - `champion_meta.json` — metrics, version, ablation results
+  - `data/` — complete training dataset (all_markets.csv, ticks, OB features, Binance spot)
 
-## Infrastructure
+## Version History
 
-| Component | Service |
-|-----------|---------|
-| Training | [Modal.com](https://modal.com) (cloud GPU) |
-| Model registry | HuggingFace — `artbreguez/polymarket-btc-model` (private) |
-| Dataset | HuggingFace — `BrockMisner/polymarket-btc-updown` (private mirror) |
-| Live deployment | Fly.io — `polymarket-maker-mm` app |
-| CI/CD | GitHub Actions |
+| Version | AUC | Features | Key Change |
+|---------|-----|----------|-----------|
+| v4 | 0.720 | 15 | Baseline: tick flow only |
+| v8 | 0.853 | 63 | Binance spot + multi-scale zscores |
+| v16 | 0.887 | 56 | Lag features + slot history |
+| v18 | 0.898 | 40 | Feature pruning + walk-forward |
+| v19 | 0.900 | 40 | L2 orderbook features (real OB data) |
+| v21 | 0.900 | 30 | Ablation study: pruned 10 low-value features |
 
----
+See [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) for full history.
 
-## Dataset
+## Live Performance
 
-- **616** resolved BTC 5-minute Polymarket markets (all available in BrockMisner)
-- Features computed from CLOB ticks in `[t=0, t=180s)` of each slot
-- **Label:** 1 = BTC UP at resolution (Chainlink oracle), 0 = DOWN
-- Oracle agreement: Binance 85.4%, Chainlink first_vs_last 97.4%
-- Dataset grows organically — no historical tick data exists for other markets
-
----
-
-## Model Champion Progression
-
-All versions use purged walk-forward CV with `gap=5` slots.
-
-| Version | AUC | Acc | Brier | Notes |
-|---------|-----|-----|-------|-------|
-| v4 | 0.843 | — | — | Baseline; multi-crypto (ETH/SOL features); deprecated |
-| v5 | 0.8553 | — | — | BTC-only; OB `ts_ms` fix; Optuna WF objective |
-| v6 | 0.8559 | 0.7738 | 0.1562 | Lagged outcomes (lag1/2/3), lag streak, permutation importance |
-| v7 | 0.8536 | 0.7598 | 0.1593 | Up/Down OB split, realized vol, `tw_up_ratio`, `vwap_trend`; ensemble LightGBM+LR tested but hurt |
-| **v8** | **0.8529** | **0.7802** | **0.1707** | **CURRENT CHAMPION** — 63 features, 6×30s sub-windows, multi-scale zscore |
-
-> v8 fold AUCs: `[0.824, 0.908, 0.872, 0.814, 0.847]`
-
----
-
-## v8 — Current Champion
-
-### Features (63 total)
-
-| Group | Features |
-|-------|----------|
-| Sub-window order flow (6×30s) | `btc_up_w0..w5`, `btc_up_w0_zscore..w5_zscore` |
-| Multi-scale zscore | `btc_up_ratio_zscore_5s/10s/20s`, `btc_up_ratio_hist_mean_5s/20s` |
-| Time-weighted | `btc_tw_up_ratio`, `btc_vwmom`, `btc_vwap_trend` |
-| Classic OB | `btc_up_ratio`, `btc_momentum`, `btc_vwap_spread`, `btc_vwap_up/dn`, `btc_buy_ratio`, `btc_avg_size`, `btc_vol_up/dn`, `btc_vol_ratio`, `btc_n_ticks` |
-| Realized vol | `btc_realized_vol_5s`, `btc_realized_vol_10s`, `btc_tick_accel` |
-| Spot context | `btc_inslot_ret/vol`, `btc_pre_5m/15m/30m/1h/4h_ret/vol` |
-| Orderbook (UP side only) | `ob_up_bid/ask/spread/bid_depth/ask_depth/imbalance`, `ob_implied_prob` |
-| Lag outcomes | `lag_1/2/3_outcome`, `lag_streak` |
-| Round numbers | `btc_dist_1k`, `btc_dist_5k`, `btc_dist_10k` |
-| Time | `hour_sin/cos`, `dow_sin/cos` |
-
-### Top Features (permutation importance)
-
-1. `btc_up_ratio_zscore`
-2. `btc_up_w2`
-3. `btc_up_w1`
-4. `btc_up_w5`
-5. `btc_tw_up_ratio`
-6. `btc_vwap_trend`
-7. `btc_vwmom`
-8. `btc_momentum`
-9. `btc_vwap_spread`
-
-### Best Hyperparameters
-
-```python
-n_estimators     = 198
-num_leaves       = 27
-min_child_samples = 41
-subsample        = 0.534
-colsample_bytree = 0.428
-reg_alpha        = 0.978
-reg_lambda       = 1.108
-learning_rate    = 0.00617
-```
-
----
-
-## Anti-Overfitting Measures
-
-- **Purged walk-forward CV** with `gap=5` slots — prevents leakage from lag features
-- **Optuna optimizes on WF AUC** (not held-out CV); falls back to baseline if Optuna overfits
-- **OB Down token dropped** — `best_bid_size` is always `0.0` for resolved markets (pure noise)
-- **No ensemble** — LightGBM+LR combination tested at v7 but hurt performance (0.8479 vs 0.8536 solo)
-- **Champion AUC read from HF metadata** — never hardcoded
-- **Gated comparison** — re-evaluates current champion with the same purged WF before comparing to challenger
-
----
-
-## Live Trading Strategy
-
-- **Entry window:** `t = 170–240s` into each 5-minute slot
-- **Signal:** model confidence exceeding a configurable threshold
-- **Stake:** configurable USDC per trade
-- **Order placement:** Polymarket SDK via `BuilderApiKey` (no direct CLOB API calls needed)
-
----
-
-## Known Pitfalls
-
-**Polymarket data-api**
-- Trades are returned newest-first; time filter params are silently ignored — must paginate via `offset`
-
-**Parquet type mismatch**
-- `orderbook.parquet` `market_id` is `STRING`; `markets.parquet` `market_id` is `INT` — PyArrow will OOM if the filter is not cast before join
-
-**OB Down token**
-- `best_bid_size` for the DOWN token is always `0.0` in resolved markets — drop from features entirely
-
-**Dollar values**
-- `to_df()` already returns dollar values; never divide by `1e9`
-
-**Databento**
-- `stype_in='continuous'` is required for `.c.0` continuous symbols
-
-**Dataset growth**
-- The dataset can only expand organically as new markets resolve; no historical tick data exists for backfilling other markets
-
----
-
-## CI/CD
-
-**`ci.yml`** — runs on every push:
-```
-validate_model.py → loads champion from HF, runs sanity checks
-```
-
-**`deploy.yml`** — triggers when `champion.pkl` changes on HuggingFace:
-```
-docker build → fly deploy → polymarket-maker-mm (Fly.io)
-```
-
----
-
-## Secrets Required
-
-| Secret | Used by |
-|--------|---------|
-| `HF_TOKEN` | Training, promote, CI, deploy |
-| `POLYMARKET_API_KEY` / `BuilderApiKey` | Live trader |
-| `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` | Training |
-| `FLY_API_TOKEN` | GitHub Actions deploy |
+- Win rate: 74% (40W / 14L over 54 trades)
+- P&L: +$30.61
+- Wallet balance: $75.08 USDC

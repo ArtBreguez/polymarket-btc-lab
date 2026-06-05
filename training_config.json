@@ -1,0 +1,72 @@
+{
+  "version": "v21",
+  "date": "2026-06-05",
+  "model": {
+    "type": "LightGBM + Isotonic Calibration",
+    "lightgbm_version": "4.6.0",
+    "calibration": "CalibratedClassifierCV (cv=3, method=isotonic)"
+  },
+  "best_params": {
+    "n_estimators": 460,
+    "learning_rate": 0.0129,
+    "max_depth": 6,
+    "num_leaves": 58,
+    "min_child_samples": 95,
+    "subsample": 0.602,
+    "colsample_bytree": 0.603,
+    "reg_alpha": 0.0056,
+    "reg_lambda": 0.0234,
+    "random_state": 42,
+    "verbose": -1
+  },
+  "optuna": {
+    "n_trials": 150,
+    "n_jobs": 4,
+    "objective": "maximize mean AUC (3-fold TimeSeriesSplit)",
+    "search_space": {
+      "n_estimators": [200, 800],
+      "learning_rate": [0.01, 0.15, "log"],
+      "max_depth": [3, 7],
+      "num_leaves": [8, 63],
+      "min_child_samples": [20, 100],
+      "subsample": [0.6, 1.0],
+      "colsample_bytree": [0.6, 1.0],
+      "reg_alpha": [0.0001, 1.0, "log"],
+      "reg_lambda": [0.0001, 1.0, "log"]
+    }
+  },
+  "walk_forward": {
+    "method": "TimeSeriesSplit",
+    "n_splits": 5,
+    "gap": 5,
+    "observation_window_seconds": 180
+  },
+  "promotion_gate": {
+    "rule": "2-of-3 metrics must beat champion",
+    "metrics": ["AUC", "Brier Score", "Accuracy"],
+    "sanity_check": "UP scenario > Neutral > DOWN scenario",
+    "tie_breaker": "prefer fewer features (simpler model)"
+  },
+  "dataset": {
+    "markets": 22319,
+    "ticks": 68364530,
+    "date_range": "2026-03-13 to 2026-06-03",
+    "days": 83,
+    "binance_candles": 119000,
+    "ob_markets": 22189,
+    "class_balance": "50.2% UP / 49.8% DOWN"
+  },
+  "infrastructure": {
+    "platform": "Modal",
+    "cpu": 8,
+    "memory_gb": 32,
+    "timeout_seconds": 7200,
+    "volume": "btc-local-data",
+    "training_time_minutes": 42
+  },
+  "ablation_study": {
+    "variants_tested": ["40 features", "35 features", "30 features"],
+    "winner": "30 features",
+    "reason": "Matched 40-feat AUC (0.9002) with better accuracy (81.34% vs 81.33%) and 25% fewer features"
+  }
+}
