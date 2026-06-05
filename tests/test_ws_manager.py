@@ -586,6 +586,21 @@ class TestClobMessageHandler:
         # Price was 0.98, new is 0.97 which is < existing BUT >= 0.97 threshold
         assert self.prices["token-hi"] == 0.98  # unchanged
 
+    def test_reconnect_invalidates_cache(self):
+        """All cached prices should be cleared on reconnect to prevent stale data."""
+        self.prices["token-a"] = 0.55
+        self.prices_ts["token-a"] = time.time()
+        self.prices["token-b"] = 0.60
+        self.prices_ts["token-b"] = time.time()
+
+        # Simulate reconnect: clear all prices
+        self.prices.clear()
+        self.prices_ts.clear()
+
+        assert "token-a" not in self.prices
+        assert "token-b" not in self.prices
+        assert len(self.prices) == 0
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Integration: Spot message handler

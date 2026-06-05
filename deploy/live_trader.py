@@ -301,6 +301,17 @@ async def _clob_on_connect(ws) -> None:
 
     _clob_prune_stale()
 
+    # Invalidate ALL cached prices on reconnect — the server will send a fresh
+    # book snapshot after we re-subscribe, which will repopulate the cache.
+    # Without this, stale prices from before the disconnect (~4-6s gap) could
+    # still pass the PRICE_MAX_AGE check and be used for trading decisions.
+    with _clob_prices_lock:
+        stale_count = len(_clob_prices)
+        _clob_prices.clear()
+        _clob_price_ts.clear()
+    if stale_count:
+        log.info("CLOB WS reconnect — invalidated %d cached prices (forcing HTTP fallback until fresh data)", stale_count)
+
     with _clob_prices_lock:
         existing = list(_clob_subscribed)
     if existing:
