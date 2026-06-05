@@ -100,6 +100,8 @@ _http.headers.update({"User-Agent": "polymarket-btc-trader/2.0"})
 
 
 # ── Spot daemon (background thread) ───────────────────────────────────────────
+from ws_manager import WebSocketManager, WSConfig
+
 _spot_buffers: dict[str, deque] = {
     "btcusdt": deque(maxlen=300),  # 5h of 1m candles — needed for btc_pre_4h_ret
     "ethusdt": deque(maxlen=75),   # kept for future use; not used by v8
@@ -135,42 +137,54 @@ def _seed_spot_buffers():
             log.warning("Spot seed %s failed: %s", sym, e)
     _write_spot_buffer()
 
-def _spot_daemon_thread():
-    """Background thread: WS stream → buffer → /tmp/spot_buffer.json"""
-    import websockets
 
-    async def _run():
-        _seed_spot_buffers()
-        while True:
-            try:
-                async with websockets.connect(BINANCE_WS, ping_interval=20, ping_timeout=10) as ws:
-                    log.info("Spot daemon connected")
-                    async for raw in ws:
-                        msg = json.loads(raw)
-                        sym = msg.get("stream", "").split("@")[0]
-                        if sym not in _spot_buffers:
-                            continue
-                        k = msg.get("data", {}).get("k", {})
-                        if not k:
-                            continue
-                        ts_s = k["t"] // 1000
-                        close = float(k["c"])
-                        dq = _spot_buffers[sym]
-                        if dq and dq[-1][0] == ts_s:
-                            dq[-1][1] = close
-                        else:
-                            dq.append([ts_s, close])
-                        _write_spot_buffer()
-            except Exception as e:
-                log.warning("Spot WS error: %s — reconnecting in 5s", e)
-                await asyncio.sleep(5)
+async def _spot_on_message(msg: dict) -> None:
+    """Handle Binance kline WS message."""
+    if isinstance(msg, dict):
+        sym = msg.get("stream", "").split("@")[0]
+        if sym not in _spot_buffers:
+            return
+        k = msg.get("data", {}).get("k", {})
+        if not k:
+            return
+        ts_s = k["t"] // 1000
+        close = float(k["c"])
+        dq = _spot_buffers[sym]
+        if dq and dq[-1][0] == ts_s:
+            dq[-1][1] = close
+        else:
+            dq.append([ts_s, close])
+        _write_spot_buffer()
 
-    asyncio.run(_run())
+
+async def _spot_on_connect(ws) -> None:
+    """Seed buffers on first connect (runs in the WS thread's event loop)."""
+    # Seeding uses REST, safe to call from async context
+    pass
+
+
+_spot_ws_manager: WebSocketManager | None = None
 
 def start_spot_daemon():
-    t = threading.Thread(target=_spot_daemon_thread, daemon=True, name="spot-daemon")
-    t.start()
-    log.info("Spot daemon thread started")
+    global _spot_ws_manager
+
+    # Seed spot buffers via REST before WS connects
+    _seed_spot_buffers()
+
+    _spot_ws_manager = WebSocketManager(
+        name="binance-spot",
+        url=BINANCE_WS,
+        on_message=_spot_on_message,
+        config=WSConfig(
+            ping_interval=20.0,
+            ping_timeout=10.0,
+            zombie_timeout=60.0,       # Binance sends klines every ~2s
+            health_log_interval=300.0,  # log health every 5 min
+        ),
+    )
+    _spot_ws_manager.start()
+    log.info("Spot daemon started (ws_manager)")
+
     # Wait up to 10s for initial seed
     for _ in range(10):
         if SPOT_BUFFER.exists():
@@ -186,6 +200,8 @@ _clob_prices_lock = threading.Lock()
 _clob_subscribed: set[str] = set()
 _token_slot: dict[str, int] = {}   # token_id → slot_ts for pruning
 _subscribe_queue: _queue_mod.Queue = _queue_mod.Queue()
+_clob_ws_manager: WebSocketManager | None = None
+_clob_last_keepalive: float = 0.0
 
 
 def clob_subscribe(token_ids: list[str], slot_ts: int = 0):
@@ -210,154 +226,153 @@ def get_ask_price_ws(token_id: str) -> float | None:
     return price
 
 
-def _clob_daemon_thread():
-    """Background thread: CLOB WS → _clob_prices dict."""
-    import websockets
+def _clob_prune_stale() -> None:
+    """Remove tokens from subscriptions that belong to old slots."""
+    now_ts = int(time.time())
+    cur = (now_ts // SLOT_DURATION) * SLOT_DURATION
+    active_cutoff = cur - SLOT_DURATION
+    with _clob_prices_lock:
+        stale = {tid for tid in _clob_subscribed
+                 if _token_slot.get(tid, 0) < active_cutoff}
+        for tid in stale:
+            _clob_subscribed.discard(tid)
+            _clob_prices.pop(tid, None)
+            _token_slot.pop(tid, None)
+    if stale:
+        log.info("CLOB WS pruned %d stale tokens", len(stale))
 
-    async def _clob_run():
-        while True:
-            try:
-                # Enable WS ping/pong (RFC 6455) — keeps connection alive through
-                # proxies/load balancers that kill idle TCP after 60-120s.
-                # If Polymarket rejects pings, the 30s keepalive below handles it.
-                async with websockets.connect(
-                    CLOB_WS_URL, ping_interval=20, ping_timeout=10, close_timeout=5
-                ) as ws:
-                    log.info("CLOB WS daemon connected")
-                    last_send = time.time()
 
-                    # DON'T clear prices on reconnect — PRICE_MAX_AGE already handles
-                    # staleness. Clearing forces immediate HTTP fallback for ALL tokens
-                    # even if prices were updated <5s ago.
+def _clob_drain_and_subscribe(ws_manager: WebSocketManager) -> None:
+    """Drain the subscribe queue and send new subscriptions via WS manager."""
+    pending: list[tuple[str, int]] = []
+    while True:
+        try:
+            pending.append(_subscribe_queue.get_nowait())
+        except _queue_mod.Empty:
+            break
+    if not pending:
+        return
+    new_tokens = [t for t, _ in pending if t not in _clob_subscribed]
+    if new_tokens:
+        _clob_subscribed.update(new_tokens)
+        for t, s in pending:
+            if s:
+                _token_slot[t] = s
+        ws_manager.send_sync({"type": "Market", "assets_ids": new_tokens})
+        log.info("CLOB WS subscribed %d new tokens", len(new_tokens))
 
-                    # Prune stale tokens — only keep current + next 3 slots
-                    now_ts = int(time.time())
-                    cur = (now_ts // SLOT_DURATION) * SLOT_DURATION
-                    active_cutoff = cur - SLOT_DURATION
+
+async def _clob_on_connect(ws) -> None:
+    """Re-subscribe existing tokens + drain queue on (re)connect."""
+    global _clob_last_keepalive
+
+    _clob_prune_stale()
+
+    with _clob_prices_lock:
+        existing = list(_clob_subscribed)
+    if existing:
+        await ws.send(json.dumps({"type": "Market", "assets_ids": existing}))
+        log.info("CLOB WS re-subscribed %d tokens on connect", len(existing))
+    _clob_last_keepalive = time.time()
+
+    # Drain any queued subscription requests that arrived before connect
+    pending: list[tuple[str, int]] = []
+    while True:
+        try:
+            pending.append(_subscribe_queue.get_nowait())
+        except _queue_mod.Empty:
+            break
+    if pending:
+        new_tokens = [t for t, _ in pending if t not in _clob_subscribed]
+        if new_tokens:
+            _clob_subscribed.update(new_tokens)
+            for t, s in pending:
+                if s:
+                    _token_slot[t] = s
+            await ws.send(json.dumps({"type": "Market", "assets_ids": new_tokens}))
+            log.info("CLOB WS subscribed %d new tokens on connect", len(new_tokens))
+
+
+async def _clob_on_message(msg) -> None:
+    """Handle CLOB WS message — updates _clob_prices cache."""
+    global _clob_last_keepalive
+
+    # Server may send a list or a single dict
+    events = [msg] if isinstance(msg, dict) else msg
+    if not isinstance(events, list):
+        return
+
+    for ev in events:
+        etype = ev.get("event_type")
+        if etype == "book":
+            asset_id = ev.get("asset_id", "")
+            asks = ev.get("asks", [])
+            valid_asks = [
+                float(a["price"])
+                for a in asks
+                if float(a.get("price", 1)) < 0.97
+            ]
+            if valid_asks:
+                best = min(valid_asks)
+                with _clob_prices_lock:
+                    _clob_prices[asset_id] = best
+                    _clob_price_ts[asset_id] = time.time()
+        elif etype == "price_change":
+            for change in ev.get("price_changes", []):
+                if change.get("side") == "ASK":
+                    asset_id = change.get("asset_id", "")
+                    price = float(change.get("price", 1))
                     with _clob_prices_lock:
-                        stale = {tid for tid in _clob_subscribed
-                                 if _token_slot.get(tid, 0) < active_cutoff}
-                        for tid in stale:
-                            _clob_subscribed.discard(tid)
-                            _clob_prices.pop(tid, None)
-                            _token_slot.pop(tid, None)
-                        existing = list(_clob_subscribed)
-                    if stale:
-                        log.info("CLOB WS pruned %d stale tokens", len(stale))
-                    if existing:
-                        await ws.send(json.dumps({"type": "Market", "assets_ids": existing}))
-                        log.info("CLOB WS re-subscribed %d tokens", len(existing))
-                        last_send = time.time()
+                        # price_change fires on ANY book level change,
+                        # not just top-of-book. Two cases:
+                        # (a) price <= existing: tighter ask or same level — update.
+                        # (b) price > existing: could mean best offer was pulled
+                        #     and book worsened. Invalidate cache so HTTP
+                        #     fallback is used until next book snapshot.
+                        existing = _clob_prices.get(asset_id, 1.0)
+                        if price < 0.97 and price <= existing:
+                            _clob_prices[asset_id] = price
+                            _clob_price_ts[asset_id] = time.time()
+                        elif price > existing:
+                            # Best ask rose — invalidate to force HTTP fallback
+                            _clob_prices.pop(asset_id, None)
+                            _clob_price_ts.pop(asset_id, None)
 
-                    # Drain any queued subscription requests that arrived before connect
-                    pending: list[tuple[str,int]] = []
-                    while True:
-                        try:
-                            pending.append(_subscribe_queue.get_nowait())
-                        except _queue_mod.Empty:
-                            break
-                    if pending:
-                        new_tokens = [t for t, _ in pending if t not in _clob_subscribed]
-                        if new_tokens:
-                            _clob_subscribed.update(new_tokens)
-                            for t, s in pending:
-                                if s:
-                                    _token_slot[t] = s
-                            await ws.send(json.dumps({"type": "Market", "assets_ids": new_tokens}))
-                            log.info("CLOB WS subscribed %d new tokens", len(new_tokens))
-                            last_send = time.time()
+    # Drain pending subscriptions from external threads
+    if _clob_ws_manager:
+        _clob_drain_and_subscribe(_clob_ws_manager)
 
-                    while True:
-                        # Check for new subscription requests (non-blocking)
-                        pending = []
-                        while True:
-                            try:
-                                pending.append(_subscribe_queue.get_nowait())
-                            except _queue_mod.Empty:
-                                break
-                        if pending:
-                            new_tokens = [t for t, _ in pending if t not in _clob_subscribed]
-                            if new_tokens:
-                                _clob_subscribed.update(new_tokens)
-                                for t, s in pending:
-                                    if s:
-                                        _token_slot[t] = s
-                                await ws.send(json.dumps({"type": "Market", "assets_ids": new_tokens}))
-                                log.info("CLOB WS subscribed %d new tokens", len(new_tokens))
-                                last_send = time.time()
-
-                        # Keepalive: re-subscribe active tokens every 30s to prevent
-                        # proxy/LB idle timeout (60-120s) and server-side timeout (~11 min)
-                        if time.time() - last_send >= 30:
-                            with _clob_prices_lock:
-                                active = list(_clob_subscribed)
-                            if active:
-                                await ws.send(json.dumps({"type": "Market", "assets_ids": active}))
-                                log.info("CLOB WS keepalive — re-subscribed %d tokens", len(active))
-                            last_send = time.time()
-
-                        # Wait for next WS message with a short timeout so we can poll queue
-                        try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
-                        except asyncio.TimeoutError:
-                            continue
-
-                        try:
-                            events = json.loads(raw)
-                        except Exception:
-                            continue
-
-                        # Server may send a list or a single dict
-                        if isinstance(events, dict):
-                            events = [events]
-
-                        for ev in events:
-                            etype = ev.get("event_type")
-                            if etype == "book":
-                                asset_id = ev.get("asset_id", "")
-                                asks = ev.get("asks", [])
-                                valid_asks = [
-                                    float(a["price"])
-                                    for a in asks
-                                    if float(a.get("price", 1)) < 0.97
-                                ]
-                                if valid_asks:
-                                    best = min(valid_asks)
-                                    with _clob_prices_lock:
-                                        _clob_prices[asset_id] = best
-                                        _clob_price_ts[asset_id] = time.time()
-                            elif etype == "price_change":
-                                for change in ev.get("price_changes", []):
-                                    if change.get("side") == "ASK":
-                                        asset_id = change.get("asset_id", "")
-                                        price = float(change.get("price", 1))
-                                        with _clob_prices_lock:
-                                            # price_change fires on ANY book level change,
-                                            # not just top-of-book. Two cases:
-                                            # (a) price <= existing: tighter ask or same level — update.
-                                            # (b) price > existing: could mean best offer was pulled
-                                            #     and book worsened. Invalidate cache so HTTP
-                                            #     fallback is used until next book snapshot.
-                                            existing = _clob_prices.get(asset_id, 1.0)
-                                            if price < 0.97 and price <= existing:
-                                                _clob_prices[asset_id] = price
-                                                _clob_price_ts[asset_id] = time.time()
-                                            elif price > existing:
-                                                # Best ask rose — invalidate to force HTTP fallback
-                                                _clob_prices.pop(asset_id, None)
-                                                _clob_price_ts.pop(asset_id, None)
-            except Exception as e:
-                log.warning("CLOB WS error: %s — reconnecting in 5s", e)
-                await asyncio.sleep(5)
-
-    asyncio.run(_clob_run())
+    # Keepalive: re-subscribe active tokens every 30s to prevent
+    # proxy/LB idle timeout (60-120s) and server-side timeout (~11 min)
+    now = time.time()
+    if now - _clob_last_keepalive >= 30 and _clob_ws_manager:
+        with _clob_prices_lock:
+            active = list(_clob_subscribed)
+        if active:
+            _clob_ws_manager.send_sync({"type": "Market", "assets_ids": active})
+            log.info("CLOB WS keepalive — re-subscribed %d tokens", len(active))
+        _clob_last_keepalive = now
 
 
 def start_clob_daemon():
     """Start the CLOB WS daemon thread and pre-subscribe to current + next slot tokens."""
-    t = threading.Thread(target=_clob_daemon_thread, daemon=True, name="clob-daemon")
-    t.start()
-    log.info("CLOB WS daemon thread started")
+    global _clob_ws_manager
+
+    _clob_ws_manager = WebSocketManager(
+        name="clob",
+        url=CLOB_WS_URL,
+        on_message=_clob_on_message,
+        on_connect=_clob_on_connect,
+        config=WSConfig(
+            ping_interval=20.0,
+            ping_timeout=10.0,
+            close_timeout=5.0,
+            zombie_timeout=45.0,       # CLOB should send updates within 45s if subscribed
+            health_log_interval=300.0,  # log health every 5 min
+        ),
+    )
+    _clob_ws_manager.start()
+    log.info("CLOB WS daemon started (ws_manager)")
 
     # Pre-subscribe to current + next 3 slots on startup (15 min window, avoids mid-session sends)
     now = int(time.time())
