@@ -390,16 +390,11 @@ async def _clob_on_message(msg) -> None:
                 await _clob_ws_manager.send({"type": "Market", "assets_ids": new_tokens})
                 log.info("CLOB WS subscribed %d new tokens", len(new_tokens))
 
-    # Keepalive: re-subscribe active tokens every 30s to prevent
-    # proxy/LB idle timeout (60-120s) and server-side timeout (~11 min)
-    now = time.time()
-    if now - _clob_last_keepalive >= 30 and _clob_ws_manager:
-        with _clob_prices_lock:
-            active = list(_clob_subscribed)
-        if active:
-            await _clob_ws_manager.send({"type": "Market", "assets_ids": active})
-            log.info("CLOB WS keepalive — re-subscribed %d tokens", len(active))
-        _clob_last_keepalive = now
+    # NOTE: We no longer send periodic re-subscribe as "keepalive".
+    # The websockets library already sends RFC 6455 PING frames every 20s
+    # (ping_interval=20 in WSConfig), which is the correct keepalive mechanism.
+    # Re-subscribing every 30s was likely causing unnecessary server-side load
+    # and possibly triggering rate-limit disconnects (code=1006).
 
 
 def start_clob_daemon():
