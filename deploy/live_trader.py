@@ -458,7 +458,6 @@ def load_model():
                 repo_type="model",
                 token=HF_TOKEN,
                 local_dir="/tmp",
-                local_dir_use_symlinks=False,
             )
             # hf_hub_download saves to /tmp/champion.pkl (or subdir) — normalise
             import shutil
@@ -666,9 +665,9 @@ def get_ask_price(token_id: str) -> float:
             book = r.json()
             asks = book.get("asks", [])
             if not asks:
-                log.warning("  get_ask_price /book empty asks (attempt %d/3)", attempt + 1)
-                time.sleep(0.5 * (attempt + 1))
-                continue
+                # Empty book = market one-sided, no sellers. Don't retry — it won't change.
+                log.info("  get_ask_price /book empty (no asks) — market one-sided")
+                return 0.0
             best_asks = [float(a["price"]) for a in asks
                          if float(a.get("price", 1)) < 0.97]
             if best_asks:
@@ -676,9 +675,9 @@ def get_ask_price(token_id: str) -> float:
                 log.info("  get_ask_price /book fallback: %.3f (attempt %d)", best_ask, attempt + 1)
                 return best_ask
             else:
-                log.warning("  get_ask_price /book all asks >= 0.97 (attempt %d/3)", attempt + 1)
-                time.sleep(0.5 * (attempt + 1))
-                continue
+                # All asks >= 0.97 = market already resolved, no edge possible
+                log.info("  get_ask_price /book all asks >= 0.97 — market decided")
+                return 0.0
         except Exception as e:
             log.warning("  get_ask_price /book exception (attempt %d/3): %s", attempt + 1, e)
             time.sleep(0.5 * (attempt + 1))
@@ -1034,6 +1033,9 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
 
         feat.update({
             "btc_up_ratio":    float(vol_up / total),
+            "btc_n_ticks":     float(n),
+            "btc_vol_up":      float(vol_up),
+            "btc_vol_dn":      float(vol_dn),
             "btc_vwap_up":     float(vwap_up),
             "btc_vwap_dn":     float(vwap_dn),
             "btc_vwap_spread": float(vwap_up - vwap_dn),
@@ -1050,6 +1052,8 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
         # No ticks — neutral fill (only v21 features)
         feat.update({
             "btc_up_ratio": 0.5,
+            "btc_n_ticks": 0.0,
+            "btc_vol_up": 0.0, "btc_vol_dn": 0.0,
             "btc_vwap_up": 0.5, "btc_vwap_dn": 0.5, "btc_vwap_spread": 0.0,
             "btc_buy_ratio": 0.5, "btc_momentum": 0.0,
             "btc_size_disparity": 0.0,
@@ -1065,10 +1069,22 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
 
     # Temporal interaction features (v17): hour modulates CLOB signal
     feat["hour_x_up_ratio"] = cur_up_ratio * (hour / 24.0)
+    # hour_cos: cyclical hour encoding (cos component)
+    feat["hour_cos"] = float(np.cos(2 * np.pi * hour / 24.0))
+    # time-weighted up ratio (recency bias)
+    if ticks:
+        weights = np.array([t["t_sec"] + 1 for t in ticks], dtype=np.float64)
+        weights /= weights.sum() + 1e-8
+        tw_vals = np.array([1.0 if t.get("outcome") == "Up" else 0.0 for t in ticks])
+        tw_up_ratio = float(np.dot(weights, tw_vals))
+    else:
+        tw_up_ratio = 0.5
+    feat["btc_tw_up_ratio"] = tw_up_ratio
+    feat["hour_x_tw_ur"] = tw_up_ratio * (hour / 24.0)
 
-    # prev_slot_up_ratio — continuous lag signals (v21 uses 1,2,3,5)
+    # prev_slot_up_ratio — continuous lag signals (v21 uses 1,2,3,4,5)
     n_hist = len(hist)
-    for lag in [1, 2, 3, 5]:
+    for lag in [1, 2, 3, 4, 5]:
         if n_hist >= lag:
             h = hist[-lag]
             feat[f"prev_slot_up_ratio_{lag}"]  = float(h.get("up_ratio", 0.5))
