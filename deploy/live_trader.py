@@ -575,7 +575,10 @@ def build_spot_features(slot_ts: int) -> dict:
             feat[f"btc_pre_{lbl}_ret"] = float(px_obs_end / px_h - 1)
         else:
             feat[f"btc_pre_{lbl}_ret"] = 0.0
-        feat[f"btc_pre_{lbl}_vol"] = 0.0  # vol not used in v18 top features
+        # Pre-window volatility: stddev/mean of prices in the window
+        seg_pre = _seg(slot_ts - w_s, slot_ts)
+        _, pre_vol = _ret_vol(seg_pre)
+        feat[f"btc_pre_{lbl}_vol"] = pre_vol
 
     # Round-number proximity (use obs-end price to match training)
     if px_obs_end > 0:
@@ -746,55 +749,70 @@ def get_market_mid(slot_ts: int) -> tuple[float, float] | tuple[None, None]:
         pass
     return None, None
 
+def _fetch_token_trades(token_id: str, outcome_label: str, slot_ts: int, expected_slug: str) -> list[dict]:
+    """Fetch trades for a single token. Used by fetch_inslot_trades for parallel fetching."""
+    trades = []
+    for page in range(MAX_TRADE_PAGES):
+        offset = page * 500
+        try:
+            r = _http.get(f"{DATA_API}/trades",
+                params={"asset": token_id, "limit": 500, "offset": offset,
+                        "_t": int(time.time())},  # cache-bust Cloudflare CDN (5min TTL)
+                timeout=HTTP_TIMEOUT)
+            if not r.ok:
+                break
+            batch = r.json()
+            if not batch:
+                break
+            for t in batch:
+                trade_slug = t.get("slug", "")
+                if trade_slug and trade_slug != expected_slug:
+                    continue
+                ts = int(t.get("timestamp", 0))
+                if ts > 1e12:
+                    ts //= 1000
+                t_sec = ts - slot_ts
+                if 0 <= t_sec < OBSERVE_SECS:
+                    _price = float(t.get("price", 0) or 0)
+                    _size  = float(t.get("size", 0) or 0)
+                    trades.append({
+                        "outcome":   t.get("outcome", outcome_label),
+                        "side":      t.get("side", "BUY"),
+                        "price":     _price,
+                        "size":      _size,
+                        "size_usdc": _price * _size,
+                        "t_sec":     t_sec,
+                    })
+        except Exception:
+            break
+    return trades
+
+
 def fetch_inslot_trades(yes_token: str, no_token: str, slot_ts: int) -> list[dict]:
     """Fetch inslot trades from data-api. Lag is ~90-120s so t=0-60s trades available at t=180s.
 
     IMPORTANT: The data-api returns trades for ALL markets using the same token ID,
     not just our BTC 5-min market. We filter by slug to exclude contamination from
     ETH, SOL, BNB, daily BTC, and other markets that share the same token.
-    """
-    expected_slug = f"btc-updown-5m-{slot_ts}"
-    all_trades = []
-    for token_id, outcome_label in [(yes_token, "Up"), (no_token, "Down")]:
-        for page in range(MAX_TRADE_PAGES):
-            offset = page * 500
-            try:
-                r = _http.get(f"{DATA_API}/trades",
-                    params={"asset": token_id, "limit": 500, "offset": offset,
-                            "_t": int(time.time())},  # cache-bust Cloudflare CDN (5min TTL)
-                    timeout=HTTP_TIMEOUT)
-                if not r.ok:
-                    break
-                batch = r.json()
-                if not batch:
-                    break
-                # Filter to inslot window [slot_ts, slot_ts+OBS_SECS)
-                for t in batch:
-                    # CRITICAL: skip trades from other markets sharing this token ID
-                    trade_slug = t.get("slug", "")
-                    if trade_slug and trade_slug != expected_slug:
-                        continue
 
-                    ts = int(t.get("timestamp", 0))
-                    if ts > 1e12:
-                        ts //= 1000
-                    t_sec = ts - slot_ts
-                    if 0 <= t_sec < OBSERVE_SECS:
-                        _price = float(t.get("price", 0) or 0)
-                        _size  = float(t.get("size", 0) or 0)
-                        all_trades.append({
-                            "outcome":   t.get("outcome", outcome_label),  # API returns Up/Down for BTC 5m markets
-                            "side":      t.get("side", "BUY"),
-                            "price":     _price,
-                            "size":      _size,
-                            "size_usdc": _price * _size,  # dollar volume — matches training features.py
-                            "t_sec":     t_sec,
-                        })
-                # NOTE: data-api returns trades in random order, NOT chronological.
-                # Do NOT break early based on min_ts — it would skip inslot trades
-                # that appear on later pages. Page until empty or max pages.
-            except Exception:
-                break
+    OPTIMIZATION: Fetches yes and no tokens in PARALLEL using ThreadPoolExecutor,
+    cutting latency roughly in half (from ~4-6s sequential to ~2-3s).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    expected_slug = f"btc-updown-5m-{slot_ts}"
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="fetch-trades") as executor:
+        fut_yes = executor.submit(_fetch_token_trades, yes_token, "Up", slot_ts, expected_slug)
+        fut_no  = executor.submit(_fetch_token_trades, no_token, "Down", slot_ts, expected_slug)
+
+        all_trades = []
+        for fut in as_completed([fut_yes, fut_no]):
+            try:
+                all_trades.extend(fut.result(timeout=HTTP_TIMEOUT * MAX_TRADE_PAGES + 5))
+            except Exception as e:
+                log.warning("Parallel trade fetch error: %s", e)
+
     return all_trades
 
 
@@ -865,6 +883,8 @@ def _build_ob_features(up_token_id: str) -> dict:
         _ob_open_cache[up_token_id] = {
             "mid": snap["mid"],
             "imbalance": snap["imbalance"],
+            "total_depth": float(sum(float(b["size"]) for b in snap["bids"]) +
+                                 sum(float(a["size"]) for a in snap["asks"])),
             "ts": snap["ts"],
         }
 
@@ -930,7 +950,7 @@ def _build_ob_features(up_token_id: str) -> dict:
             "ob_mid_drift":     ob_mid_drift,
             "ob_imbalance_end": float(imbalance),
             "ob_spread_end":    float(spread),
-            "ob_depth_change":  0.0,
+            "ob_depth_change":  float(total_depth - open_snap.get("total_depth", total_depth)),
             "ob_imb_momentum":  ob_imb_momentum,
             # Windowed imbalance — open/mid/close
             "ob_imb_w0":        ob_imb_w0,
@@ -1745,10 +1765,17 @@ def run(client, model, features):
                 continue
 
             token_id   = market["yes_token"] if direction == "UP" else market["no_token"]
-            t_ask_start = time.time()
-            ask_price  = get_ask_price(token_id)
-            t_ask_ms = (time.time() - t_ask_start) * 1000
-            log.info("  get_ask_price: $%.3f (took %.0fms)", ask_price, t_ask_ms)
+
+            # Fetch ask price AND market mid in PARALLEL — saves ~1-5s
+            from concurrent.futures import ThreadPoolExecutor
+            t_price_start = time.time()
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="price-fetch") as executor:
+                fut_ask = executor.submit(get_ask_price, token_id)
+                fut_mid = executor.submit(get_market_mid, slot_ts)
+                ask_price = fut_ask.result(timeout=20)
+                up_mid, down_mid = fut_mid.result(timeout=20)
+            t_price_ms = (time.time() - t_price_start) * 1000
+            log.info("  get_ask_price+mid: ask=$%.3f (%.0fms parallel)", ask_price, t_price_ms)
             model_prob = prob_up if direction == "UP" else (1.0 - prob_up)
 
             # Log ask price source and freshness
@@ -1769,8 +1796,7 @@ def run(client, model, features):
                 continue
             edge_vs_ask = model_prob - ask_price
 
-            # Also validate against market mid (outcomePrices) — catches stale ask prices
-            up_mid, down_mid = get_market_mid(slot_ts)
+            # Market mid already fetched in parallel above
             market_mid  = up_mid if direction == "UP" else down_mid
             edge_vs_mid = (model_prob - market_mid) if market_mid else None
 
@@ -1853,11 +1879,13 @@ def run(client, model, features):
                 order_id = getattr(result, "order_id", None) or str(result)
                 log.info("  Order placed: %s", str(order_id)[:20])
 
-                # Wait up to 30s for fill, then cancel if unfilled
+                # Wait up to 20s for fill with progressive polling (fast start, slower later)
+                # Pattern: 1s, 2s, 3s, 4s, 5s, 5s = 20s total (vs old 5s x 6 = 30s)
                 filled = False
                 poll_errors = 0
-                for _ in range(6):
-                    time.sleep(5)
+                poll_delays = [1, 2, 3, 4, 5, 5]
+                for delay in poll_delays:
+                    time.sleep(delay)
                     try:
                         o = client.get_order(order_id=str(order_id))
                         status = str(getattr(o, "status", "")).upper()
@@ -1879,7 +1907,7 @@ def run(client, model, features):
                             break
 
                 if not filled:
-                    log.info("  Order unfilled after 30s — cancelling")
+                    log.info("  Order unfilled after 20s — cancelling")
                     cancel_ok = False
                     try:
                         client.cancel_order(order_id=str(order_id))
