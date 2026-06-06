@@ -87,10 +87,10 @@ BUFFER_STALE    = 120
 AUTO_SHARES     = os.environ.get("AUTO_SHARES", "false").lower() in ("true", "1", "yes")
 FIXED_SHARES    = float(os.environ.get("FIXED_SHARES", "8"))
 AUTO_SHARES_MIN = float(os.environ.get("AUTO_SHARES_MIN", "5"))
-AUTO_SHARES_MAX = float(os.environ.get("AUTO_SHARES_MAX", "50"))
+AUTO_SHARES_MAX = float(os.environ.get("AUTO_SHARES_MAX", "40"))
 # Balance anchors: at BAL_FLOOR shares=MIN, at BAL_CEIL shares=MAX, linear between
 AUTO_SHARES_BAL_FLOOR = float(os.environ.get("AUTO_SHARES_BAL_FLOOR", "20"))
-AUTO_SHARES_BAL_CEIL  = float(os.environ.get("AUTO_SHARES_BAL_CEIL", "500"))
+AUTO_SHARES_BAL_CEIL  = float(os.environ.get("AUTO_SHARES_BAL_CEIL", "700"))
 
 MODEL_PATH  = Path("/tmp/champion.pkl")
 HF_REPO     = "artbreguez/polymarket-btc-model"

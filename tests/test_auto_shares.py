@@ -69,9 +69,9 @@ def _auto_ctx():
         lt,
         AUTO_SHARES=True,
         AUTO_SHARES_MIN=5.0,
-        AUTO_SHARES_MAX=50.0,
+        AUTO_SHARES_MAX=40.0,
         AUTO_SHARES_BAL_FLOOR=20.0,
-        AUTO_SHARES_BAL_CEIL=500.0,
+        AUTO_SHARES_BAL_CEIL=700.0,
     )
 
 
@@ -86,30 +86,30 @@ class TestAutoShares:
 
     def test_at_ceil_returns_max(self):
         with _auto_ctx():
-            assert lt.compute_shares(500.0, 0.50) == 50.0
+            assert lt.compute_shares(700.0, 0.50) == 40.0
 
     def test_above_ceil_returns_max(self):
         with _auto_ctx():
-            assert lt.compute_shares(1000.0, 0.50) == 50.0
+            assert lt.compute_shares(1000.0, 0.50) == 40.0
 
     def test_midpoint_linear(self):
         """Balance at midpoint -> roughly midpoint shares."""
-        # midpoint balance = (20 + 500) / 2 = 260
-        # expected = 5 + 0.5 * (50 - 5) = 27.5 -> int = 27
+        # midpoint balance = (20 + 700) / 2 = 360
+        # expected = 5 + 0.5 * (40 - 5) = 22.5 -> int = 22
         with _auto_ctx():
-            assert lt.compute_shares(260.0, 0.50) == 27.0
+            assert lt.compute_shares(360.0, 0.50) == 22.0
 
     def test_quarter_point(self):
-        # 25% = 20 + 0.25 * 480 = 140
-        # expected = 5 + 0.25 * 45 = 16.25 -> int = 16
+        # 25% = 20 + 0.25 * 680 = 190
+        # expected = 5 + 0.25 * 35 = 13.75 -> int = 13
         with _auto_ctx():
-            assert lt.compute_shares(140.0, 0.50) == 16.0
+            assert lt.compute_shares(190.0, 0.50) == 13.0
 
     def test_three_quarter_point(self):
-        # 75% = 20 + 0.75 * 480 = 380
-        # expected = 5 + 0.75 * 45 = 38.75 -> int = 38
+        # 75% = 20 + 0.75 * 680 = 530
+        # expected = 5 + 0.75 * 35 = 31.25 -> int = 31
         with _auto_ctx():
-            assert lt.compute_shares(380.0, 0.50) == 38.0
+            assert lt.compute_shares(530.0, 0.50) == 31.0
 
     def test_returns_integer(self):
         with _auto_ctx():
@@ -150,9 +150,9 @@ class TestRiskCap:
         """With cheap asks, risk cap doesn't interfere."""
         with _auto_ctx():
             # balance=200, ask=0.10 -> 10% = $20 -> max 200 shares (above MAX)
-            # linear: 5 + ((200-20)/480) * 45 = 5 + 16.875 = 21.875 -> 21
+            # linear: 5 + ((200-20)/680) * 35 = 5 + 9.26 = 14.26 -> 14
             result = lt.compute_shares(200.0, 0.10)
-            assert result == 21.0
+            assert result == 14.0
 
     def test_risk_cap_never_exceeds_10pct(self):
         """For any balance/ask combo above floor, cost doesn't exceed 10% of balance.
@@ -180,7 +180,7 @@ class TestEdgeCases:
 
     def test_very_high_balance(self):
         with _auto_ctx():
-            assert lt.compute_shares(10000.0, 0.50) == 50.0
+            assert lt.compute_shares(10000.0, 0.50) == 40.0
 
     def test_very_small_ask(self):
         with _auto_ctx():
