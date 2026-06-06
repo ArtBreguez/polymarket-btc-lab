@@ -45,6 +45,10 @@ CHANGELOG = [
     ("v12", "0.8542", "0.7762", "0.1634", "601",  "7-fold WF — test sets too small, rejected"),
     ("v13", "—",      "—",      "—",      "7062", "Local-only 2026 data — spot_price_usdt 99.6% null, rejected"),
     ("v14", "—",      "—",      "—",      "7062", "Local 2026 + Binance 1m spot klines — full spot coverage (training)"),
+    ("v17", "0.8873", "0.8059", "0.1426", "15257", "Extended lag context + temporal features + expanded dataset"),
+    ("v18", "0.8979", "0.8126", "0.1293", "22319", "22k markets, feature pruning (40 features), walk-forward validation"),
+    ("v19", "0.9000", "0.8127", "0.1291", "22319", "Real L2 orderbook features from pmdata, OB-CLOB interactions"),
+    ("v21", "0.9002", "0.8134", "0.1290", "22319", "Ablation study: pruned to 30 features, same AUC, better accuracy"),
 ]
 
 USAGE_SNIPPET = '''\

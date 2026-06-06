@@ -288,13 +288,13 @@ Features tested and consistently dropped by permutation importance:
 
 ## Reproduction
 
-To retrain the current champion (v19):
+To retrain the current champion (v21):
 ```bash
-modal run scripts/train_v19_modal.py
+modal run scripts/train_v21_modal.py
 ```
 
 All training scripts are in `scripts/train_vN_modal.py`. Each is self-contained —
-loads data from Modal Volume, trains on Modal cloud (~45min, ~$0.50), and promotes
+loads data from Modal Volume, trains on Modal cloud (~42min, ~$0.50), and promotes
 if it beats the current champion on 2/3 metrics.
 
 ---

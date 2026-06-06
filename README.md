@@ -99,11 +99,13 @@ polymarket-btc-lab/
 │   └── fly.toml
 ├── scripts/
 │   ├── train_v21_modal.py      # Current training script (champion)
-│   ├── train_v19_modal.py      # Previous version
 │   ├── fetch_ob_features_modal.py
 │   └── fetch_ticks_modal.py
 ├── tests/
-│   └── test_ws_manager.py      # 41 tests
+│   ├── test_ws_manager.py      # 41 tests
+│   ├── test_data_quality_gate.py  # 49 tests
+│   ├── test_live_trader.py     # 36 tests
+│   └── test_auto_shares.py     # 28 tests
 ├── docs/
 │   ├── EXPERIMENTS.md           # Version history (v4 → v21)
 │   ├── PIPELINE.md              # Pipeline deep-dive
@@ -133,6 +135,7 @@ See [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) for full history.
 
 ## Live Performance
 
-- Win rate: 74% (40W / 14L over 54 trades)
-- P&L: +$30.61
-- Wallet balance: $75.08 USDC
+- Win rate: 67% (39W / 19L over 58 trades)
+- P&L: +$17.72
+- Wallet balance: $75.95 USDC
+- Auto-sizing shares: 5-40 shares proportional to balance ($20-$700 range)

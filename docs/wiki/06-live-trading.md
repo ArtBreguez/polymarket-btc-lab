@@ -15,7 +15,10 @@ Entry criteria (all must be true):
 - Model confidence > 60% (`MIN_CONFIDENCE = 0.60`)
 - Edge vs ask price >= 10% (`MIN_EDGE = 0.10`)
 - Edge vs market mid >= 5% (`MIN_EDGE_MID = 0.05`)
-- Flat stake: $1.50 USDC per trade
+- Auto-sizing shares: 5-40 shares proportional to balance ($20-$700)
+  - `AUTO_SHARES=true` enables, `=false` uses `FIXED_SHARES` (default 8)
+  - Risk cap: never spend >10% of balance per trade
+  - CLOB minimum: 5 shares per order
 
 ---
 
