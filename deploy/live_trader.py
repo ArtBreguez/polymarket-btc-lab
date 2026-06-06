@@ -490,8 +490,12 @@ def compute_shares(balance_usdc: float, ask_price: float) -> float:
     max_shares_by_cost = max_cost / (ask_price + 1e-8)
     shares = min(shares, max_shares_by_cost)
 
-    # Clamp and floor to integer
-    shares = max(lo, min(hi, shares))
+    # Clamp to MAX and floor to integer. Note: we do NOT clamp up to MIN here
+    # because the risk cap must take priority. If risk cap says 3 shares but
+    # MIN is 5, we return MIN (5) only because CLOB rejects < 5 — but the
+    # balance check downstream will catch that the cost exceeds budget.
+    shares = min(hi, shares)
+    shares = max(lo, shares)  # CLOB min 5 shares — order would be rejected below this
     return float(int(shares))
 
 
@@ -1825,7 +1829,9 @@ def run(client, model, features):
             if usdc is not None:
                 shares = compute_shares(usdc, ask_price)
             else:
-                shares = float(max(FIXED_SHARES, AUTO_SHARES_MIN))
+                # Balance fetch failed — use fixed shares and SKIP trade (no balance = no trade)
+                log.warning("  Balance unknown — skipping trade (cannot verify funds)")
+                continue
 
             actual_cost = round(shares * ask_price, 4)
             sizing_mode = "auto" if AUTO_SHARES else "fixed"
@@ -1931,7 +1937,7 @@ def run(client, model, features):
                         trades.append({"slot_ts": slot_ts, "direction": direction,
                                        "confidence": round(confidence, 4),
                                        "entry_price": round(ask_price, 4), "status": "skipped",
-                                       "reason": "limit order unfilled in 30s — cancelled",
+                                       "reason": "limit order unfilled in 20s — cancelled",
                                        "entered_at": now})
                     save_trades(trades)
                     continue
