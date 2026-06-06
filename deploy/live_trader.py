@@ -1141,6 +1141,27 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
         else:
             feat[f"prev_slot_up_ratio_{lag}"]  = 0.5
 
+    # ── Multi-scale up_ratio zscore (5/20 slots) ─────────────────────────────
+    # Matches training: zscore of current up_ratio vs recent history mean/std.
+    def _hist_ur(n: int) -> list[float]:
+        return [h["up_ratio"] for h in hist[-n:]] if hist else []
+
+    hist_vals_20 = _hist_ur(20)
+    if len(hist_vals_20) >= 3:
+        mu20 = float(np.mean(hist_vals_20))
+        sd20 = float(np.std(hist_vals_20)) + 1e-6
+        feat["btc_up_ratio_zscore_20s"] = (cur_up_ratio - mu20) / sd20
+    else:
+        feat["btc_up_ratio_zscore_20s"] = 0.0
+
+    hist_vals_5 = _hist_ur(5)
+    if len(hist_vals_5) >= 2:
+        mu5 = float(np.mean(hist_vals_5))
+        sd5 = float(np.std(hist_vals_5)) + 1e-6
+        feat["btc_up_ratio_zscore_5s"] = (cur_up_ratio - mu5) / sd5
+    else:
+        feat["btc_up_ratio_zscore_5s"] = 0.0
+
     # ── OB features: fetch real order book via CLOB REST ──────────────────────
     # Identical computation to training (pmdata poly_l2 book snapshots).
     # Called once per slot at ~t=150s (after tick observation window ends).
@@ -1656,10 +1677,12 @@ def run(client, model, features):
             if feat is None:
                 log.warning("  build_features returned None (took %.0fms)", t_feat_ms)
                 continue
+            nz = sum(1 for f in features if feat.get(f, 0.0) != 0.0)
             log.info("  build_features OK (%.0fms) — %d/%d features non-zero",
-                     t_feat_ms,
-                     sum(1 for f in features if feat.get(f, 0.0) != 0.0),
-                     len(features))
+                     t_feat_ms, nz, len(features))
+            if nz < len(features):
+                zero_feats = [f for f in features if feat.get(f, 0.0) == 0.0]
+                log.info("  zero features: %s", zero_feats)
 
             # ── GATE 2: Feature sanity ─────────────────────────────────
             ok, reason = gate.check_feature_sanity(feat)
