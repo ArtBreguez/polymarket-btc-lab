@@ -81,6 +81,17 @@ TAKER_FEE       = 0.02          # Polymarket taker fee ~2%
 STAKE_USDC      = 1.50          # capped at $1.50 per trade
 BUFFER_STALE    = 120
 
+# ── Auto-sizing shares ────────────────────────────────────────────────────────
+# When AUTO_SHARES=true, shares scale linearly with balance between MIN/MAX.
+# When AUTO_SHARES=false (default), FIXED_SHARES is used.
+AUTO_SHARES     = os.environ.get("AUTO_SHARES", "false").lower() in ("true", "1", "yes")
+FIXED_SHARES    = float(os.environ.get("FIXED_SHARES", "8"))
+AUTO_SHARES_MIN = float(os.environ.get("AUTO_SHARES_MIN", "5"))
+AUTO_SHARES_MAX = float(os.environ.get("AUTO_SHARES_MAX", "50"))
+# Balance anchors: at BAL_FLOOR shares=MIN, at BAL_CEIL shares=MAX, linear between
+AUTO_SHARES_BAL_FLOOR = float(os.environ.get("AUTO_SHARES_BAL_FLOOR", "20"))
+AUTO_SHARES_BAL_CEIL  = float(os.environ.get("AUTO_SHARES_BAL_CEIL", "500"))
+
 MODEL_PATH  = Path("/tmp/champion.pkl")
 HF_REPO     = "artbreguez/polymarket-btc-model"
 HF_TOKEN    = os.environ.get("HF_TOKEN")
@@ -443,6 +454,45 @@ def start_clob_daemon():
         if mkt:
             clob_subscribe([mkt["yes_token"], mkt["no_token"]], slot_ts=slot_ts)
             log.info("CLOB WS pre-subscribed slot=%d", slot_ts)
+
+
+# ── Auto-sizing shares logic ───────────────────────────────────────────────────
+def compute_shares(balance_usdc: float, ask_price: float) -> float:
+    """Compute number of shares for a trade.
+
+    When AUTO_SHARES is enabled, scales linearly between AUTO_SHARES_MIN and
+    AUTO_SHARES_MAX based on balance (floor/ceil anchors). Also ensures the
+    trade cost doesn't exceed 10% of balance (risk cap).
+
+    When AUTO_SHARES is disabled, returns FIXED_SHARES.
+
+    Always clamps to [AUTO_SHARES_MIN, AUTO_SHARES_MAX] and rounds down to int.
+    """
+    if not AUTO_SHARES:
+        return float(max(FIXED_SHARES, AUTO_SHARES_MIN))
+
+    floor = AUTO_SHARES_BAL_FLOOR
+    ceil  = AUTO_SHARES_BAL_CEIL
+    lo    = AUTO_SHARES_MIN
+    hi    = AUTO_SHARES_MAX
+
+    if balance_usdc <= floor:
+        shares = lo
+    elif balance_usdc >= ceil:
+        shares = hi
+    else:
+        # Linear interpolation
+        t = (balance_usdc - floor) / (ceil - floor)
+        shares = lo + t * (hi - lo)
+
+    # Risk cap: never spend more than 10% of balance on a single trade
+    max_cost = balance_usdc * 0.10
+    max_shares_by_cost = max_cost / (ask_price + 1e-8)
+    shares = min(shares, max_shares_by_cost)
+
+    # Clamp and floor to integer
+    shares = max(lo, min(hi, shares))
+    return float(int(shares))
 
 
 # ── Model loading ──────────────────────────────────────────────────────────────
@@ -1741,22 +1791,31 @@ def run(client, model, features):
             true_edge = edge_vs_ask
 
             # ── Compute shares + actual cost (CLOB min 5 shares) ───────────
-            # Gradual scale-up: 8 shares (was 5 during testing phase).
-            shares = 8.0
-            actual_cost = round(shares * ask_price, 4)
-            log.info("  %d shares @ $%.3f — cost $%.2f", int(shares), ask_price, actual_cost)
-
-            # ── Balance check against real order cost (not just STAKE_USDC) ──
+            # Fetch balance first — needed for both auto-sizing and balance check
             try:
                 bal  = client.get_balance_allowance(asset_type="COLLATERAL")
                 usdc = float(bal.balance) / 1e6
+            except Exception as e:
+                log.warning("  Balance check FAILED: %s — using FIXED_SHARES without confirmation", e)
+                usdc = None
+
+            if usdc is not None:
+                shares = compute_shares(usdc, ask_price)
+            else:
+                shares = float(max(FIXED_SHARES, AUTO_SHARES_MIN))
+
+            actual_cost = round(shares * ask_price, 4)
+            sizing_mode = "auto" if AUTO_SHARES else "fixed"
+            log.info("  %d shares @ $%.3f — cost $%.2f [%s, bal=$%.2f]",
+                     int(shares), ask_price, actual_cost, sizing_mode, usdc or 0)
+
+            # ── Balance check against real order cost ──────────────────────
+            if usdc is not None:
                 required = actual_cost * 1.05  # 5% buffer for fees/slippage
                 if usdc < required:
                     log.error("  Insufficient balance $%.2f < required $%.2f — skipping",
                               usdc, required)
                     continue
-            except Exception as e:
-                log.warning("  Balance check FAILED: %s — PROCEEDING WITHOUT CONFIRMATION", e)
 
             # ── Place limit order at the validated ask price ──────────────────
             # Use limit (not market) to guarantee we pay the price we validated.
@@ -1919,6 +1978,11 @@ if __name__ == "__main__":
     log.info("Config: MIN_CONFIDENCE=%.0f%% MIN_EDGE=%.0f%% MIN_EDGE_MID=%.0f%%",
              MIN_CONFIDENCE * 100, MIN_EDGE * 100, MIN_EDGE_MID * 100)
     log.info("Config: ENTER_WINDOW=%s SLOT_DURATION=%ds", ENTER_WINDOW, SLOT_DURATION)
+    if AUTO_SHARES:
+        log.info("Config: AUTO_SHARES=ON min=%d max=%d bal_floor=$%.0f bal_ceil=$%.0f",
+                 AUTO_SHARES_MIN, AUTO_SHARES_MAX, AUTO_SHARES_BAL_FLOOR, AUTO_SHARES_BAL_CEIL)
+    else:
+        log.info("Config: AUTO_SHARES=OFF fixed_shares=%d", FIXED_SHARES)
     log.info("=" * 60)
 
     # Start spot daemon in background
