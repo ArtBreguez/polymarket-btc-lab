@@ -944,6 +944,7 @@ def _build_ob_features(up_token_id: str) -> dict:
     if up_token_id not in _ob_open_cache:
         _ob_open_cache[up_token_id] = {
             "mid": snap["mid"],
+            "spread": snap["spread"],
             "imbalance": snap["imbalance"],
             "total_depth": float(sum(float(b["size"]) for b in snap["bids"]) +
                                  sum(float(a["size"]) for a in snap["asks"])),
@@ -1000,9 +1001,11 @@ def _build_ob_features(up_token_id: str) -> dict:
         weighted_imb = float((bid_wt - ask_wt) / (bid_wt + ask_wt + 1e-8))
 
         return {
-            "ob_mid":           float(mid),
-            "ob_spread":        float(spread),
-            "ob_imbalance":     float(imbalance),
+            # Base OB features use OPEN snapshot to match training
+            # (training uses first book snapshot in observation window)
+            "ob_mid":           float(open_snap["mid"]),
+            "ob_spread":        float(open_snap.get("spread", spread)),
+            "ob_imbalance":     float(open_snap.get("imbalance", imbalance)),
             "ob_depth_ratio":   float(depth_ratio),
             "ob_bid_depth_5c":  float(bid_depth_5c),
             "ob_ask_depth_5c":  float(ask_depth_5c),
@@ -1146,11 +1149,19 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
     feat["hour_x_tw_ur"] = tw_up_ratio * (hour / 24.0)
 
     # prev_slot_up_ratio — continuous lag signals (v21 uses 1,2,3,4,5)
+    # Staleness guard: if time gap between slots is too large (e.g. downtime),
+    # fill with 0.5 (matches training behavior)
+    SLOT_DURATION = 300  # 5 minutes
     n_hist = len(hist)
     for lag in [1, 2, 3, 4, 5]:
         if n_hist >= lag:
             h = hist[-lag]
-            feat[f"prev_slot_up_ratio_{lag}"]  = float(h.get("up_ratio", 0.5))
+            # Check staleness: if gap > lag * SLOT_DURATION * 3, consider stale
+            time_gap = slot_ts - h.get("slot_ts", 0)
+            if time_gap > lag * SLOT_DURATION * 3:
+                feat[f"prev_slot_up_ratio_{lag}"]  = 0.5
+            else:
+                feat[f"prev_slot_up_ratio_{lag}"]  = float(h.get("up_ratio", 0.5))
         else:
             feat[f"prev_slot_up_ratio_{lag}"]  = 0.5
 
