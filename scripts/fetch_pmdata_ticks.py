@@ -145,12 +145,11 @@ def main():
         todo = todo.head(args.limit)
     log.info("Processing %d markets with %d workers...", len(todo), args.workers)
 
-    # Load existing ticks
+    # Count existing ticks (don't keep full DF in RAM)
+    existing_count = 0
     if OUT_FILE.exists():
-        existing = pd.read_parquet(OUT_FILE)
-        log.info("Existing ticks: %d", len(existing))
-    else:
-        existing = None
+        existing_count = pq.ParquetFile(OUT_FILE).metadata.num_rows
+        log.info("Existing ticks on disk: %d", existing_count)
 
     all_new_ticks: list[dict] = []
     with_ticks = 0
@@ -179,32 +178,48 @@ def main():
                 else:
                     empty += 1
 
-        # Save progress + ticks incrementally every batch so crashes don't lose data
+        # Save progress
         with open(PROGRESS_FILE, "w") as f:
             json.dump(list(done_ids), f)
 
+        # Write new ticks as separate batch file (avoid re-reading growing parquet)
         if all_new_ticks:
             new_df = pd.DataFrame(all_new_ticks)
-            if existing is not None:
-                combined = pd.concat([existing, new_df], ignore_index=True)
-            else:
-                combined = new_df
-            combined = combined.drop_duplicates(
-                subset=["market_id", "timestamp_ms", "outcome", "side"]
-            )
-            combined.to_parquet(OUT_FILE, index=False, compression="snappy")
-            existing = combined  # update for next batch merge
-            all_new_ticks = []  # reset buffer — already flushed to disk
+            batch_num = batch_start // batch_size
+            batch_file = DATA_DIR / f"_pmdata_batch_{batch_num:04d}.parquet"
+            new_df.to_parquet(batch_file, index=False, compression="snappy")
+            existing_count += len(new_df)
+            del new_df
+            all_new_ticks = []  # reset buffer
 
         total_done = batch_start + len(batch)
         log.info("%d/%d | with_ticks=%d empty=%d total_saved=%d",
-                 total_done, len(todo), with_ticks, empty,
-                 len(existing) if existing is not None else 0)
+                 total_done, len(todo), with_ticks, empty, existing_count)
 
         time.sleep(0.1)
 
-    log.info("Done. Total ticks saved: %d from %d markets (empty=%d)",
-             len(existing) if existing is not None else 0, with_ticks, empty)
+    log.info("Done fetching. Merging batch files...")
+    
+    # Merge all batch files + existing into single OUT_FILE
+    batch_files = sorted(DATA_DIR.glob("_pmdata_batch_*.parquet"))
+    tables = []
+    if OUT_FILE.exists():
+        tables.append(pq.read_table(OUT_FILE))
+    for bf in batch_files:
+        tables.append(pq.read_table(bf))
+    
+    if tables:
+        merged = pa.concat_tables(tables)
+        pq.write_table(merged, OUT_FILE, compression="snappy")
+        existing_count = len(merged)
+        del merged, tables
+        # Clean up batch files
+        for bf in batch_files:
+            bf.unlink()
+        log.info("Merged into %s: %d ticks", OUT_FILE, existing_count)
+    
+    log.info("Total ticks saved: %d from %d markets (empty=%d)",
+             existing_count, with_ticks, empty)
 
     log.info("Progress: %d/%d markets done", len(done_ids), len(markets))
 

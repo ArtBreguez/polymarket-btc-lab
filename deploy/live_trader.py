@@ -1164,8 +1164,11 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
         mu20 = float(np.mean(hist_vals_20))
         sd20 = float(np.std(hist_vals_20)) + 1e-6
         feat["btc_up_ratio_zscore_20s"] = (cur_up_ratio - mu20) / sd20
+        # v22: zscore of last sub-window (w5) vs 20-slot history
+        feat["btc_up_w5_zscore"] = (feat.get("btc_up_w5", 0.5) - mu20) / sd20
     else:
         feat["btc_up_ratio_zscore_20s"] = 0.0
+        feat["btc_up_w5_zscore"] = 0.0
 
     hist_vals_5 = _hist_ur(5)
     if len(hist_vals_5) >= 2:
