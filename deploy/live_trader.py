@@ -77,7 +77,11 @@ SETTLE_GRACE    = 60
 MIN_CONFIDENCE  = 0.60
 MIN_EDGE        = 0.10
 MIN_EDGE_MID    = 0.05          # edge vs market mid (catches stale ask)
-TAKER_FEE       = 0.02          # Polymarket taker fee ~2%
+TAKER_FEE       = 0.02          # Polymarket taker fee default ~2% (updated dynamically)
+
+# Fee rate cache — fetched from CLOB at startup and refreshed periodically
+_fee_rate_cache: float = TAKER_FEE
+_fee_rate_ts: float = 0.0
 STAKE_USDC      = 1.50          # capped at $1.50 per trade
 BUFFER_STALE    = 120
 
@@ -742,15 +746,9 @@ def get_ask_price(token_id: str) -> float:
 
 def get_market_mid(slot_ts: int) -> tuple[float, float] | tuple[None, None]:
     """
-    Get current market mid prices (UP, DOWN) from the CLOB order book.
+    Get current market mid prices (UP, DOWN) from CLOB.
 
-    BUG FIX (2026-06-04): Previously used Gamma outcomePrices, but those start
-    at ~0.50/0.50 for every new BTC 5-min market and rarely update during the
-    active slot.  Real book midpoints diverge wildly (e.g. book UP mid=0.12 while
-    Gamma says 0.50), causing the ask-vs-mid divergence check to block almost
-    every trade.  Now we compute mid = (best_bid + best_ask) / 2 directly from
-    the CLOB /book endpoint, which is always live.
-
+    Uses GET /midpoint (server-authoritative) with fallback to GET /book.
     Returns (up_mid, down_mid) or (None, None) on failure.
     """
     slug = f"btc-updown-5m-{slot_ts}"
@@ -766,29 +764,40 @@ def get_market_mid(slot_ts: int) -> tuple[float, float] | tuple[None, None]:
             return None, None
 
         up_token, dn_token = ctids[0], ctids[1]
-        mids = []
+        mids: list[float | None] = []
         for tid in [up_token, dn_token]:
+            mid = None
+            # Fast path: GET /midpoint (server-authoritative, no parsing needed)
             try:
-                rb = _http.get(f"{CLOB_URL}/book",
-                               params={"token_id": tid}, timeout=HTTP_TIMEOUT + 2)
-                if not rb.ok:
-                    mids.append(None)
-                    continue
-                book = rb.json()
-                asks = [float(a["price"]) for a in book.get("asks", [])
-                        if 0 < float(a.get("price", 0)) < 0.99]
-                bids = [float(b["price"]) for b in book.get("bids", [])
-                        if 0 < float(b.get("price", 0)) < 0.99]
-                if asks and bids:
-                    mids.append((min(asks) + max(bids)) / 2.0)
-                elif asks:
-                    mids.append(min(asks))       # no bids, use best ask as proxy
-                elif bids:
-                    mids.append(max(bids))       # no asks, use best bid as proxy
-                else:
-                    mids.append(None)
+                rm = _http.get(f"{CLOB_URL}/midpoint",
+                               params={"token_id": tid}, timeout=HTTP_TIMEOUT)
+                if rm.ok:
+                    data = rm.json()
+                    mp = float(data.get("mid", 0))
+                    if 0 < mp < 1:
+                        mid = mp
             except Exception:
-                mids.append(None)
+                pass
+            # Fallback: parse from /book
+            if mid is None:
+                try:
+                    rb = _http.get(f"{CLOB_URL}/book",
+                                   params={"token_id": tid}, timeout=HTTP_TIMEOUT + 2)
+                    if rb.ok:
+                        book = rb.json()
+                        asks = [float(a["price"]) for a in book.get("asks", [])
+                                if 0 < float(a.get("price", 0)) < 0.99]
+                        bids = [float(b["price"]) for b in book.get("bids", [])
+                                if 0 < float(b.get("price", 0)) < 0.99]
+                        if asks and bids:
+                            mid = (min(asks) + max(bids)) / 2.0
+                        elif asks:
+                            mid = min(asks)
+                        elif bids:
+                            mid = max(bids)
+                except Exception:
+                    pass
+            mids.append(mid)
 
         up_mid, dn_mid = mids[0], mids[1]
         if up_mid is not None and dn_mid is not None:
@@ -1646,6 +1655,27 @@ def run(client, model, features):
         if cur_slot != _ob_last_slot:
             _ob_open_cache.clear()
             _ob_last_slot = cur_slot
+
+        # ── OB early snapshot: fetch "open" OB at t~60s (well before entry window) ──
+        # This gives temporal separation between open (t~60s) and close (t~170s+)
+        # snapshots, enabling real ob_mid_drift, ob_imb_momentum, and windowed
+        # imbalance. Training data had snapshots ~180s apart; we aim for ~110s gap.
+        t_in_slot = now - cur_slot
+        if 50 <= t_in_slot <= 90 and cur_slot not in already:
+            # Fetch market to get token IDs for OB pre-fetch
+            mkt = fetch_market(cur_slot)
+            if mkt and mkt["yes_token"] not in _ob_open_cache:
+                snap = _fetch_ob_snapshot(mkt["yes_token"])
+                if snap:
+                    _ob_open_cache[mkt["yes_token"]] = {
+                        "mid": snap["mid"],
+                        "imbalance": snap["imbalance"],
+                        "total_depth": float(sum(float(b["size"]) for b in snap["bids"]) +
+                                             sum(float(a["size"]) for a in snap["asks"])),
+                        "ts": snap["ts"],
+                    }
+                    log.info("OB early snapshot cached for slot=%d (t=%ds, mid=%.4f, imb=%.3f)",
+                             cur_slot, int(t_in_slot), snap["mid"], snap["imbalance"])
 
         for slot_ts in [cur_slot]:  # prev-slot check removed: t_elapsed would be 300-599, outside ENTER_WINDOW [170,240]
             t_elapsed = now - slot_ts
