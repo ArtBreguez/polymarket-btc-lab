@@ -1174,9 +1174,13 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
     if len(hist_vals_20) >= 3:
         mu20 = float(np.mean(hist_vals_20))
         sd20 = float(np.std(hist_vals_20)) + 1e-6
-        feat["btc_up_ratio_zscore_20s"] = (cur_up_ratio - mu20) / sd20
+        # Guard: if sd is too small (e.g. seeded history with identical values),
+        # use a minimum std to prevent zscore explosion
+        if sd20 < 0.01:
+            sd20 = 0.01
+        feat["btc_up_ratio_zscore_20s"] = float(np.clip((cur_up_ratio - mu20) / sd20, -5.0, 5.0))
         # v22: zscore of last sub-window (w5) vs 20-slot history
-        feat["btc_up_w5_zscore"] = (feat.get("btc_up_w5", 0.5) - mu20) / sd20
+        feat["btc_up_w5_zscore"] = float(np.clip((feat.get("btc_up_w5", 0.5) - mu20) / sd20, -5.0, 5.0))
     else:
         feat["btc_up_ratio_zscore_20s"] = 0.0
         feat["btc_up_w5_zscore"] = 0.0
@@ -1185,7 +1189,9 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
     if len(hist_vals_5) >= 2:
         mu5 = float(np.mean(hist_vals_5))
         sd5 = float(np.std(hist_vals_5)) + 1e-6
-        feat["btc_up_ratio_zscore_5s"] = (cur_up_ratio - mu5) / sd5
+        if sd5 < 0.01:
+            sd5 = 0.01
+        feat["btc_up_ratio_zscore_5s"] = float(np.clip((cur_up_ratio - mu5) / sd5, -5.0, 5.0))
     else:
         feat["btc_up_ratio_zscore_5s"] = 0.0
 
