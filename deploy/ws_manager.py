@@ -447,57 +447,76 @@ class WebSocketManager:
         if ping also fails (true zombie: connection silently dead).
 
         STALE DATA guard: if ping/pong succeeds but no real data messages
-        arrive for too many consecutive checks (~10 min), force reconnect.
+        arrive for too many consecutive checks, force reconnect.
         The Polymarket WS can keep TCP alive via ping/pong but silently stop
         sending book/price_change events — a reconnect fixes this.
+
+        KEY FIX: We do NOT reset last_message_at on ping/pong success.
+        Instead we track message count to detect actual data flow resumption.
+        Previous bug: resetting last_message_at created a 120s blind window
+        each cycle, so consecutive_quiet never accumulated past 1.
         """
-        consecutive_quiet = 0
-        MAX_QUIET_BEFORE_RECONNECT = 5  # 5 x zombie_timeout(120s) ≈ 10 min
-        # Wait a bit before first check to allow initial messages
+        MAX_QUIET_BEFORE_RECONNECT = 3   # 3 checks ≈ 6 min max
+        STALE_CHECK_INTERVAL = 120.0     # seconds between stale-data checks
+
+        # Wait for initial messages before starting checks
         await asyncio.sleep(self.config.zombie_timeout)
+
+        consecutive_quiet = 0
+        last_seen_count = self.metrics.total_messages
+
         while True:
-            await asyncio.sleep(self.config.zombie_check_interval)
+            await asyncio.sleep(STALE_CHECK_INTERVAL)
             if self.metrics.last_message_at == 0:
                 continue  # Haven't received first message yet
+
+            # Check if new data messages arrived since last check
+            current_count = self.metrics.total_messages
+            if current_count > last_seen_count:
+                # Real data flowing — reset quiet counter
+                consecutive_quiet = 0
+                last_seen_count = current_count
+                continue
+
             age = time.time() - self.metrics.last_message_at
-            if age > self.config.zombie_timeout:
-                # ACTIVE CHECK: ping/pong probe before killing
-                try:
-                    pong = await ws.ping()
-                    await asyncio.wait_for(pong, timeout=10.0)
-                    # Pong received — connection is alive, just no data messages.
-                    consecutive_quiet += 1
-                    if consecutive_quiet >= MAX_QUIET_BEFORE_RECONNECT:
-                        log.warning(
-                            "[%s] No data for %d consecutive checks (~%.0fs total) despite ping/pong OK. "
-                            "Force reconnecting to restore data flow.",
-                            self.name,
-                            consecutive_quiet,
-                            age,
-                        )
-                        self.metrics.record_zombie_kill()
-                        await ws.close(code=4001, reason="stale-data-reconnect")
-                        return
-                    log.info(
-                        "[%s] No data for %.0fs but ping/pong OK — connection alive (market quiet, %d/%d)",
-                        self.name,
-                        age,
-                        consecutive_quiet,
-                        MAX_QUIET_BEFORE_RECONNECT,
-                    )
-                    with self.metrics._lock:
-                        self.metrics.last_message_at = time.time()
-                    continue
-                except (asyncio.TimeoutError, Exception) as e:
+            if age <= self.config.zombie_timeout:
+                continue
+
+            # No new data for zombie_timeout+ seconds — active probe
+            try:
+                pong = await ws.ping()
+                await asyncio.wait_for(pong, timeout=10.0)
+                # Pong received — connection alive but no data messages
+                consecutive_quiet += 1
+                if consecutive_quiet >= MAX_QUIET_BEFORE_RECONNECT:
                     log.warning(
-                        "[%s] Zombie confirmed — no message for %.0fs AND ping failed (%s). Force closing.",
+                        "[%s] No data for %d consecutive checks (~%.0fs total) despite ping/pong OK. "
+                        "Force reconnecting to restore data flow.",
                         self.name,
+                        consecutive_quiet,
                         age,
-                        e,
                     )
                     self.metrics.record_zombie_kill()
-                    await ws.close(code=4000, reason="zombie-timeout")
+                    await ws.close(code=4001, reason="stale-data-reconnect")
                     return
-            else:
-                # Got real data — reset quiet counter
-                consecutive_quiet = 0
+                log.info(
+                    "[%s] No data for %.0fs (0 new msgs in %ds), ping/pong OK — stale data (%d/%d)",
+                    self.name,
+                    age,
+                    int(STALE_CHECK_INTERVAL),
+                    consecutive_quiet,
+                    MAX_QUIET_BEFORE_RECONNECT,
+                )
+                # DO NOT reset last_message_at here — that was the root bug.
+                # The next check in STALE_CHECK_INTERVAL will re-evaluate.
+                continue
+            except (asyncio.TimeoutError, Exception) as e:
+                log.warning(
+                    "[%s] Zombie confirmed — no message for %.0fs AND ping failed (%s). Force closing.",
+                    self.name,
+                    age,
+                    e,
+                )
+                self.metrics.record_zombie_kill()
+                await ws.close(code=4000, reason="zombie-timeout")
+                return

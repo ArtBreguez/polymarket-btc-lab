@@ -71,11 +71,11 @@ MAX_TRADE_PAGES = 8    # max 8 pages/token × 2 tokens = 16 calls max (~4000 tra
                        # so we must page through all pages to collect inslot trades.
 
 SLOT_DURATION   = 300
-OBSERVE_SECS    = 180
-ENTER_WINDOW    = (170, 240)
+OBSERVE_SECS    = 60   # v23: matches model training (was 180 for v22, caused data mismatch)
+ENTER_WINDOW    = (170, 240)  # Keep same window: data-api lag ~120s means ticks from t=0-60 arrive at t~180
 SETTLE_GRACE    = 60
 MIN_CONFIDENCE  = 0.60
-MIN_EDGE        = 0.10
+MIN_EDGE        = 0.07   # v23: lowered from 10% to 7% — with tighter ask_max, less aggressive filter needed
 MIN_EDGE_MID    = 0.05          # edge vs market mid (catches stale ask)
 TAKER_FEE       = 0.02          # Polymarket taker fee default ~2% (updated dynamically)
 
@@ -389,13 +389,13 @@ async def _clob_on_message(msg) -> None:
                         #     and book worsened. Invalidate cache so HTTP
                         #     fallback is used until next book snapshot.
                         existing = _clob_prices.get(asset_id, 1.0)
-                        if price < 0.97 and price <= existing:
+                        if price < 0.97:
+                            # Always update — whether tighter or worse, the server
+                            # is telling us the new best ask. Invalidating on
+                            # worse price (pop) was too aggressive: forced HTTP
+                            # fallback until next book snapshot, often seconds later.
                             _clob_prices[asset_id] = price
                             _clob_price_ts[asset_id] = time.time()
-                        elif price > existing:
-                            # Best ask rose — invalidate to force HTTP fallback
-                            _clob_prices.pop(asset_id, None)
-                            _clob_price_ts.pop(asset_id, None)
 
     # Drain pending subscriptions from external threads
     if _clob_ws_manager:
@@ -442,17 +442,20 @@ def start_clob_daemon():
             ping_interval=None,
             ping_timeout=None,
             close_timeout=5.0,
-            zombie_timeout=120.0,      # Raised from 60s: one-sided markets can go minutes without data msgs. Active ping/pong probe in ws_manager prevents true zombies.
+            zombie_timeout=60.0,       # BTC 5min markets have constant book activity. 60s silence = stale connection.
             health_log_interval=300.0,  # log health every 5 min
         ),
     )
     _clob_ws_manager.start()
     log.info("CLOB WS daemon started (ws_manager)")
 
-    # Pre-subscribe to current + next 3 slots on startup (15 min window, avoids mid-session sends)
+    # Pre-subscribe to current + next slot only (4 tokens max).
+    # Subscribing to too many tokens (8-16) causes Polymarket to drop the WS
+    # connection every ~5min (code=1006) due to excessive message volume.
+    # The pruner + on-demand subscribe in fetch_market handles future slots.
     now = int(time.time())
     cur_slot = (now // SLOT_DURATION) * SLOT_DURATION
-    for i in range(4):
+    for i in range(2):
         slot_ts = cur_slot + i * SLOT_DURATION
         mkt = fetch_market(slot_ts)
         if mkt:
@@ -615,9 +618,19 @@ def build_spot_features(slot_ts: int) -> dict:
         vol = float(np.std(seg) / (np.mean(seg) + 1e-8))
         return ret, vol
 
-    # Inslot: [slot_ts, slot_ts+OBSERVE_SECS)
-    seg_inslot = _seg(slot_ts, slot_ts + OBSERVE_SECS)
-    feat["btc_inslot_ret"], feat["btc_inslot_vol"] = _ret_vol(seg_inslot)
+    # Inslot: BTC price return during [slot_ts, slot_ts+OBSERVE_SECS)
+    # Use searchsorted to find nearest candle at start and end (matches training)
+    idx_start = int(np.searchsorted(ts_arr, slot_ts, side="left"))
+    idx_end   = int(np.searchsorted(ts_arr, slot_ts + OBSERVE_SECS, side="right")) - 1
+    idx_start = max(0, min(idx_start, len(px_arr) - 1))
+    idx_end   = max(0, min(idx_end, len(px_arr) - 1))
+    if idx_end > idx_start and px_arr[idx_start] > 0:
+        feat["btc_inslot_ret"] = float(px_arr[idx_end] / px_arr[idx_start] - 1)
+        seg_inslot = px_arr[idx_start:idx_end + 1]
+        feat["btc_inslot_vol"] = float(np.std(seg_inslot) / (np.mean(seg_inslot) + 1e-8)) if len(seg_inslot) > 1 else 0.0
+    else:
+        feat["btc_inslot_ret"] = 0.0
+        feat["btc_inslot_vol"] = 0.0
 
     # Pre-slot windows — MUST use px at observation end (slot_ts + OBS_SECS)
     # to match training: spot_at(obs_end_ts) vs spot_at(slot_ts - window)
@@ -1144,6 +1157,7 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
             "btc_momentum":    btc_momentum,
             # v9
             "btc_size_disparity":     size_disparity,
+            "btc_up_ratio_stability": up_ratio_stability,
             # v10 interaction features
             "btc_signal_conviction":  float((vol_up / total) * (1.0 - up_ratio_stability)),
             **sw,
@@ -1172,12 +1186,20 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
     feat["hour_x_up_ratio"] = cur_up_ratio * (hour / 24.0)
     # hour_cos: cyclical hour encoding (cos component)
     feat["hour_cos"] = float(np.cos(2 * np.pi * hour / 24.0))
-    # time-weighted up ratio (recency bias)
+    # hour_sin: cyclical hour encoding (sin component) — v23 uses this
+    feat["hour_sin"] = float(np.sin(2 * np.pi * hour / 24.0))
+    # btc_up_ratio_stability: std of 6 sub-windows (v23 feature)
+    feat["btc_up_ratio_stability"] = feat.get("btc_up_ratio_stability", 0.0)
+    # time-weighted up ratio (recency bias) — MUST match training formula:
+    # Training uses exponential decay exp(-0.02*(obs_secs-t)) weighted by size_usdc.
     if ticks:
-        weights = np.array([t["t_sec"] + 1 for t in ticks], dtype=np.float64)
-        weights /= weights.sum() + 1e-8
-        tw_vals = np.array([1.0 if t.get("outcome") == "Up" else 0.0 for t in ticks])
-        tw_up_ratio = float(np.dot(weights, tw_vals))
+        t_arr = np.array([t["t_sec"] for t in ticks], dtype=np.float64)
+        sz_arr = np.array([t.get("size_usdc", 1.0) for t in ticks], dtype=np.float64)
+        up_arr = np.array([1.0 if t.get("outcome") == "Up" else 0.0 for t in ticks])
+        w_exp = np.exp(-0.02 * (OBSERVE_SECS - t_arr))
+        numerator = np.sum(up_arr * sz_arr * w_exp)
+        denominator = np.sum(sz_arr * w_exp) + 1e-9
+        tw_up_ratio = float(numerator / denominator)
     else:
         tw_up_ratio = 0.5
     feat["btc_tw_up_ratio"] = tw_up_ratio
@@ -1195,10 +1217,16 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
             time_gap = slot_ts - h.get("slot_ts", 0)
             if time_gap > lag * SLOT_DURATION * 3:
                 feat[f"prev_slot_up_ratio_{lag}"]  = 0.5
+                feat[f"prev_slot_n_ticks_{lag}"]   = 0.0
+                feat[f"prev_slot_vol_{lag}"]       = 0.0
             else:
                 feat[f"prev_slot_up_ratio_{lag}"]  = float(h.get("up_ratio", 0.5))
+                feat[f"prev_slot_n_ticks_{lag}"]   = float(h.get("n_ticks", 0.0))
+                feat[f"prev_slot_vol_{lag}"]       = float(h.get("vol_total", 0.0))
         else:
             feat[f"prev_slot_up_ratio_{lag}"]  = 0.5
+            feat[f"prev_slot_n_ticks_{lag}"]   = 0.0
+            feat[f"prev_slot_vol_{lag}"]       = 0.0
 
     # ── Multi-scale up_ratio zscore (5/20 slots) ─────────────────────────────
     # Matches training: zscore of current up_ratio vs recent history mean/std.
@@ -1236,14 +1264,15 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
     # up_token_id must be passed in; on failure fills with None (market excluded).
     feat.update(_build_ob_features(up_token_id))
 
-    # ── Cross-domain interaction features (OB x CLOB) ─────────────────────────
+    # ── Spot features ──────────────────────────────────────────────────────────
+    feat.update(build_spot_features(slot_ts))
+
+    # ── Cross-domain interaction features (OB x CLOB x Spot) ─────────────────
+    # MUST be computed AFTER both OB and spot features exist in feat dict.
     # v21 uses: x_imb_x_ur, x_depth_x_momentum, x_ob_drift_x_inslot
     feat["x_imb_x_ur"]          = feat.get("ob_imbalance", 0.0) * feat.get("btc_up_ratio", 0.5)
     feat["x_depth_x_momentum"]  = feat.get("ob_depth_ratio", 1.0) * feat.get("btc_momentum", 0.0)
     feat["x_ob_drift_x_inslot"] = feat.get("ob_mid_drift", 0.0) * feat.get("btc_inslot_ret", 0.0)
-
-    # ── Spot features ──────────────────────────────────────────────────────────
-    feat.update(build_spot_features(slot_ts))
 
     # ── Final: fill any remaining model features with context-aware defaults ────
     # ob_mid should be ~0.5 (binary market midpoint), not 0.0
@@ -1840,12 +1869,17 @@ def run(client, model, features):
             ask_src = f"WS {ask_age:.1f}s" if ws_ts else "HTTP"
 
             # Reject extreme ask prices — token is illiquid, already one-sided, or no edge
-            if not (0.38 <= ask_price <= 0.90):
-                log.info("  Skip — ask $%.3f outside [0.38, 0.90] — market already one-sided", ask_price)
+            # v23: tightened to [0.42, 0.65] from [0.38, 0.90]
+            #   - Below $0.42: market strongly against us (29% WR historically)
+            #   - Above $0.65: risk/reward terrible (need 66%+ WR to breakeven)
+            #     At ask=$0.70, risk $0.70 to win $0.28 (2.5:1 against)
+            #     $0.70-$0.80 bucket lost $29 on 18 trades despite 50% WR
+            if not (0.42 <= ask_price <= 0.65):
+                log.info("  Skip — ask $%.3f outside [0.42, 0.65] — unfavorable risk/reward", ask_price)
                 trades.append({"slot_ts": slot_ts, "direction": direction,
                                 "confidence": round(confidence, 4),
                                 "entry_price": round(ask_price, 4), "status": "skipped",
-                                "reason": f"ask ${ask_price:.3f} outside valid range [0.38, 0.90]",
+                                "reason": f"ask ${ask_price:.3f} outside valid range [0.42, 0.65]",
                                 "entered_at": now})
                 save_trades(trades)
                 continue
@@ -2091,7 +2125,8 @@ if __name__ == "__main__":
     log.info("Config: PROXY_WALLET=%s", PROXY_WALLET)
     log.info("Config: MIN_CONFIDENCE=%.0f%% MIN_EDGE=%.0f%% MIN_EDGE_MID=%.0f%%",
              MIN_CONFIDENCE * 100, MIN_EDGE * 100, MIN_EDGE_MID * 100)
-    log.info("Config: ENTER_WINDOW=%s SLOT_DURATION=%ds", ENTER_WINDOW, SLOT_DURATION)
+    log.info("Config: ENTER_WINDOW=%s SLOT_DURATION=%ds OBS_SECS=%ds", ENTER_WINDOW, SLOT_DURATION, OBSERVE_SECS)
+    log.info("Config: ASK_RANGE=[0.42, 0.65]")
     if AUTO_SHARES:
         log.info("Config: AUTO_SHARES=ON min=%d max=%d bal_floor=$%.0f bal_ceil=$%.0f",
                  AUTO_SHARES_MIN, AUTO_SHARES_MAX, AUTO_SHARES_BAL_FLOOR, AUTO_SHARES_BAL_CEIL)
