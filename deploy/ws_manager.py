@@ -445,7 +445,14 @@ class WebSocketManager:
         and waits for pong. If pong comes back, the connection is alive — just
         no *data* messages (common on illiquid/one-sided markets). Only kills
         if ping also fails (true zombie: connection silently dead).
+
+        STALE DATA guard: if ping/pong succeeds but no real data messages
+        arrive for too many consecutive checks (~10 min), force reconnect.
+        The Polymarket WS can keep TCP alive via ping/pong but silently stop
+        sending book/price_change events — a reconnect fixes this.
         """
+        consecutive_quiet = 0
+        MAX_QUIET_BEFORE_RECONNECT = 5  # 5 x zombie_timeout(120s) ≈ 10 min
         # Wait a bit before first check to allow initial messages
         await asyncio.sleep(self.config.zombie_timeout)
         while True:
@@ -459,12 +466,24 @@ class WebSocketManager:
                     pong = await ws.ping()
                     await asyncio.wait_for(pong, timeout=10.0)
                     # Pong received — connection is alive, just no data messages.
-                    # This is normal on illiquid/one-sided markets. Reset the
-                    # last_message_at so we don't spam this check every 5s.
+                    consecutive_quiet += 1
+                    if consecutive_quiet >= MAX_QUIET_BEFORE_RECONNECT:
+                        log.warning(
+                            "[%s] No data for %d consecutive checks (~%.0fs total) despite ping/pong OK. "
+                            "Force reconnecting to restore data flow.",
+                            self.name,
+                            consecutive_quiet,
+                            age,
+                        )
+                        self.metrics.record_zombie_kill()
+                        await ws.close(code=4001, reason="stale-data-reconnect")
+                        return
                     log.info(
-                        "[%s] No data for %.0fs but ping/pong OK — connection alive (market quiet)",
+                        "[%s] No data for %.0fs but ping/pong OK — connection alive (market quiet, %d/%d)",
                         self.name,
                         age,
+                        consecutive_quiet,
+                        MAX_QUIET_BEFORE_RECONNECT,
                     )
                     with self.metrics._lock:
                         self.metrics.last_message_at = time.time()
@@ -479,3 +498,6 @@ class WebSocketManager:
                     self.metrics.record_zombie_kill()
                     await ws.close(code=4000, reason="zombie-timeout")
                     return
+            else:
+                # Got real data — reset quiet counter
+                consecutive_quiet = 0

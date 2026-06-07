@@ -87,7 +87,7 @@ class DataQualityGate:
         features_list: list[str],
         min_ticks: int = 50,
         spot_max_age_s: int = 300,
-        min_subwindows_with_ticks: int = 3,
+        min_subwindows_with_ticks: int = 2,
         warmup_slots: int = 3,
         stale_repeat_threshold: int = 10,
         execution_ask_range: tuple[float, float] = (0.10, 0.95),
