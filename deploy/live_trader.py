@@ -1859,12 +1859,11 @@ def run(client, model, features):
                      direction, ask_price, ask_src, edge_vs_ask * 100,
                      market_mid or 0, (edge_vs_mid or 0) * 100)
 
-            # Sanity check: ask must not diverge >0.20 from market mid.
-            # A stale/deep-book ask can be e.g. $0.87 while mid is $0.50 — that
-            # would pass the edge_ask check (model_prob=0.97, edge=0.10) but the
-            # trade is a guaranteed overpay. Real best-ask is always within ~0.10
-            # of mid in an active Polymarket binary.
-            if market_mid is not None and abs(ask_price - market_mid) > 0.20:
+            # Sanity check: ask must not diverge >0.35 from market mid.
+            # BTC 5min markets move fast late in slot — midpoint reflects
+            # near-resolution while book still has tradeable liquidity.
+            # 0.35 allows normal late-slot movement while catching true stale prices.
+            if market_mid is not None and abs(ask_price - market_mid) > 0.35:
                 log.warning("  Skip — ask $%.3f diverges %.2f from mid $%.3f (stale/bad price)",
                             ask_price, abs(ask_price - market_mid), market_mid)
                 trades.append({"slot_ts": slot_ts, "direction": direction,
