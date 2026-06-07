@@ -1136,7 +1136,10 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
         # ── v9 features ────────────────────────────────────────────────────────
         # Signal consistency across 6 windows (needed by btc_signal_conviction)
         w_vals_list = [sw[f"btc_up_w{i}"] for i in range(6)]
-        up_ratio_stability = float(np.std(w_vals_list))
+        # v24 fix: use only REAL windows for stability (not padded 0.5)
+        # Training uses std(w_vals[:n_windows]) where n_windows = obs_secs // 30
+        n_real_windows = OBSERVE_SECS // 30  # 2 for obs_secs=60
+        up_ratio_stability = float(np.std(w_vals_list[:n_real_windows]))
 
         # Size disparity: avg trade size Up vs Down
         up_tks_v9   = [t for t in ticks if t.get("outcome") == "Up"]
