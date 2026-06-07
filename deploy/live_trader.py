@@ -47,6 +47,8 @@ from pathlib import Path
 import asyncio
 import numpy as np
 import pandas as pd
+from clob_features import get_accumulator, FEATURE_NAMES as CLOB_FEATURE_NAMES
+from clob_feature_logger import log_clob_features, resolve_clob_features
 from data_quality_gate import DataQualityGate
 import requests
 
@@ -353,7 +355,7 @@ async def _clob_on_connect(ws) -> None:
 
 
 async def _clob_on_message(msg) -> None:
-    """Handle CLOB WS message — updates _clob_prices cache."""
+    """Handle CLOB WS message — updates _clob_prices cache + feeds CLOB feature accumulator."""
     global _clob_last_keepalive
 
     # Server may send a list or a single dict
@@ -361,8 +363,20 @@ async def _clob_on_message(msg) -> None:
     if not isinstance(events, list):
         return
 
+    _acc = get_accumulator()
     for ev in events:
         etype = ev.get("event_type")
+        # Feed into CLOB feature accumulator for real-time microstructure features
+        if etype == "book":
+            asset_id = ev.get("asset_id", "")
+            if asset_id:
+                _acc.feed_event(asset_id, ev)
+        elif etype == "price_change":
+            # Feed to all referenced asset_ids
+            for pc in ev.get("price_changes", []):
+                aid = pc.get("asset_id", "")
+                if aid:
+                    _acc.feed_event(aid, ev)
         if etype == "book":
             asset_id = ev.get("asset_id", "")
             asks = ev.get("asks", [])
@@ -1277,6 +1291,14 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
     feat["x_depth_x_momentum"]  = feat.get("ob_depth_ratio", 1.0) * feat.get("btc_momentum", 0.0)
     feat["x_ob_drift_x_inslot"] = feat.get("ob_mid_drift", 0.0) * feat.get("btc_inslot_ret", 0.0)
 
+    # ── CLOB real-time microstructure features (ZERO lag from WS stream) ──────
+    # These features come directly from the live CLOB WebSocket book/price_change
+    # events accumulated since slot start. No data-api lag dependency.
+    if up_token_id:
+        _acc = get_accumulator()
+        clob_feats = _acc.get_features(up_token_id, window_secs=60.0)
+        feat.update(clob_feats)
+
     # ── Final: fill any remaining model features with context-aware defaults ────
     # ob_mid should be ~0.5 (binary market midpoint), not 0.0
     # ob_ask_depth_5c should be ~0.5 (neutral), not 0.0
@@ -1611,6 +1633,8 @@ def settle_trades(trades: list[dict]) -> bool:
         trade.update({"status": "settled", "actual": actual,
                       "result": result, "pnl_usdc": pnl, "settled_at": now})
         updated = True
+        # Resolve CLOB feature log with ground truth for v25 training
+        resolve_clob_features(trade["slot_ts"], float(target_int))
         log.info("SETTLED slot=%d | %s→%s | %s | P&L $%.2f",
                  trade["slot_ts"], direction, actual, result, pnl)
     return updated
@@ -1659,7 +1683,7 @@ def _backfill_history_targets():
 
 # ── Main loop ───────────────────────────────────────────────────────────────────
 def run(client, model, features):
-    gate = DataQualityGate(features_list=features, warmup_slots=3)
+    gate = DataQualityGate(features_list=features, warmup_slots=3, min_subwindows_with_ticks=1)
     log.info("Live trader started | stake=$%.2f | min_conf=%.0f%% | min_edge=%.0f%%",
              STAKE_USDC, MIN_CONFIDENCE*100, MIN_EDGE*100)
     log.info("DataQualityGate active — warming up for %d slots", gate.warmup_slots)
@@ -1829,12 +1853,32 @@ def run(client, model, features):
             log.info("  btc_up_ratio=%.3f momentum=%.3f tw=%.3f n_ticks=%d",
                      feat.get("btc_up_ratio", 0.5), feat.get("btc_momentum", 0),
                      feat.get("btc_tw_up_ratio", 0.5), int(feat.get("btc_n_ticks", 0)))
+            # Log CLOB real-time features
+            _cf = {k: feat.get(k, 0.0) for k in CLOB_FEATURE_NAMES}
+            clob_nonzero = sum(1 for v in _cf.values() if v != 0.0)
+            if clob_nonzero > 0:
+                log.info("  CLOB features: %d/%d non-zero | imb=%.3f vel=%.4f act=%.1f/s",
+                         clob_nonzero, len(CLOB_FEATURE_NAMES),
+                         _cf.get("clob_imb_mean", 0), _cf.get("clob_mid_velocity", 0),
+                         _cf.get("clob_activity_rate", 0))
+            else:
+                log.info("  CLOB features: no data yet (accumulator empty)")
 
             X = pd.DataFrame([[feat.get(f, 0.0) for f in features]], columns=features)
             prob_up = predict_proba(model, X)
             direction  = "UP" if prob_up >= 0.5 else "DOWN"
             confidence = prob_up if direction == "UP" else 1.0 - prob_up
             log.info("  Prediction: %s  conf=%.1f%%", direction, confidence*100)
+
+            # Log CLOB features for future v25 training
+            clob_feats = {k: feat.get(k, 0.0) for k in CLOB_FEATURE_NAMES}
+            log_clob_features(
+                slot_ts=slot_ts,
+                token_id=market["yes_token"],
+                clob_features=clob_feats,
+                model_prob=prob_up,
+                t_in_slot=t_elapsed,
+            )
 
             # ── GATE 3: Prediction sanity ──────────────────────────────
             ok, reason = gate.check_prediction_sanity(prob_up, feat)
@@ -1850,6 +1894,31 @@ def run(client, model, features):
                                 "entered_at": now})
                 save_trades(trades)
                 continue
+
+            # ── GATE 4: CLOB confirmation — skip if real-time order flow contradicts ──
+            # If model says UP but CLOB buyers are absent (imb strongly negative),
+            # or model says DOWN but CLOB is strongly bid-heavy, likely a false signal.
+            # NOTE: This gate is SOFT — only fires on strong contradiction (>0.3).
+            # Once we train v25 with CLOB features, this manual gate becomes unnecessary.
+            CLOB_CONTRADICTION_THRESHOLD = 0.3
+            clob_imb = feat.get("clob_imb_mean", 0.0)
+            if clob_imb != 0.0:  # 0.0 means no data (CLOB accumulator empty)
+                if direction == "UP" and clob_imb < -CLOB_CONTRADICTION_THRESHOLD:
+                    log.info("  Skip — CLOB CONTRADICTION: model=UP but clob_imb=%.3f (sellers dominate)", clob_imb)
+                    trades.append({"slot_ts": slot_ts, "direction": direction,
+                                    "confidence": round(confidence, 4), "status": "skipped",
+                                    "reason": f"clob_contradiction imb={clob_imb:.3f}",
+                                    "entered_at": now})
+                    save_trades(trades)
+                    continue
+                elif direction == "DOWN" and clob_imb > CLOB_CONTRADICTION_THRESHOLD:
+                    log.info("  Skip — CLOB CONTRADICTION: model=DOWN but clob_imb=%.3f (buyers dominate)", clob_imb)
+                    trades.append({"slot_ts": slot_ts, "direction": direction,
+                                    "confidence": round(confidence, 4), "status": "skipped",
+                                    "reason": f"clob_contradiction imb={clob_imb:.3f}",
+                                    "entered_at": now})
+                    save_trades(trades)
+                    continue
 
             token_id   = market["yes_token"] if direction == "UP" else market["no_token"]
 
