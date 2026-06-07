@@ -934,24 +934,57 @@ def _build_ob_features(up_token_id: str) -> dict:
     This lets us compute real ob_mid_drift, ob_imb_momentum, and windowed
     imbalance (ob_imb_w0/w1/w2) — top-5 features that were previously 0.0.
 
+    FALLBACK: If close snapshot fails (book empty/one-sided late in slot),
+    uses open snapshot for static features and zeros for temporal features.
+    This prevents 9 OB features from going to zero simultaneously.
+
     Returns dict with features. On failure returns empty dict (model uses 0.0 fallback).
     """
     snap = _fetch_ob_snapshot(up_token_id)
-    if snap is None:
-        return {}
 
     # ── Cache open snapshot (first poll of entry window) ──────────────
     if up_token_id not in _ob_open_cache:
-        _ob_open_cache[up_token_id] = {
-            "mid": snap["mid"],
-            "spread": snap["spread"],
-            "imbalance": snap["imbalance"],
-            "total_depth": float(sum(float(b["size"]) for b in snap["bids"]) +
-                                 sum(float(a["size"]) for a in snap["asks"])),
-            "ts": snap["ts"],
-        }
+        if snap is not None:
+            _ob_open_cache[up_token_id] = {
+                "mid": snap["mid"],
+                "spread": snap["spread"],
+                "imbalance": snap["imbalance"],
+                "total_depth": float(sum(float(b["size"]) for b in snap["bids"]) +
+                                     sum(float(a["size"]) for a in snap["asks"])),
+                "ts": snap["ts"],
+            }
 
-    open_snap = _ob_open_cache[up_token_id]
+    open_snap = _ob_open_cache.get(up_token_id)
+
+    # If BOTH snapshots failed, we have nothing — return empty
+    if snap is None and open_snap is None:
+        return {}
+
+    # If close snapshot failed but we have open_snap, use it as fallback
+    # (static features from open, temporal features = 0)
+    if snap is None:
+        log.debug("OB close snapshot failed for %s — using open_snap fallback", up_token_id[:20])
+        return {
+            # Static OB features from open snapshot
+            "ob_mid":           float(open_snap["mid"]),
+            "ob_spread":        float(open_snap.get("spread", 0.02)),
+            "ob_imbalance":     float(open_snap["imbalance"]),
+            "ob_depth_ratio":   1.0,  # neutral
+            "ob_bid_depth_5c":  0.5,
+            "ob_ask_depth_5c":  0.5,
+            "ob_total_depth":   float(open_snap.get("total_depth", 0)),
+            "ob_weighted_imb":  float(open_snap["imbalance"]),  # approx
+            # Temporal features = 0 (no change from open to close)
+            "ob_mid_drift":     0.0,
+            "ob_imbalance_end": float(open_snap["imbalance"]),
+            "ob_spread_end":    float(open_snap.get("spread", 0.02)),
+            "ob_depth_change":  0.0,
+            "ob_imb_momentum":  0.0,
+            # Windowed imbalance: all same as open (no temporal variation)
+            "ob_imb_w0":        float(open_snap["imbalance"]),
+            "ob_imb_w1":        float(open_snap["imbalance"]),
+            "ob_imb_w2":        float(open_snap["imbalance"]),
+        }
 
     # ── Temporal features from open vs close ──────────────────────────
     ob_mid_drift   = float(snap["mid"] - open_snap["mid"])
@@ -1689,6 +1722,7 @@ def run(client, model, features):
                 if snap:
                     _ob_open_cache[mkt["yes_token"]] = {
                         "mid": snap["mid"],
+                        "spread": snap["spread"],
                         "imbalance": snap["imbalance"],
                         "total_depth": float(sum(float(b["size"]) for b in snap["bids"]) +
                                              sum(float(a["size"]) for a in snap["asks"])),

@@ -447,6 +447,10 @@ def backtest_honest():
     FEATURE_COLS_WITH_NOISE = FEATURE_COLS + noise_cols
     log.info("Added %d random noise features as canary", N_NOISE_FEATS)
 
+    # Recreate train/test splits with noise columns included
+    df_train = df.iloc[:n_train]
+    df_test = df.iloc[n_embargo_end:]
+
     # ══════════════════════════════════════════════════════════════════════
     # ANTI-OVERFITTING TECHNIQUE 2: Adversarial validation
     # ══════════════════════════════════════════════════════════════════════
@@ -455,7 +459,7 @@ def backtest_honest():
     log.info("ANTI-OVERFITTING CHECK 2: Adversarial validation")
     log.info("Can a model distinguish train from test? (AUC ~0.5 = good)")
 
-    X_adv_train = df_train[FEATURE_COLS].values[:, :30].astype(np.float32)  # use top 30 feats
+    X_adv_train = df_train[FEATURE_COLS].values[:, :30].astype(np.float32)
     X_adv_test = df_test[FEATURE_COLS].values[:, :30].astype(np.float32)
     X_adv = np.vstack([X_adv_train, X_adv_test])
     y_adv = np.array([0]*len(X_adv_train) + [1]*len(X_adv_test))
