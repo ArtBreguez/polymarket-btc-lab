@@ -895,11 +895,13 @@ def _fetch_ob_snapshot(up_token_id: str) -> dict | None:
             timeout=5,
         )
         if not r.ok:
+            log.warning("OB snapshot HTTP %d for %s", r.status_code, up_token_id[:20])
             return None
         book = r.json()
         asks = book.get("asks", [])
         bids = book.get("bids", [])
         if not asks or not bids:
+            log.warning("OB snapshot empty book for %s: asks=%d bids=%d", up_token_id[:20], len(asks), len(bids))
             return None
         asks_sorted = sorted(asks, key=lambda x: float(x["price"]))
         bids_sorted = sorted(bids, key=lambda x: float(x["price"]), reverse=True)
