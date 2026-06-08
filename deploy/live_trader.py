@@ -76,8 +76,8 @@ SLOT_DURATION   = 300
 OBSERVE_SECS    = 60   # v23: matches model training (was 180 for v22, caused data mismatch)
 ENTER_WINDOW    = (170, 240)  # Keep same window: data-api lag ~120s means ticks from t=0-60 arrive at t~180
 SETTLE_GRACE    = 60
-MIN_CONFIDENCE  = 0.60
-MIN_EDGE        = 0.07   # v23: lowered from 10% to 7% — with tighter ask_max, less aggressive filter needed
+MIN_CONFIDENCE  = 0.55   # v26: lowered from 60% — backtest shows 55% profitable with edge>7%
+MIN_EDGE        = 0.07   # v26: kept at 7% — backtest confirms 7%+ edge is profitable
 MIN_EDGE_MID    = 0.05          # edge vs market mid (catches stale ask)
 TAKER_FEE       = 0.02          # Polymarket taker fee default ~2% (updated dynamically)
 
@@ -148,7 +148,7 @@ def _seed_spot_buffers():
                              timeout=HTTP_TIMEOUT)
             if r.ok:
                 for k in r.json():
-                    _spot_buffers[sym].append([k[0] // 1000, float(k[4])])
+                    _spot_buffers[sym].append([k[0] // 1000, float(k[4]), float(k[2]), float(k[3])])  # [ts, close, high, low]
                 log.info("Spot seed %s: %d candles", sym.upper(), len(_spot_buffers[sym]))
         except Exception as e:
             log.warning("Spot seed %s failed: %s", sym, e)
@@ -166,11 +166,18 @@ async def _spot_on_message(msg: dict) -> None:
             return
         ts_s = k["t"] // 1000
         close = float(k["c"])
+        high = float(k["h"])
+        low = float(k["l"])
         dq = _spot_buffers[sym]
         if dq and dq[-1][0] == ts_s:
             dq[-1][1] = close
+            if len(dq[-1]) >= 4:
+                dq[-1][2] = max(dq[-1][2], high)
+                dq[-1][3] = min(dq[-1][3], low)
+            else:
+                dq[-1].extend([high, low])
         else:
-            dq.append([ts_s, close])
+            dq.append([ts_s, close, high, low])
         _write_spot_buffer()
 
 
@@ -197,11 +204,18 @@ def _spot_rest_poll():
                     for k in r.json():
                         ts_s = k[0] // 1000
                         close = float(k[4])
+                        high = float(k[2])
+                        low = float(k[3])
                         dq = _spot_buffers[sym]
                         if dq and dq[-1][0] == ts_s:
                             dq[-1][1] = close
+                            if len(dq[-1]) >= 4:
+                                dq[-1][2] = max(dq[-1][2], high)
+                                dq[-1][3] = min(dq[-1][3], low)
+                            else:
+                                dq[-1].extend([high, low])
                         elif not dq or ts_s > dq[-1][0]:
-                            dq.append([ts_s, close])
+                            dq.append([ts_s, close, high, low])
                     _write_spot_buffer()
         except Exception as e:
             log.warning("Spot REST poll error: %s", e)
@@ -684,6 +698,36 @@ def build_spot_features(slot_ts: int) -> dict:
         feat["btc_pre_1h_4h_ratio"] = (px_now - px_1h_ago) / (px_now - px_4h_ago + 1e-9)
     else:
         feat["btc_pre_1h_4h_ratio"] = 0.0  # cold buffer or no meaningful 4h move
+
+    # ── v26 NEW spot features ─────────────────────────────────────────────────
+    # btc_inslot_range: (high - low) / px during [slot_ts, slot_ts+OBS]
+    if idx_end > idx_start and px_obs_end > 0:
+        hi_arr = np.array([c[2] for c in candles], dtype=np.float64) if len(candles[0]) > 2 else px_arr
+        lo_arr = np.array([c[3] for c in candles], dtype=np.float64) if len(candles[0]) > 3 else px_arr
+        inslot_hi = hi_arr[idx_start:idx_end + 1]
+        inslot_lo = lo_arr[idx_start:idx_end + 1]
+        feat["btc_inslot_range"] = float((inslot_hi.max() - inslot_lo.min()) / px_obs_end) if len(inslot_hi) > 0 else 0.0
+    else:
+        feat["btc_inslot_range"] = 0.0
+
+    # btc_vol_1h / btc_vol_4h: std of 1-min returns over 1h / 4h
+    def _volatility(lo_ts: int, hi_ts: int) -> float:
+        mask = (ts_arr >= lo_ts) & (ts_arr < hi_ts)
+        seg = px_arr[mask]
+        if len(seg) >= 3:
+            rets = np.diff(seg) / seg[:-1]
+            return float(np.std(rets))
+        return 0.0
+
+    feat["btc_vol_1h"] = _volatility(slot_ts - 3600, slot_ts)
+    feat["btc_vol_4h"] = _volatility(slot_ts - 14400, slot_ts)
+
+    # btc_spot_vol_ratio: recent 5m volume / avg hourly 5m volume
+    # Approximated as: count of candles in last 5m / (count in last 1h / 12)
+    n_5m = int(np.sum((ts_arr >= slot_ts - 300) & (ts_arr < slot_ts)))
+    n_1h = int(np.sum((ts_arr >= slot_ts - 3600) & (ts_arr < slot_ts - 300)))
+    avg_5m_per_hour = n_1h / 11 if n_1h > 0 else 1.0
+    feat["btc_spot_vol_ratio"] = float(n_5m / (avg_5m_per_hour + 1e-9))
 
     return feat
 
@@ -1261,9 +1305,13 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
         feat["btc_up_ratio_zscore_20s"] = float(np.clip((cur_up_ratio - mu20) / sd20, -5.0, 5.0))
         # v22: zscore of last sub-window (w5) vs 20-slot history
         feat["btc_up_w5_zscore"] = float(np.clip((feat.get("btc_up_w5", 0.5) - mu20) / sd20, -5.0, 5.0))
+        # v26: lag_ur_zscore_20 uses prev_slot_up_ratio_1 as current value
+        prev_ur_1 = feat.get("prev_slot_up_ratio_1", 0.5)
+        feat["lag_ur_zscore_20"] = float(np.clip((prev_ur_1 - mu20) / sd20, -5.0, 5.0))
     else:
         feat["btc_up_ratio_zscore_20s"] = 0.0
         feat["btc_up_w5_zscore"] = 0.0
+        feat["lag_ur_zscore_20"] = 0.0
 
     hist_vals_5 = _hist_ur(5)
     if len(hist_vals_5) >= 2:
@@ -1272,8 +1320,12 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
         if sd5 < 0.01:
             sd5 = 0.01
         feat["btc_up_ratio_zscore_5s"] = float(np.clip((cur_up_ratio - mu5) / sd5, -5.0, 5.0))
+        # v26: lag_ur_zscore_5 uses prev_slot_up_ratio_1 as current value
+        prev_ur_1 = feat.get("prev_slot_up_ratio_1", 0.5)
+        feat["lag_ur_zscore_5"] = float(np.clip((prev_ur_1 - mu5) / sd5, -5.0, 5.0))
     else:
         feat["btc_up_ratio_zscore_5s"] = 0.0
+        feat["lag_ur_zscore_5"] = 0.0
 
     # ── OB features: fetch real order book via CLOB REST ──────────────────────
     # Identical computation to training (pmdata poly_l2 book snapshots).
@@ -1286,10 +1338,16 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
 
     # ── Cross-domain interaction features (OB x CLOB x Spot) ─────────────────
     # MUST be computed AFTER both OB and spot features exist in feat dict.
-    # v21 uses: x_imb_x_ur, x_depth_x_momentum, x_ob_drift_x_inslot
+    # v26 cross-features: all real-time, no tick-based
     feat["x_imb_x_ur"]          = feat.get("ob_imbalance", 0.0) * feat.get("btc_up_ratio", 0.5)
     feat["x_depth_x_momentum"]  = feat.get("ob_depth_ratio", 1.0) * feat.get("btc_momentum", 0.0)
     feat["x_ob_drift_x_inslot"] = feat.get("ob_mid_drift", 0.0) * feat.get("btc_inslot_ret", 0.0)
+    # v26 NEW cross-features
+    feat["x_drift_x_ret5m"]     = feat.get("ob_mid_drift", 0.0) * feat.get("btc_pre_5m_ret", 0.0)
+    feat["x_imb_end_x_ret"]     = feat.get("ob_imbalance_end", 0.0) * feat.get("btc_inslot_ret", 0.0)
+    feat["x_imb_x_inslot"]      = feat.get("ob_imbalance", 0.0) * feat.get("btc_inslot_ret", 0.0)
+    feat["x_spread_x_vol"]      = feat.get("ob_spread", 0.02) * feat.get("btc_vol_1h", 0.0)
+    feat["x_depth_x_vol"]       = feat.get("ob_depth_ratio", 1.0) * feat.get("btc_vol_1h", 0.0)
 
     # ── CLOB real-time microstructure features (ZERO lag from WS stream) ──────
     # These features come directly from the live CLOB WebSocket book/price_change
@@ -1307,6 +1365,8 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
         "ob_ask_depth_5c": 0.5,
         "ob_bid_depth_5c": 0.5,
         "ob_depth_ratio": 1.0,
+        "ob_total_depth": 1000.0,
+        "ob_spread": 0.02,
     }
     for f in features:
         if f not in feat:
