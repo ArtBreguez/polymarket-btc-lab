@@ -148,7 +148,7 @@ def _seed_spot_buffers():
                              timeout=HTTP_TIMEOUT)
             if r.ok:
                 for k in r.json():
-                    _spot_buffers[sym].append([k[0] // 1000, float(k[4]), float(k[2]), float(k[3])])  # [ts, close, high, low]
+                    _spot_buffers[sym].append([k[0] // 1000, float(k[4]), float(k[2]), float(k[3]), float(k[5])])  # [ts, close, high, low, volume]
                 log.info("Spot seed %s: %d candles", sym.upper(), len(_spot_buffers[sym]))
         except Exception as e:
             log.warning("Spot seed %s failed: %s", sym, e)
@@ -168,6 +168,7 @@ async def _spot_on_message(msg: dict) -> None:
         close = float(k["c"])
         high = float(k["h"])
         low = float(k["l"])
+        volume = float(k["v"])
         dq = _spot_buffers[sym]
         if dq and dq[-1][0] == ts_s:
             dq[-1][1] = close
@@ -176,8 +177,13 @@ async def _spot_on_message(msg: dict) -> None:
                 dq[-1][3] = min(dq[-1][3], low)
             else:
                 dq[-1].extend([high, low])
+            # Update volume (always latest cumulative from WS)
+            if len(dq[-1]) >= 5:
+                dq[-1][4] = volume
+            else:
+                dq[-1].append(volume)
         else:
-            dq.append([ts_s, close, high, low])
+            dq.append([ts_s, close, high, low, volume])
         _write_spot_buffer()
 
 
@@ -206,6 +212,7 @@ def _spot_rest_poll():
                         close = float(k[4])
                         high = float(k[2])
                         low = float(k[3])
+                        volume = float(k[5])
                         dq = _spot_buffers[sym]
                         if dq and dq[-1][0] == ts_s:
                             dq[-1][1] = close
@@ -214,8 +221,12 @@ def _spot_rest_poll():
                                 dq[-1][3] = min(dq[-1][3], low)
                             else:
                                 dq[-1].extend([high, low])
+                            if len(dq[-1]) >= 5:
+                                dq[-1][4] = volume
+                            else:
+                                dq[-1].append(volume)
                         elif not dq or ts_s > dq[-1][0]:
-                            dq.append([ts_s, close, high, low])
+                            dq.append([ts_s, close, high, low, volume])
                     _write_spot_buffer()
         except Exception as e:
             log.warning("Spot REST poll error: %s", e)
@@ -723,11 +734,14 @@ def build_spot_features(slot_ts: int) -> dict:
     feat["btc_vol_4h"] = _volatility(slot_ts - 14400, slot_ts)
 
     # btc_spot_vol_ratio: recent 5m volume / avg hourly 5m volume
-    # Approximated as: count of candles in last 5m / (count in last 1h / 12)
-    n_5m = int(np.sum((ts_arr >= slot_ts - 300) & (ts_arr < slot_ts)))
-    n_1h = int(np.sum((ts_arr >= slot_ts - 3600) & (ts_arr < slot_ts - 300)))
-    avg_5m_per_hour = n_1h / 11 if n_1h > 0 else 1.0
-    feat["btc_spot_vol_ratio"] = float(n_5m / (avg_5m_per_hour + 1e-9))
+    # Uses actual Binance candle volume (matching training formula)
+    vol_arr = np.array([c[4] if len(c) > 4 else 0.0 for c in candles], dtype=np.float64)
+    mask_5m = (ts_arr >= slot_ts - 300) & (ts_arr < slot_ts)
+    mask_55m = (ts_arr >= slot_ts - 3600) & (ts_arr < slot_ts - 300)
+    vol_5m = float(vol_arr[mask_5m].sum()) if mask_5m.any() else 0.0
+    vol_55m = float(vol_arr[mask_55m].sum()) if mask_55m.any() else 0.0
+    avg_5m_per_hour = vol_55m / 11 if vol_55m > 0 else 1e-9
+    feat["btc_spot_vol_ratio"] = float(vol_5m / (avg_5m_per_hour + 1e-9))
 
     return feat
 
