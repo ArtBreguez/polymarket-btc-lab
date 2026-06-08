@@ -213,14 +213,22 @@ def train_v25():
         ob_raw.to_parquet(str(ob_raw_cache), index=False)
         log.info("  Cached to volume")
 
-    # Convert timestamps
-    if pd.api.types.is_datetime64_any_dtype(ob_raw["timestamp"]):
-        ob_raw["ts_sec"] = ob_raw["timestamp"].astype("int64") / 1e3  # ms → s
+    # Convert timestamps — detect column name dynamically
+    log.info("  Raw OB columns: %s", list(ob_raw.columns)[:15])
+    log.info("  Raw OB rows: %d", len(ob_raw))
+    ts_col = next((c for c in ["timestamp", "time", "ts", "datetime"] if c in ob_raw.columns), None)
+    if ts_col is None and isinstance(ob_raw.index, pd.DatetimeIndex):
+        ob_raw = ob_raw.reset_index()
+        ts_col = ob_raw.columns[0]  # first col after reset_index is the old index
+    if ts_col is None:
+        log.error("  No timestamp column! Available: %s. CLOB features will be zeros.", list(ob_raw.columns))
+        ob_raw["ts_sec"] = 0.0  # dummy — will produce no valid groups
+    elif pd.api.types.is_datetime64_any_dtype(ob_raw[ts_col]):
+        ob_raw["ts_sec"] = ob_raw[ts_col].astype("int64") / 1e3  # ms → s
     else:
-        ob_raw["ts_sec"] = pd.to_numeric(ob_raw["timestamp"], errors="coerce").fillna(0)
-
-    log.info("  Raw OB events: %d rows, columns: %s", len(ob_raw), list(ob_raw.columns)[:10])
-    log.info("  Event types: %s", ob_raw["event_type"].value_counts().to_dict() if "event_type" in ob_raw.columns else "?")
+        ob_raw["ts_sec"] = pd.to_numeric(ob_raw[ts_col], errors="coerce").fillna(0)
+    if "event_type" in ob_raw.columns:
+        log.info("  Event types: %s", ob_raw["event_type"].value_counts().to_dict())
 
     # ── Build CLOB features per market (simulate ClobFeatureAccumulator) ──
     # For each market, we simulate what the live accumulator sees:
