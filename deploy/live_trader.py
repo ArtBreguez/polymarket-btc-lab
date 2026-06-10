@@ -47,7 +47,7 @@ from pathlib import Path
 import asyncio
 import numpy as np
 import pandas as pd
-from clob_features import get_accumulator, FEATURE_NAMES as CLOB_FEATURE_NAMES
+from clob_features import get_accumulator, FEATURE_NAMES as CLOB_FEATURE_NAMES, OB_PC_FEATURE_NAMES
 from clob_feature_logger import log_clob_features, resolve_clob_features
 from data_quality_gate import DataQualityGate
 import requests
@@ -1407,24 +1407,55 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
     feat["x_spread_x_vol"]      = feat.get("ob_spread", 0.02) * feat.get("btc_vol_1h", 0.0)
     feat["x_depth_x_vol"]       = feat.get("ob_depth_ratio", 1.0) * feat.get("btc_vol_1h", 0.0)
 
-    # ── CLOB real-time microstructure features (ZERO lag from WS stream) ──────
-    # These features come directly from the live CLOB WebSocket book/price_change
-    # events accumulated since slot start. No data-api lag dependency.
+    # ── CLOB + OB_PC real-time features (from WS stream, slot-anchored) ─────────
+    # All windows anchored to slot_ts so t=[0,168) and t=[108,168) match training.
+    # clob_* : window [slot_ts+108, slot_ts+168) — same as fetch_ob_features_modal
+    # ob_pc_*: window [slot_ts,     slot_ts+168) — same as fetch_ob_features_modal
+    # ob_imb_w0/1/2: windows [0,60) / [60,120) / [120,168) relative to slot_ts
     if up_token_id:
         _acc = get_accumulator()
-        clob_feats = _acc.get_features(up_token_id, window_secs=60.0)
+        # clob_* features: 60s window ending at obs cutoff t=168s
+        clob_feats = _acc.get_features(
+            up_token_id,
+            slot_ts=slot_ts,
+            obs_secs=168,       # cutoff = slot_ts + 168s (matches training CUTOFF_SEC)
+            window_secs=60.0,   # 60s lookback → window [108, 168)
+        )
         feat.update(clob_feats)
 
+        # ob_pc_* features: price-change aggregates over [slot_ts, slot_ts+168)
+        pc_feats = _acc.get_ob_pc_features(
+            up_token_id,
+            slot_ts=slot_ts,
+            cutoff_secs=168.0,  # matches training CUTOFF_SEC
+        )
+        feat.update(pc_feats)
+
+        # ob_imb_w0/w1/w2: windowed imbalance from real book snapshots
+        # Overwrites the interpolated values from _build_ob_features if we have real data.
+        imb_windows = _acc.get_windowed_imbalance(
+            up_token_id,
+            slot_ts=slot_ts,
+            windows=[(0, 60), (60, 120), (120, 168)],
+        )
+        # Only override if we have at least one real data point in the window
+        # (value 0.0 from get_windowed_imbalance means no data — keep interpolated fallback)
+        for k, v in imb_windows.items():
+            if v != 0.0 or feat.get(k, None) is None:
+                feat[k] = v
+
     # ── Final: fill any remaining model features with context-aware defaults ────
-    # ob_mid should be ~0.5 (binary market midpoint), not 0.0
-    # ob_ask_depth_5c should be ~0.5 (neutral), not 0.0
     _neutral_defaults = {
-        "ob_mid": 0.5,
+        "ob_mid":          0.5,
         "ob_ask_depth_5c": 0.5,
         "ob_bid_depth_5c": 0.5,
-        "ob_depth_ratio": 1.0,
-        "ob_total_depth": 1000.0,
-        "ob_spread": 0.02,
+        "ob_depth_ratio":  1.0,
+        "ob_total_depth":  1000.0,
+        "ob_spread":       0.02,
+        "ob_pc_up_ratio":  0.5,   # neutral — no directional info
+        "ob_pc_volatility": 0.0,
+        "ob_pc_count":     0.0,
+        "ob_fill_imbalance": 0.0,
     }
     for f in features:
         if f not in feat:
@@ -1893,6 +1924,11 @@ def run(client, model, features):
         global _ob_last_slot
         if cur_slot != _ob_last_slot:
             _ob_open_cache.clear()
+            # Reset CLOB accumulator buffers so ob_pc_* and ob_imb_w* windows
+            # are anchored to the new slot_ts — matches training [slot_ts, slot_ts+168)
+            _acc = get_accumulator()
+            for tid in list(_clob_subscribed):
+                _acc.reset_token(tid, slot_ts=cur_slot)
             _ob_last_slot = cur_slot
 
         # ── OB early snapshot: fetch "open" OB at t~60s (well before entry window) ──

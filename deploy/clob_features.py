@@ -3,11 +3,19 @@
 Buffers CLOB WebSocket events (book and price_change) and computes
 real-time microstructure features with zero lag for LightGBM prediction.
 
+All time-windowed methods accept slot_ts so windows are anchored to the
+slot start — exactly matching how fetch_ob_features_modal.py computes
+training features. This eliminates train/live divergence.
+
 Usage:
     from clob_features import get_accumulator
     acc = get_accumulator()
     acc.feed_event(token_id, event_dict)  # called from WS thread
-    features = acc.get_features(token_id, window_secs=60)  # called from main thread
+
+    # At prediction time (t≈170-240s into slot):
+    clob_feats  = acc.get_features(token_id, slot_ts, obs_secs=60, window_secs=60)
+    pc_feats    = acc.get_ob_pc_features(token_id, slot_ts, cutoff_secs=168)
+    imb_windows = acc.get_windowed_imbalance(token_id, slot_ts, windows=[(0,60),(60,120),(120,168)])
 """
 
 from __future__ import annotations
@@ -16,7 +24,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -35,14 +43,23 @@ FEATURE_NAMES: List[str] = [
     "clob_ask_pressure",
 ]
 
-# Maximum buffer duration in seconds
-MAX_BUFFER_SECS: float = 180.0
+# Feature names returned by get_ob_pc_features
+OB_PC_FEATURE_NAMES: List[str] = [
+    "ob_pc_up_ratio",
+    "ob_pc_volatility",
+    "ob_pc_count",
+    "ob_fill_imbalance",
+]
+
+# Maximum buffer duration in seconds — must be >= slot duration (300s) so
+# we retain enough events to cover the full ob_pc window [0, 168s).
+MAX_BUFFER_SECS: float = 360.0
 
 
 @dataclass
 class BookSnapshot:
     """Parsed book event data."""
-    timestamp: float
+    timestamp: float      # wall-clock time (time.time())
     best_ask: float
     best_bid: float
     mid: float
@@ -55,9 +72,10 @@ class BookSnapshot:
 @dataclass
 class PriceChangeEvent:
     """Parsed price_change event data."""
-    timestamp: float
+    timestamp: float      # wall-clock time (time.time())
     price: float
-    side: str  # "ASK" or "BID"
+    side: str             # "ASK" or "BID"
+    size: float = 0.0     # fill size (pc_size from price_change, if available)
 
 
 @dataclass
@@ -65,6 +83,7 @@ class TokenBuffer:
     """Thread-safe event buffer for a single token."""
     book_events: List[BookSnapshot] = field(default_factory=list)
     price_events: List[PriceChangeEvent] = field(default_factory=list)
+    slot_ts: int = 0      # slot this buffer was last reset for
 
 
 class ClobFeatureAccumulator:
@@ -73,8 +92,8 @@ class ClobFeatureAccumulator:
     Thread-safe: feed_event() is called from the WebSocket thread,
     get_features() is called from the main prediction thread.
 
-    Events are stored in a time-windowed buffer (last 180s) and pruned
-    on each feed call to prevent unbounded memory growth.
+    All windowed methods use slot_ts as the epoch so [t0, t1) is
+    [slot_ts+t0, slot_ts+t1) in wall-clock time — matching training.
     """
 
     def __init__(self, max_buffer_secs: float = MAX_BUFFER_SECS) -> None:
@@ -83,12 +102,7 @@ class ClobFeatureAccumulator:
         self._lock = threading.Lock()
 
     def feed_event(self, token_id: str, event: Dict[str, Any]) -> None:
-        """Ingest a raw CLOB WebSocket event into the buffer.
-
-        Args:
-            token_id: The asset/token identifier.
-            event: Raw event dict from the WebSocket. Must have 'event_type'.
-        """
+        """Ingest a raw CLOB WebSocket event into the buffer."""
         event_type = event.get("event_type", "")
         now = time.time()
 
@@ -111,113 +125,238 @@ class ClobFeatureAccumulator:
             # Prune old events beyond max buffer
             self._prune_buffer(buf, now)
 
-    def get_features(self, token_id: str, window_secs: float = 60.0) -> Dict[str, float]:
-        """Compute features over the last window_secs seconds.
+    def reset_token(self, token_id: str, slot_ts: int = 0) -> None:
+        """Clear all buffered data for a token (e.g., on slot change).
+
+        Args:
+            token_id: The asset/token identifier to clear.
+            slot_ts: New slot timestamp (stored for reference).
+        """
+        with self._lock:
+            buf = self._buffers[token_id]
+            buf.book_events.clear()
+            buf.price_events.clear()
+            buf.slot_ts = slot_ts
+
+    # ------------------------------------------------------------------
+    # Primary feature methods (all slot_ts-anchored)
+    # ------------------------------------------------------------------
+
+    def get_features(
+        self,
+        token_id: str,
+        slot_ts: int,
+        obs_secs: int = 60,
+        window_secs: float = 60.0,
+    ) -> Dict[str, float]:
+        """Compute clob_* features over a slot-anchored window.
+
+        Window: wall-clock [slot_ts + obs_secs - window_secs, slot_ts + obs_secs).
+        Matches training: fetch_ob_features_modal._compute_clob_features uses
+        t=[108, 168) (window_secs=60, obs_secs=168 by default → same semantics).
+
+        At prediction time (t≈170s), obs_secs=168 gives window [108, 168) —
+        identical to training. Default obs_secs=60 is kept for backward compat.
 
         Args:
             token_id: The asset/token identifier.
-            window_secs: Lookback window in seconds (default 60).
+            slot_ts: Slot start timestamp (UTC seconds).
+            obs_secs: Observation cutoff relative to slot_ts (default 60; use 168 for
+                      full parity with training window).
+            window_secs: How many seconds before obs_secs to look back (default 60).
 
         Returns:
-            Dict mapping feature names to float values. Returns all zeros
-            if insufficient data (< 5 events or < 5 seconds of history).
+            Dict of clob_* features. All zeros if insufficient data.
         """
         zeros = {name: 0.0 for name in FEATURE_NAMES}
-        now = time.time()
-        cutoff = now - window_secs
+
+        cutoff_wall   = slot_ts + obs_secs          # wall-clock upper bound (exclusive)
+        window_wall   = cutoff_wall - window_secs    # wall-clock lower bound (inclusive)
 
         with self._lock:
             buf = self._buffers.get(token_id)
             if buf is None:
                 return zeros
+            books  = [b for b in buf.book_events  if window_wall <= b.timestamp < cutoff_wall]
+            prices = [p for p in buf.price_events if window_wall <= p.timestamp < cutoff_wall]
 
-            # Filter book events within window
-            books = [b for b in buf.book_events if b.timestamp >= cutoff]
-            prices = [p for p in buf.price_events if p.timestamp >= cutoff]
-
-        # Check minimum data requirements (count only real events, no double-counting)
-        real_books_all = [b for b in books if not b.synthetic]
-        total_events = len(real_books_all) + len(prices)
+        real_books = [b for b in books if not b.synthetic]
+        total_events = len(real_books) + len(prices)
         if total_events < 5:
             return zeros
 
-        # Polymarket WS sends 1 book snapshot on subscribe then only price_change events.
-        # Relax: allow 1 book snapshot as long as we have enough price_change events (>=5).
-        # Use price_events timestamps for time_span when only 1 book snapshot available.
-        if len(books) < 2:
-            if len(prices) < 5:
-                return zeros
-            time_span = prices[-1].timestamp - prices[0].timestamp
-            if time_span < 5.0:
-                return zeros
-        else:
-            time_span = books[-1].timestamp - books[0].timestamp
-            if time_span < 5.0:
-                # Fall back to price_events span
-                if len(prices) >= 2:
-                    time_span = prices[-1].timestamp - prices[0].timestamp
-                if time_span < 5.0:
-                    return zeros
+        # Time span
+        all_ts_wall = sorted([b.timestamp for b in books] + [p.timestamp for p in prices])
+        time_span = max(all_ts_wall[-1] - all_ts_wall[0], 1e-3) if len(all_ts_wall) >= 2 else 1.0
 
-        # Compute features from book snapshots.
-        # Synthetic snapshots (built from price_change best_bid/best_ask) have real
-        # mid/spread but NO imbalance or depth data — separate them to avoid pollution.
-        real_books  = [b for b in books if not b.synthetic]
-        all_books   = books  # includes synthetic — used for mid/spread time-series
-
-        # Use all books for mid/spread (synthetic have real best_bid/best_ask)
-        spreads    = np.array([b.spread for b in all_books], dtype=np.float64)
-        mids       = np.array([b.mid    for b in all_books], dtype=np.float64)
-        timestamps = np.array([b.timestamp for b in all_books], dtype=np.float64)
-        t_rel      = timestamps - timestamps[0]
-
-        # Use ONLY real books for imbalance and depth (synthetic have fabricated zeros)
+        # Real books for imbalance/depth
         imbalances = np.array([b.imbalance    for b in real_books], dtype=np.float64)
         depths     = np.array([b.total_depth  for b in real_books], dtype=np.float64)
         t_real     = np.array([b.timestamp    for b in real_books], dtype=np.float64)
-        t_real_rel = t_real - t_real[0] if len(t_real) > 1 else t_real
+
+        # All events (real + synthetic books + pc synthetic mid/spread) for velocity
+        all_mid:    List[float] = []
+        all_spread: List[float] = []
+        all_ts:     List[float] = []
+        ask_prices_seq: List[float] = []
+
+        for b in books:
+            all_mid.append(b.mid)
+            all_spread.append(b.spread)
+            all_ts.append(b.timestamp)
+
+        for p in prices:
+            # price_change events don't carry best_bid/best_ask directly here
+            # (those are already captured in the synthetic BookSnapshot above).
+            # We use them only for ask_pressure.
+            if p.side == "ASK":
+                ask_prices_seq.append(p.price)
+
+        if len(all_mid) < 2:
+            return zeros
+
+        order          = np.argsort(all_ts)
+        all_ts_arr     = np.array(all_ts)[order]
+        all_mid_arr    = np.array(all_mid)[order]
+        all_spread_arr = np.array(all_spread)[order]
+        t_rel          = all_ts_arr - all_ts_arr[0]
 
         features: Dict[str, float] = {}
 
-        # Imbalance features — from real book snapshots only
-        features["clob_imb_mean"]  = float(np.mean(imbalances))  if len(imbalances) > 0 else 0.0
-        features["clob_imb_std"]   = float(np.std(imbalances))   if len(imbalances) > 1 else 0.0
+        features["clob_imb_mean"]  = float(np.mean(imbalances)) if len(imbalances) > 0 else 0.0
+        features["clob_imb_std"]   = float(np.std(imbalances))  if len(imbalances) > 1 else 0.0
         features["clob_imb_drift"] = float(imbalances[-1] - imbalances[0]) if len(imbalances) > 1 else 0.0
 
-        # Spread features — from all books (synthetic have real spread)
-        features["clob_spread_mean"]  = float(np.mean(spreads))
-        features["clob_spread_trend"] = self._linear_slope(t_rel, spreads) if len(spreads) > 1 else 0.0
+        features["clob_spread_mean"]  = float(np.mean(all_spread_arr))
+        features["clob_spread_trend"] = self._linear_slope(t_rel, all_spread_arr) if len(t_rel) > 1 else 0.0
 
-        # Mid-price features — from all books (synthetic have real mid)
-        features["clob_mid_velocity"]   = self._linear_slope(t_rel, mids) if len(mids) > 1 else 0.0
-        mid_diffs = np.diff(mids)
+        features["clob_mid_velocity"]   = self._linear_slope(t_rel, all_mid_arr) if len(t_rel) > 1 else 0.0
+        mid_diffs = np.diff(all_mid_arr)
         features["clob_mid_volatility"] = float(np.std(mid_diffs)) if len(mid_diffs) > 0 else 0.0
 
-        # Activity rate: real events per second.
-        # Synthetic book snapshots are derived from price_change events — counting
-        # them would double-count every price_change and inflate activity_rate ~2x
-        # vs training (where synthetics didn't exist). Use only real book snapshots
-        # + price_change events to match the training distribution.
-        real_event_count = len(real_books) + len(prices)
-        features["clob_activity_rate"] = float(real_event_count / time_span)
+        # Activity rate: real book events + price_change events (no double-count)
+        features["clob_activity_rate"] = float((len(real_books) + len(prices)) / time_span)
 
-        # Depth trend — from real book snapshots only
-        features["clob_depth_trend"] = self._linear_slope(t_real_rel, depths) if len(depths) > 1 else 0.0
+        # Depth trend — real books only
+        if len(depths) > 1:
+            t_real_rel = t_real - t_real[0]
+            features["clob_depth_trend"] = self._linear_slope(t_real_rel, depths)
+        else:
+            features["clob_depth_trend"] = 0.0
 
-        # Ask pressure: fraction of ASK price_change events that moved DOWN
-        features["clob_ask_pressure"] = self._compute_ask_pressure(prices)
+        # Ask pressure: fraction of ASK price changes that went DOWN
+        features["clob_ask_pressure"] = self._compute_ask_pressure_list(ask_prices_seq)
 
         return features
 
-    def reset_token(self, token_id: str) -> None:
-        """Clear all buffered data for a token (e.g., on slot change).
+    def get_ob_pc_features(
+        self,
+        token_id: str,
+        slot_ts: int,
+        cutoff_secs: float = 168.0,
+    ) -> Dict[str, float]:
+        """Compute ob_pc_* features from price_change events since slot_ts.
+
+        Window: wall-clock [slot_ts, slot_ts + cutoff_secs).
+        Matches training: fetch_ob_features_modal uses t=[0, CUTOFF_SEC=168).
+
+        ob_pc_up_ratio   = n_up_moves / n_total_moves   (price changes going UP)
+        ob_pc_volatility = std(price_diffs)
+        ob_pc_count      = n_total price change moves
+        ob_fill_imbalance = (buy_vol - sell_vol) / (buy_vol + sell_vol)
+                           where BUY = side=="BID", SELL = side=="ASK"
 
         Args:
-            token_id: The asset/token identifier to clear.
+            token_id: The asset/token identifier.
+            slot_ts: Slot start timestamp (UTC seconds).
+            cutoff_secs: Upper bound relative to slot_ts (default 168s = CUTOFF_SEC).
+
+        Returns:
+            Dict with ob_pc_* features. Neutral fills if no data.
         """
+        neutral = {
+            "ob_pc_up_ratio":    0.5,
+            "ob_pc_volatility":  0.0,
+            "ob_pc_count":       0.0,
+            "ob_fill_imbalance": 0.0,
+        }
+
+        t_lo = float(slot_ts)
+        t_hi = float(slot_ts) + cutoff_secs
+
         with self._lock:
-            if token_id in self._buffers:
-                del self._buffers[token_id]
+            buf = self._buffers.get(token_id)
+            if buf is None:
+                return neutral
+            prices = [p for p in buf.price_events if t_lo <= p.timestamp < t_hi]
+
+        if not prices:
+            return neutral
+
+        price_vals = np.array([p.price for p in prices], dtype=np.float64)
+        diffs      = np.diff(price_vals)
+        changes    = diffs[diffs != 0]
+
+        if len(changes) == 0:
+            result = dict(neutral)
+            result["ob_pc_count"] = float(len(prices))
+            return result
+
+        n_up = int((changes > 0).sum())
+        n_total = len(changes)
+
+        # Fill imbalance: BID-side fills = buys, ASK-side = sells
+        buy_vol  = sum(p.size for p in prices if p.side == "BID")
+        sell_vol = sum(p.size for p in prices if p.side == "ASK")
+        fill_imb = float((buy_vol - sell_vol) / (buy_vol + sell_vol + 1e-8))
+
+        return {
+            "ob_pc_up_ratio":    float(n_up / n_total),
+            "ob_pc_volatility":  float(np.std(changes)),
+            "ob_pc_count":       float(n_total),
+            "ob_fill_imbalance": fill_imb,
+        }
+
+    def get_windowed_imbalance(
+        self,
+        token_id: str,
+        slot_ts: int,
+        windows: List[Tuple[float, float]] = ((0, 60), (60, 120), (120, 168)),
+    ) -> Dict[str, float]:
+        """Compute ob_imb_w0/w1/w2 from real book snapshots in slot-anchored windows.
+
+        Window i covers wall-clock [slot_ts + t0_i, slot_ts + t1_i).
+        Uses ONLY real (non-synthetic) book snapshots — matching training.
+
+        Returns mean imbalance in each window, or 0.0 if no real books present.
+        Falls back to 0.0 (not interpolated) so behaviour is honest when data absent.
+
+        Args:
+            token_id: The asset/token identifier.
+            slot_ts: Slot start timestamp (UTC seconds).
+            windows: List of (t_start, t_end) tuples relative to slot_ts.
+
+        Returns:
+            Dict with ob_imb_w{i} keys.
+        """
+        result: Dict[str, float] = {}
+        t_base = float(slot_ts)
+
+        with self._lock:
+            buf = self._buffers.get(token_id)
+            if buf is None:
+                for i in range(len(windows)):
+                    result[f"ob_imb_w{i}"] = 0.0
+                return result
+            real_books = [b for b in buf.book_events if not b.synthetic]
+
+        for i, (t0, t1) in enumerate(windows):
+            lo = t_base + t0
+            hi = t_base + t1
+            imbs = [b.imbalance for b in real_books if lo <= b.timestamp < hi]
+            result[f"ob_imb_w{i}"] = float(np.mean(imbs)) if imbs else 0.0
+
+        return result
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -232,22 +371,17 @@ class ClobFeatureAccumulator:
         if not asks or not bids:
             return None
 
-        # Best ask = lowest ask price, best bid = highest bid price
         best_ask = float(asks[0]["price"])
         best_bid = float(bids[0]["price"])
+        ask_sz   = float(asks[0].get("size", "0"))
+        bid_sz   = float(bids[0].get("size", "0"))
 
-        # Sizes at top of book
-        ask_sz = float(asks[0].get("size", "0"))
-        bid_sz = float(bids[0].get("size", "0"))
-
-        mid = (best_ask + best_bid) / 2.0
+        mid    = (best_ask + best_bid) / 2.0
         spread = best_ask - best_bid
 
-        # Imbalance: positive = more bid pressure (bullish)
-        total_sz = bid_sz + ask_sz
+        total_sz  = bid_sz + ask_sz
         imbalance = (bid_sz - ask_sz) / total_sz if total_sz > 0 else 0.0
 
-        # Total depth across all levels
         total_depth = sum(float(a.get("size", "0")) for a in asks) + \
                       sum(float(b.get("size", "0")) for b in bids)
 
@@ -269,8 +403,10 @@ class ClobFeatureAccumulator:
 
         Polymarket WS sends `side` as "BUY"/"SELL" (not "BID"/"ASK").
         Each item also includes `best_bid` and `best_ask` — we use those to build
-        synthetic BookSnapshots so features can be computed even with only 1 real
-        book snapshot (which is all Polymarket sends on subscribe).
+        synthetic BookSnapshots so mid/spread time-series are available even with
+        only 1 real book snapshot per subscription.
+
+        We also capture `size` from the price_change for ob_fill_imbalance.
         """
         results: List[PriceChangeEvent] = []
         synth_books: List[BookSnapshot] = []
@@ -279,20 +415,23 @@ class ClobFeatureAccumulator:
             asset_id = pc.get("asset_id", "")
             if asset_id != token_id:
                 continue
-            price = float(pc.get("price", "0"))
+            price    = float(pc.get("price", "0"))
             raw_side = pc.get("side", "UNKNOWN")
-            # Polymarket uses BUY/SELL — map to BID/ASK for our feature logic
+            # Polymarket uses BUY/SELL — map to BID/ASK
             side = "BID" if raw_side == "BUY" else ("ASK" if raw_side == "SELL" else raw_side)
-            results.append(PriceChangeEvent(timestamp=timestamp, price=price, side=side))
+            size = float(pc.get("size", "0") or "0")
 
-            # Build synthetic BookSnapshot from best_bid / best_ask if present.
-            # These are sent on every price_change and give us a real time-series of
-            # mid / spread without waiting for a new full book event.
+            results.append(PriceChangeEvent(
+                timestamp=timestamp,
+                price=price,
+                side=side,
+                size=size,
+            ))
+
+            # Synthetic BookSnapshot from best_bid / best_ask.
             # IMPORTANT: imbalance and total_depth are NOT available in price_change
-            # events — we set them to 0.0 (neutral) rather than fabricating values.
-            # The model was trained with real imbalance from the full book; injecting
-            # fake ±0.3 values causes distribution shift on clob_imb_* features.
-            # Zero is the least-bad neutral value (model treats it as no imbalance signal).
+            # events — set to 0.0 so synthetic books are excluded from imbalance/depth
+            # features (handled by the synthetic flag).
             raw_bid = pc.get("best_bid")
             raw_ask = pc.get("best_ask")
             if raw_bid is not None and raw_ask is not None:
@@ -300,14 +439,12 @@ class ClobFeatureAccumulator:
                     best_bid = float(raw_bid)
                     best_ask = float(raw_ask)
                     if best_ask > best_bid > 0:
-                        mid = (best_ask + best_bid) / 2.0
-                        spread = best_ask - best_bid
                         synth_books.append(BookSnapshot(
                             timestamp=timestamp,
                             best_ask=best_ask,
                             best_bid=best_bid,
-                            mid=mid,
-                            spread=spread,
+                            mid=(best_ask + best_bid) / 2.0,
+                            spread=best_ask - best_bid,
                             imbalance=0.0,    # unknown — not in price_change events
                             total_depth=0.0,  # unknown — not in price_change events
                             synthetic=True,
@@ -320,52 +457,30 @@ class ClobFeatureAccumulator:
     def _prune_buffer(self, buf: TokenBuffer, now: float) -> None:
         """Remove events older than max_buffer_secs."""
         cutoff = now - self._max_buffer_secs
-        if buf.book_events and buf.book_events[0].timestamp < cutoff:
-            # Binary-style prune: find first event within window
-            idx = 0
-            for i, b in enumerate(buf.book_events):
-                if b.timestamp >= cutoff:
-                    idx = i
-                    break
-            else:
-                idx = len(buf.book_events)
-            buf.book_events = buf.book_events[idx:]
 
-        if buf.price_events and buf.price_events[0].timestamp < cutoff:
-            idx = 0
-            for i, p in enumerate(buf.price_events):
-                if p.timestamp >= cutoff:
-                    idx = i
-                    break
-            else:
-                idx = len(buf.price_events)
-            buf.price_events = buf.price_events[idx:]
+        def _trim(lst):
+            if lst and lst[0].timestamp < cutoff:
+                idx = next((i for i, e in enumerate(lst) if e.timestamp >= cutoff), len(lst))
+                del lst[:idx]
+
+        _trim(buf.book_events)
+        _trim(buf.price_events)
 
     @staticmethod
     def _linear_slope(t: np.ndarray, y: np.ndarray) -> float:
-        """Compute linear regression slope (units of y per second).
-
-        Uses numpy polyfit degree 1 for efficiency.
-        """
+        """Compute linear regression slope (units of y per second)."""
         if len(t) < 2 or t[-1] == t[0]:
             return 0.0
         try:
-            coeffs = np.polyfit(t, y, 1)
-            return float(coeffs[0])
+            return float(np.polyfit(t, y, 1)[0])
         except (np.linalg.LinAlgError, ValueError):
             return 0.0
 
     @staticmethod
-    def _compute_ask_pressure(prices: List[PriceChangeEvent]) -> float:
-        """Compute ask pressure: fraction of consecutive ASK moves that went DOWN.
-
-        A declining ask = tighter market = bullish pressure.
-        Returns 0.5 (neutral) if no ASK price changes available.
-        """
-        ask_prices = [p.price for p in prices if p.side == "ASK"]
+    def _compute_ask_pressure_list(ask_prices: List[float]) -> float:
+        """Compute ask pressure: fraction of consecutive ASK moves that went DOWN."""
         if len(ask_prices) < 2:
             return 0.0
-
         moves_down = 0
         total_moves = 0
         for i in range(1, len(ask_prices)):
@@ -374,7 +489,6 @@ class ClobFeatureAccumulator:
                 total_moves += 1
                 if diff < 0:
                     moves_down += 1
-
         return float(moves_down / total_moves) if total_moves > 0 else 0.0
 
 
