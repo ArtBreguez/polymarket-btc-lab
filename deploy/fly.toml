@@ -6,9 +6,18 @@ primary_region = "ams"
 [env]
   PYTHONUNBUFFERED = "1"
 
+[processes]
+  app = "python -u live_trader.py"
+
 [[vm]]
   size = "performance-1x"
   memory = "2048mb"
 
-[processes]
-  app = "python -u live_trader.py"
+# Worker machine — no HTTP service, must never auto-stop
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+  processes = ["app"]
