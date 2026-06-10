@@ -63,7 +63,7 @@ GAMMA_HOST      = "https://gamma-api.polymarket.com"
 DATA_API        = "https://data-api.polymarket.com"
 CLOB_URL        = "https://clob.polymarket.com"
 CLOB_WS_URL     = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-BINANCE_WS      = "wss://stream.binance.com:9443/stream?streams=btcusdt@kline_1m/ethusdt@kline_1m/solusdt@kline_1m"
+BINANCE_WS      = "wss://stream.binance.com:9443/stream?streams=btcusdt@kline_1m"
 BINANCE_REST    = "https://api.binance.com/api/v3"
 
 HTTP_TIMEOUT    = 3    # seconds — tight budget for a 10s loop
@@ -121,8 +121,6 @@ from ws_manager import WebSocketManager, WSConfig
 
 _spot_buffers: dict[str, deque] = {
     "btcusdt": deque(maxlen=300),  # 5h of 1m candles — needed for btc_pre_4h_ret
-    "ethusdt": deque(maxlen=75),   # kept for future use; not used by v8
-    "solusdt": deque(maxlen=75),   # kept for future use; not used by v8
 }
 _spot_last_write = 0.0
 
@@ -359,6 +357,27 @@ async def _clob_on_connect(ws) -> None:
     if existing:
         await ws.send(json.dumps({"type": "Market", "assets_ids": existing}))
         log.info("CLOB WS re-subscribed %d tokens on connect", len(existing))
+
+        # Hydrate accumulator via REST /book on reconnect.
+        # The CLOB WS sends 1 book snapshot per subscribe, but it arrives a few
+        # seconds after connect. If the entry window fires during that gap the
+        # accumulator is empty. Pre-seeding via REST guarantees data immediately.
+        _acc = get_accumulator()
+        hydrated = 0
+        for tid in existing:
+            try:
+                r = _http.get(f"{CLOB_URL}/book", params={"token_id": tid}, timeout=3)
+                if r.ok:
+                    book = r.json()
+                    book["event_type"] = "book"
+                    book["asset_id"] = tid
+                    _acc.feed_event(tid, book)
+                    hydrated += 1
+            except Exception:
+                pass
+        if hydrated:
+            log.info("CLOB WS reconnect — hydrated accumulator for %d tokens via REST", hydrated)
+
     _clob_last_keepalive = time.time()
 
     # Drain any queued subscription requests that arrived before connect
@@ -417,24 +436,22 @@ async def _clob_on_message(msg) -> None:
                     _clob_price_ts[asset_id] = time.time()
         elif etype == "price_change":
             for change in ev.get("price_changes", []):
-                if change.get("side") == "ASK":
-                    asset_id = change.get("asset_id", "")
-                    price = float(change.get("price", 1))
-                    with _clob_prices_lock:
-                        # price_change fires on ANY book level change,
-                        # not just top-of-book. Two cases:
-                        # (a) price <= existing: tighter ask or same level — update.
-                        # (b) price > existing: could mean best offer was pulled
-                        #     and book worsened. Invalidate cache so HTTP
-                        #     fallback is used until next book snapshot.
-                        existing = _clob_prices.get(asset_id, 1.0)
-                        if price < 0.97:
-                            # Always update — whether tighter or worse, the server
-                            # is telling us the new best ask. Invalidating on
-                            # worse price (pop) was too aggressive: forced HTTP
-                            # fallback until next book snapshot, often seconds later.
-                            _clob_prices[asset_id] = price
-                            _clob_price_ts[asset_id] = time.time()
+                asset_id = change.get("asset_id", "")
+                if not asset_id:
+                    continue
+                # Polymarket sends best_ask directly on every price_change — use it.
+                # Much more reliable than filtering by side (WS uses "SELL"/"BUY",
+                # not "ASK"/"BID", so the old side=="ASK" filter never matched).
+                raw_best_ask = change.get("best_ask")
+                if raw_best_ask is not None:
+                    try:
+                        best_ask = float(raw_best_ask)
+                        if 0 < best_ask < 0.97:
+                            with _clob_prices_lock:
+                                _clob_prices[asset_id] = best_ask
+                                _clob_price_ts[asset_id] = time.time()
+                    except (ValueError, TypeError):
+                        pass
 
     # Drain pending subscriptions from external threads
     if _clob_ws_manager:
@@ -1709,8 +1726,9 @@ def settle_trades(trades: list[dict]) -> bool:
         updated = True
         # Resolve CLOB feature log with ground truth for v25 training
         resolve_clob_features(trade["slot_ts"], float(target_int))
-        log.info("SETTLED slot=%d | %s→%s | %s | P&L $%.2f",
-                 trade["slot_ts"], direction, actual, result, pnl)
+        log.info("SETTLED slot=%d | pred=%s actual=%s | %s | entry=$%.3f shares=%.0f cost=$%.2f P&L $%+.2f",
+                 trade["slot_ts"], direction, actual, result,
+                 entry, shares_out, cost, pnl)
     return updated
 
 
@@ -1813,7 +1831,16 @@ def run(client, model, features):
                     buf_data = json.loads(SPOT_BUFFER.read_text())
                     buf_age = now - buf_data.get("updated_at", 0)
                     btc_len = len(buf_data.get("btcusdt", []))
-                    log.info("SPOT-BUFFER age=%ds btc_candles=%d", buf_age, btc_len)
+                    # Check 4h lookback coverage (need ~240 candles for btc_pre_4h_ret)
+                    import numpy as _np
+                    _candles = buf_data.get("btcusdt", [])
+                    _ts_arr = [c[0] for c in _candles] if _candles else []
+                    _now_ts = now
+                    _covered_1h  = sum(1 for t in _ts_arr if _now_ts - 3600 <= t <= _now_ts)
+                    _covered_4h  = sum(1 for t in _ts_arr if _now_ts - 14400 <= t <= _now_ts)
+                    _buf_warn = " ⚠️ LOW_4H" if _covered_4h < 180 else ""
+                    log.info("SPOT-BUFFER age=%ds btc_candles=%d | 1h=%d 4h=%d candles%s",
+                             buf_age, btc_len, _covered_1h, _covered_4h, _buf_warn)
                 except Exception as e:
                     log.warning("SPOT-BUFFER read error: %s", e)
             else:
@@ -1942,7 +1969,16 @@ def run(client, model, features):
             prob_up = predict_proba(model, X)
             direction  = "UP" if prob_up >= 0.5 else "DOWN"
             confidence = prob_up if direction == "UP" else 1.0 - prob_up
-            log.info("  Prediction: %s  conf=%.1f%%", direction, confidence*100)
+            log.info("  Prediction: %s  conf=%.1f%%  prob_up=%.4f", direction, confidence*100, prob_up)
+            # Log top-10 features by absolute model importance for diagnosis
+            _top = ["ob_mid_drift","ob_mid","ob_weighted_imb","btc_inslot_ret",
+                    "btc_pre_5m_ret","ob_imb_w0","btc_spot_vol_ratio","ob_imb_momentum",
+                    "prev_slot_up_ratio_1","ob_depth_change"]
+            _fv = " | ".join(
+                f"{f.replace('btc_','b_').replace('ob_','o_').replace('prev_slot_','ps_')}={feat.get(f,0.0):.4f}"
+                for f in _top
+            )
+            log.info("  TOP FEATS: %s", _fv)
 
             # Log CLOB features for future v25 training
             clob_feats = {k: feat.get(k, 0.0) for k in CLOB_FEATURE_NAMES}
@@ -2021,7 +2057,8 @@ def run(client, model, features):
             #     At ask=$0.70, risk $0.70 to win $0.28 (2.5:1 against)
             #     $0.70-$0.80 bucket lost $29 on 18 trades despite 50% WR
             if not (0.42 <= ask_price <= 0.65):
-                log.info("  Skip — ask $%.3f outside [0.42, 0.65] — unfavorable risk/reward", ask_price)
+                log.info("  Skip — ask $%.3f outside [0.42, 0.65] | model=%s conf=%.1f%% prob_up=%.4f",
+                         ask_price, direction, confidence*100, prob_up)
                 trades.append({"slot_ts": slot_ts, "direction": direction,
                                 "confidence": round(confidence, 4),
                                 "entry_price": round(ask_price, 4), "status": "skipped",
@@ -2098,10 +2135,23 @@ def run(client, model, features):
                 log.warning("  Balance unknown — skipping trade (cannot verify funds)")
                 continue
 
-            actual_cost = round(shares * ask_price, 4)
+            # order_price = ask + 1 tick for taker-aggressive fill (see placement block below)
+            TICK = 0.01
+            order_price = min(round(ask_price + TICK, 2), 0.96)
+            actual_cost = round(shares * order_price, 4)
             sizing_mode = "auto" if AUTO_SHARES else "fixed"
-            log.info("  %d shares @ $%.3f — cost $%.2f [%s, bal=$%.2f]",
-                     int(shares), ask_price, actual_cost, sizing_mode, usdc or 0)
+            if AUTO_SHARES and usdc is not None:
+                _floor, _ceil = AUTO_SHARES_BAL_FLOOR, AUTO_SHARES_BAL_CEIL
+                _t = max(0.0, min(1.0, (usdc - _floor) / max(_ceil - _floor, 1)))
+                _shares_by_interp = AUTO_SHARES_MIN + _t * (AUTO_SHARES_MAX - AUTO_SHARES_MIN)
+                _max_cost = usdc * 0.10
+                _shares_by_risk  = _max_cost / (ask_price + 1e-8)
+                log.info("  %d shares @ $%.3f — cost $%.2f [auto bal=$%.2f t=%.2f interp=%.1f risk_cap=%.1f final=%d]",
+                         int(shares), ask_price, actual_cost, usdc,
+                         _t, _shares_by_interp, _shares_by_risk, int(shares))
+            else:
+                log.info("  %d shares @ $%.3f — cost $%.2f [%s, bal=$%.2f]",
+                         int(shares), ask_price, actual_cost, sizing_mode, usdc or 0)
 
             # ── Balance check against real order cost ──────────────────────
             if usdc is not None:
@@ -2111,15 +2161,19 @@ def run(client, model, features):
                               usdc, required)
                     continue
 
-            # ── Place limit order at the validated ask price ──────────────────
-            # Use limit (not market) to guarantee we pay the price we validated.
-            # Market orders can sweep stale/extreme prices in the book.
-            log.info("  Placing LIMIT BUY %s — %.2f shares @ $%.3f | edge_ask=%.1f%% edge_mid=%.1f%%",
-                     direction, shares, ask_price,
+            # ── Place limit order at ask + 1 tick (taker-aggressive) ──────────
+            # Polymarket tick size is 0.01. Posting exactly at the ask often races
+            # against the market maker pulling the offer — we end up unfilled and
+            # then the market moves away. Adding 1 tick makes us the best bid
+            # (crossing the spread slightly) and dramatically improves fill rate.
+            # We validated edge at ask_price already; the 1-tick premium (max $0.05
+            # on a 5-share order) is well within the 7%+ edge we require.
+            log.info("  Placing LIMIT BUY %s — %.2f shares @ $%.3f (+1 tick from ask $%.3f) | edge_ask=%.1f%% edge_mid=%.1f%%",
+                     direction, shares, order_price, ask_price,
                      edge_vs_ask * 100, (edge_vs_mid or 0) * 100)
             try:
                 result = client.place_limit_order(
-                    token_id=token_id, side="BUY", price=ask_price, size=shares
+                    token_id=token_id, side="BUY", price=order_price, size=shares
                 )
                 order_id = getattr(result, "order_id", None) or str(result)
                 log.info("  Order placed: %s", str(order_id)[:20])
@@ -2144,10 +2198,19 @@ def run(client, model, features):
                         poll_errors = 0  # reset on success
                     except Exception as e:
                         poll_errors += 1
-                        log.warning("  get_order poll failed (%d/3): %s", poll_errors, e)
+                        err_str = str(e)
+                        # "did not match expected shape" usually means order was instantly filled
+                        # and the endpoint returned a closed-order object instead of OpenOrder
+                        if "expected shape" in err_str or "did not match" in err_str:
+                            log.info("  get_order shape mismatch (likely instant fill) (%d/3)", poll_errors)
+                        else:
+                            log.warning("  get_order poll failed (%d/3): %s", poll_errors, e)
                         if poll_errors >= 3:
                             # Cannot confirm fill status — do NOT cancel; treat as open
-                            log.error("  get_order failed 3x — recording as open to avoid cancelling a filled order")
+                            if "expected shape" in err_str or "did not match" in err_str:
+                                log.info("  get_order shape mismatch 3x — order likely instantly filled, recording as open")
+                            else:
+                                log.error("  get_order failed 3x — recording as open to avoid cancelling a filled order")
                             filled = True  # conservatively assume filled
                             break
 
