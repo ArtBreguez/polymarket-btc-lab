@@ -1280,6 +1280,10 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
     feat["hour_cos"] = float(np.cos(2 * np.pi * hour / 24.0))
     # hour_sin: cyclical hour encoding (sin component) — v23 uses this
     feat["hour_sin"] = float(np.sin(2 * np.pi * hour / 24.0))
+    # dow_sin/cos: day-of-week cyclical encoding — v28 parity
+    dow = datetime.fromtimestamp(slot_ts, tz=timezone.utc).weekday()
+    feat["dow_sin"] = float(np.sin(2 * np.pi * dow / 7))
+    feat["dow_cos"] = float(np.cos(2 * np.pi * dow / 7))
     # btc_up_ratio_stability: std of 6 sub-windows (v23 feature)
     feat["btc_up_ratio_stability"] = feat.get("btc_up_ratio_stability", 0.0)
     # time-weighted up ratio (recency bias) — MUST match training formula:
@@ -1311,14 +1315,37 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
                 feat[f"prev_slot_up_ratio_{lag}"]  = 0.5
                 feat[f"prev_slot_n_ticks_{lag}"]   = 0.0
                 feat[f"prev_slot_vol_{lag}"]       = 0.0
+                feat[f"lag_{lag}_outcome"]         = 0.5
             else:
                 feat[f"prev_slot_up_ratio_{lag}"]  = float(h.get("up_ratio", 0.5))
                 feat[f"prev_slot_n_ticks_{lag}"]   = float(h.get("n_ticks", 0.0))
                 feat[f"prev_slot_vol_{lag}"]       = float(h.get("vol_total", 0.0))
+                feat[f"lag_{lag}_outcome"]         = float(h.get("target", 0.5))
         else:
             feat[f"prev_slot_up_ratio_{lag}"]  = 0.5
             feat[f"prev_slot_n_ticks_{lag}"]   = 0.0
             feat[f"prev_slot_vol_{lag}"]       = 0.0
+            feat[f"lag_{lag}_outcome"]         = 0.5
+
+    # lag_streak: consecutive same-direction outcomes — v28 parity
+    lag_streak = 0
+    streak_dir = None
+    for lag in [1, 2, 3, 4, 5]:
+        if n_hist >= lag:
+            h = hist[-lag]
+            time_gap = slot_ts - h.get("slot_ts", 0)
+            if time_gap > lag * SLOT_DURATION * 3:
+                break  # stale — stop streak
+            t_val = h.get("target")
+            if t_val is None:
+                break
+            if lag == 1:
+                streak_dir = int(t_val); lag_streak = 1
+            elif int(t_val) == streak_dir:
+                lag_streak += 1
+            else:
+                break
+    feat["lag_streak"] = float(lag_streak)
 
     # ── Multi-scale up_ratio zscore (5/20 slots) ─────────────────────────────
     # Matches training: zscore of current up_ratio vs recent history mean/std.
