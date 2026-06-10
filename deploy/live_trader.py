@@ -1951,15 +1951,11 @@ def run(client, model, features):
             direction  = "UP" if prob_up >= 0.5 else "DOWN"
             confidence = prob_up if direction == "UP" else 1.0 - prob_up
             log.info("  Prediction: %s  conf=%.1f%%  prob_up=%.4f", direction, confidence*100, prob_up)
-            # Log top-10 features by absolute model importance for diagnosis
-            _top = ["ob_mid_drift","ob_mid","ob_weighted_imb","btc_inslot_ret",
-                    "btc_pre_5m_ret","ob_imb_w0","btc_spot_vol_ratio","ob_imb_momentum",
-                    "prev_slot_up_ratio_1","ob_depth_change"]
-            _fv = " | ".join(
-                f"{f.replace('btc_','b_').replace('ob_','o_').replace('prev_slot_','ps_')}={feat.get(f,0.0):.4f}"
-                for f in _top
-            )
-            log.info("  TOP FEATS: %s", _fv)
+            # Log all model features (sorted by |value| desc) for diagnosis
+            _feat_vals = [(f, feat.get(f, 0.0)) for f in features]
+            _feat_vals.sort(key=lambda x: abs(x[1]), reverse=True)
+            _fv = " | ".join(f"{f}={v:.4f}" for f, v in _feat_vals)
+            log.info("  FEATS (%d): %s", len(features), _fv)
 
             # Log CLOB features for future v25 training
             clob_feats = {k: feat.get(k, 0.0) for k in CLOB_FEATURE_NAMES}
