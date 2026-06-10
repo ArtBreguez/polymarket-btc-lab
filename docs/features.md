@@ -68,8 +68,8 @@ slot_ts                     +60s (OBS_SECS)       +170s          +240s      +300
 
 ## 3. Tabela canônica de features
 
-Total: **104 features** (antes da seleção de importância).  
-Legenda: ✅ idêntico | ⚠️ divergência aceita | 🚫 candidata a remoção
+Total: **88 features** (após remoção das 16 inviáveis; antes da seleção de importância).  
+Legenda: ✅ idêntico | ⚠️ divergência aceita
 
 ### Grupo A — Spot Binance (15 features)
 
@@ -536,7 +536,8 @@ Antes de rodar `modal run scripts/train_v28_modal.py` (ou v29):
 | v27 | `ob_features_full.parquet` com clob_* incluídos. Fix prefixo `clob_*` no treino. |
 | **v28** | Full train==live parity: tick features no treino, dow_sin/cos, hour_x_up_ratio/tw_ur, todos cross-features. lag_{1..5}_outcome e lag_streak no live. 104 features, diff=0. |
 | **v28 patch** | Eliminação de todas as divergências: get_features() slot-anchored [108,168); get_ob_pc_features() [0,168); get_windowed_imbalance() real book snaps; reset_token() na troca de slot; MAX_BUFFER_SECS=360. |
-| **v29 (plan)** | Remover 15 features problemáticas (4 DEAD + 4 redundantes + 2 ruidosas + 2 quase-constantes + 3 esparsas live). 104→89 candidatas. Auto feature selection aprimorado. |
+| **v28 → 88f** | **Remoção de 16 features inviáveis.** DEAD: btc_up_w2-5 (OBS=60s). Redundante: btc_vol_up/dn, btc_vwap_spread, btc_signal_conviction, btc_up_w5_zscore. Ruidoso: btc_vwap_up/dn. Quase-constante: btc_dist_5k/10k. Esparso live: ob_imb_w0, ob_pc_count, ob_fill_imbalance. btc_momentum simplificado para w1-w0. 104→88 candidatas. Paridade ✅ confirmada. |
+| **v29 (plan)** | Auto feature selection com 88 candidatas limpas. Optuna + purged CV. |
 
 ---
 
