@@ -1267,9 +1267,9 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
                 feat[f"prev_slot_vol_{lag}"]       = 0.0
                 feat[f"lag_{lag}_outcome"]         = 0.5
             else:
-                feat[f"prev_slot_up_ratio_{lag}"]  = float(h.get("up_ratio", 0.5))
-                feat[f"prev_slot_n_ticks_{lag}"]   = float(h.get("n_ticks", 0.0))
-                feat[f"prev_slot_vol_{lag}"]       = float(h.get("vol_total", 0.0))
+                feat[f"prev_slot_up_ratio_{lag}"]  = float(h.get("up_ratio") or 0.5)
+                feat[f"prev_slot_n_ticks_{lag}"]   = float(h.get("n_ticks") or 0.0)
+                feat[f"prev_slot_vol_{lag}"]       = float(h.get("vol_total") or 0.0)
                 feat[f"lag_{lag}_outcome"]         = float(h.get("target") or 0.5)
         else:
             feat[f"prev_slot_up_ratio_{lag}"]  = 0.5
@@ -1361,7 +1361,7 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
         )
         # Only keep the 5 OK clob features; discard the divergent ones
         CLOB_KEEP = {"clob_spread_mean", "clob_spread_trend",
-                     "clob_mid_velocity", "clob_mid_volatility", "clob_ask_pressure"}
+                     "clob_mid_volatility", "clob_ask_pressure"}
         for k, v in clob_feats.items():
             if k in CLOB_KEEP:
                 feat[k] = v
