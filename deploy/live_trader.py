@@ -564,25 +564,27 @@ def compute_shares(balance_usdc: float, ask_price: float) -> float:
 
 # ── Model loading ──────────────────────────────────────────────────────────────
 def load_model():
-    """Download champion.pkl from HuggingFace if not cached, then load it."""
-    if not MODEL_PATH.exists():
-        log.info("Downloading champion model from HuggingFace (%s)...", HF_REPO)
-        try:
-            from huggingface_hub import hf_hub_download
-            path = hf_hub_download(
-                repo_id=HF_REPO,
-                filename="champion.pkl",
-                repo_type="model",
-                token=HF_TOKEN,
-                local_dir="/tmp",
-            )
-            # hf_hub_download saves to /tmp/champion.pkl (or subdir) — normalise
-            import shutil
-            if Path(path) != MODEL_PATH:
-                shutil.copy(path, MODEL_PATH)
-            log.info("Champion model downloaded: %s", MODEL_PATH)
-        except Exception as e:
-            raise RuntimeError(f"Failed to download champion model from HF: {e}") from e
+    """Download champion.pkl from HuggingFace (always fresh), then load it."""
+    if MODEL_PATH.exists():
+        MODEL_PATH.unlink()
+        log.info("Removed stale champion cache — downloading fresh from HF...")
+    log.info("Downloading champion model from HuggingFace (%s)...", HF_REPO)
+    try:
+        from huggingface_hub import hf_hub_download
+        path = hf_hub_download(
+            repo_id=HF_REPO,
+            filename="champion.pkl",
+            repo_type="model",
+            token=HF_TOKEN,
+            local_dir="/tmp",
+        )
+        # hf_hub_download saves to /tmp/champion.pkl (or subdir) — normalise
+        import shutil
+        if Path(path) != MODEL_PATH:
+            shutil.copy(path, MODEL_PATH)
+        log.info("Champion model downloaded: %s", MODEL_PATH)
+    except Exception as e:
+        raise RuntimeError(f"Failed to download champion model from HF: {e}") from e
     with open(MODEL_PATH, "rb") as f:
         bundle = pickle.load(f)
     log.info("Model loaded: %d features, WF AUC=%.3f, ensemble=%s",
