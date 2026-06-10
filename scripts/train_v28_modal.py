@@ -188,8 +188,11 @@ def train_v28():
     ob_df = pd.read_parquet(str(ob_path))
     ob_df["market_id"] = ob_df["market_id"].astype(str)
     ob_by_market = ob_df.set_index("market_id").to_dict("index")
-    ob_cols = [c for c in ob_df.columns if c != "market_id"]
-    log.info("OB features: %d markets, %d features: %s", len(ob_df), len(ob_cols), ob_cols[:5])
+    # Exclude features with poor live coverage (sparse, quasi-constant, or unreliable)
+    OB_EXCLUDED = {"ob_imb_w0", "ob_pc_count", "ob_fill_imbalance"}
+    ob_cols = [c for c in ob_df.columns if c != "market_id" and c not in OB_EXCLUDED]
+    log.info("OB features: %d markets, %d features (excluded %s): %s",
+             len(ob_df), len(ob_cols), OB_EXCLUDED, ob_cols[:5])
 
     # ══════════════════════════════════════════════════════════════════════
     # STEP 3: LOAD BINANCE SPOT
@@ -353,14 +356,12 @@ def train_v28():
         else:
             feat["btc_pre_1h_4h_ratio"] = 0.0
 
-        # Round-number proximity (matches live build_spot_features)
+        # Round-number proximity — only btc_dist_1k (dist_5k/10k removed: quasi-constant for BTC ~$95k)
         if px_now > 0:
             px_k = px_now / 1000
-            feat["btc_dist_1k"]  = float(min(px_k - math.floor(px_k), math.ceil(px_k) - px_k))
-            feat["btc_dist_5k"]  = float(abs(px_now % 5000) / 5000)
-            feat["btc_dist_10k"] = float(abs(px_now % 10000) / 10000)
+            feat["btc_dist_1k"] = float(min(px_k - math.floor(px_k), math.ceil(px_k) - px_k))
         else:
-            feat["btc_dist_1k"] = feat["btc_dist_5k"] = feat["btc_dist_10k"] = 0.5
+            feat["btc_dist_1k"] = 0.5
 
         # Volume ratio
         feat["btc_spot_vol_ratio"] = (
@@ -403,26 +404,24 @@ def train_v28():
 
             up_tks = [t for t in ticks if t.get("outcome") == "Up"]
             dn_tks = [t for t in ticks if t.get("outcome") == "Down"]
-            vwap_up = sum(t["price"] * t["size_usdc"] for t in up_tks) / (vol_up + 1e-8) if up_tks else 0.5
-            vwap_dn = sum(t["price"] * t["size_usdc"] for t in dn_tks) / (vol_dn + 1e-8) if dn_tks else 0.5
 
             def _ur_w(subset):
                 vu = sum(t["size_usdc"] for t in subset if t.get("outcome") == "Up")
                 tt = sum(t["size_usdc"] for t in subset) + 1e-8
                 return float(vu / tt)
 
-            # 6x30s sub-windows (only 2 real windows for OBS_SECS=60, rest = 0.5 fill)
+            # 2x30s sub-windows (only w0/w1 real for OBS_SECS=60; w2-w5 always 0.5 → removed)
             sw = {}
             n_real_windows = OBS_SECS // 30  # 2
-            for i in range(6):
+            for i in range(2):
                 t0_w, t1_w = i * 30, (i + 1) * 30
                 sub = [t for t in ticks if t0_w <= t["t_sec"] < t1_w]
                 sw[f"btc_up_w{i}"] = _ur_w(sub) if sub else 0.5
 
-            w_vals = [sw[f"btc_up_w{i}"] for i in range(6)]
-            btc_momentum = float(np.mean(w_vals[3:]) - np.mean(w_vals[:3]))
+            w_vals = [sw[f"btc_up_w{i}"] for i in range(2)]
+            btc_momentum = float(sw["btc_up_w1"] - sw["btc_up_w0"])  # w1 - w0 (only real windows)
             # Stability: std of real windows only
-            up_ratio_stability = float(np.std(w_vals[:n_real_windows]))
+            up_ratio_stability = float(np.std(w_vals))
 
             avg_up_sz = float(sum(t["size_usdc"] for t in up_tks) / (len(up_tks) + 1e-8))
             avg_dn_sz = float(sum(t["size_usdc"] for t in dn_tks) / (len(dn_tks) + 1e-8))
@@ -433,16 +432,10 @@ def train_v28():
             feat.update({
                 "btc_up_ratio":           cur_up_ratio,
                 "btc_n_ticks":            float(n),
-                "btc_vol_up":             float(vol_up),
-                "btc_vol_dn":             float(vol_dn),
-                "btc_vwap_up":            float(vwap_up),
-                "btc_vwap_dn":            float(vwap_dn),
-                "btc_vwap_spread":        float(vwap_up - vwap_dn),
                 "btc_buy_ratio":          float(sum(t["size_usdc"] for t in ticks if t.get("side") == "BUY") / total),
                 "btc_momentum":           btc_momentum,
                 "btc_size_disparity":     size_disparity,
                 "btc_up_ratio_stability": up_ratio_stability,
-                "btc_signal_conviction":  float(cur_up_ratio * (1.0 - up_ratio_stability)),
                 **sw,
             })
 
@@ -453,16 +446,14 @@ def train_v28():
             w_exp  = np.exp(-0.02 * (OBS_SECS - t_arr))
             feat["btc_tw_up_ratio"] = float(np.sum(up_arr * sz_arr * w_exp) / (np.sum(sz_arr * w_exp) + 1e-9))
         else:
-            # No ticks — neutral fill (matches live)
+            # No ticks — neutral fill
             cur_up_ratio = 0.5
             feat.update({
                 "btc_up_ratio": 0.5, "btc_n_ticks": 0.0,
-                "btc_vol_up": 0.0,   "btc_vol_dn": 0.0,
-                "btc_vwap_up": 0.5,  "btc_vwap_dn": 0.5, "btc_vwap_spread": 0.0,
                 "btc_buy_ratio": 0.5, "btc_momentum": 0.0,
                 "btc_size_disparity": 0.0, "btc_up_ratio_stability": 0.0,
-                "btc_signal_conviction": 0.0, "btc_tw_up_ratio": 0.5,
-                **{f"btc_up_w{i}": 0.5 for i in range(6)},
+                "btc_tw_up_ratio": 0.5,
+                "btc_up_w0": 0.5, "btc_up_w1": 0.5,
             })
 
         # ── D. LAG FEATURES (from previous resolved slots) ───────────
@@ -519,11 +510,9 @@ def train_v28():
             mu20 = np.mean(hist_vals); sd20 = max(np.std(hist_vals), 0.01)
             feat["lag_ur_zscore_20"] = float(np.clip((prev_ur_1 - mu20) / sd20, -5, 5))
             feat["btc_up_ratio_zscore_20s"] = float(np.clip((cur_up_ratio - mu20) / sd20, -5, 5))
-            feat["btc_up_w5_zscore"] = float(np.clip((feat.get("btc_up_w5", 0.5) - mu20) / sd20, -5, 5))
         else:
             feat["lag_ur_zscore_20"] = 0.0
             feat["btc_up_ratio_zscore_20s"] = 0.0
-            feat["btc_up_w5_zscore"] = 0.0
 
         hist5 = hist_vals[:5]
         if len(hist5) >= 2:

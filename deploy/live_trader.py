@@ -639,7 +639,7 @@ def build_spot_features(slot_ts: int) -> dict:
         "btc_pre_30m_ret": 0.0, "btc_pre_30m_vol": 0.0,
         "btc_pre_1h_ret": 0.0,  "btc_pre_1h_vol": 0.0,
         "btc_pre_4h_ret": 0.0,  "btc_pre_4h_vol": 0.0,
-        "btc_dist_1k": 0.5, "btc_dist_5k": 0.5, "btc_dist_10k": 0.5,
+        "btc_dist_1k": 0.5,
     }
     if not SPOT_BUFFER.exists():
         log.warning("spot_buffer missing — filling zeros")
@@ -710,10 +710,8 @@ def build_spot_features(slot_ts: int) -> dict:
     if px_obs_end > 0:
         px_k = px_obs_end / 1000
         feat["btc_dist_1k"]  = float(min(px_k - math.floor(px_k), math.ceil(px_k) - px_k))
-        feat["btc_dist_5k"]  = float(abs(px_obs_end % 5000) / 5000)
-        feat["btc_dist_10k"] = float(abs(px_obs_end % 10000) / 10000)
     else:
-        feat["btc_dist_1k"] = feat["btc_dist_5k"] = feat["btc_dist_10k"] = 0.5
+        feat["btc_dist_1k"] = 0.5
 
     # 1h/4h ratio — (px_now - px_1h_ago) / (px_now - px_4h_ago)
     # MUST use px at observation end (slot_ts + OBS_SECS) to match training
@@ -1084,21 +1082,19 @@ def _build_ob_features(up_token_id: str) -> dict:
             "ob_spread_end":    float(open_snap.get("spread", 0.02)),
             "ob_depth_change":  0.0,
             "ob_imb_momentum":  0.0,
-            # Windowed imbalance: all same as open (no temporal variation)
-            "ob_imb_w0":        float(open_snap["imbalance"]),
+            # ob_imb_w1/w2 from WS accumulator will overwrite; w0 removed (sparse live)
             "ob_imb_w1":        float(open_snap["imbalance"]),
             "ob_imb_w2":        float(open_snap["imbalance"]),
         }
 
     # ── Temporal features from open vs close ──────────────────────────
-    ob_mid_drift   = float(snap["mid"] - open_snap["mid"])
+    ob_mid_drift    = float(snap["mid"] - open_snap["mid"])
     ob_imb_momentum = float(snap["imbalance"] - open_snap["imbalance"])
 
-    # Windowed imbalance: split the time range into 3 windows
-    # open=w0, interpolated midpoint=w1, close=w2
-    ob_imb_w0 = float(open_snap["imbalance"])
+    # Windowed imbalance w1/w2 — interpolated fallback (overwritten by WS accumulator)
+    # ob_imb_w0 removed: live coverage too sparse (1 real book snap from WS)
     ob_imb_w2 = float(snap["imbalance"])
-    ob_imb_w1 = float((ob_imb_w0 + ob_imb_w2) / 2.0)  # interpolated middle
+    ob_imb_w1 = float((float(open_snap["imbalance"]) + ob_imb_w2) / 2.0)
 
     # Use close snapshot for all other features
     book = snap
@@ -1154,8 +1150,7 @@ def _build_ob_features(up_token_id: str) -> dict:
             "ob_spread_end":    float(spread),
             "ob_depth_change":  float(total_depth - open_snap.get("total_depth", total_depth)),
             "ob_imb_momentum":  ob_imb_momentum,
-            # Windowed imbalance — open/mid/close
-            "ob_imb_w0":        ob_imb_w0,
+            # Windowed imbalance — w1/w2 only (w0 removed: sparse live)
             "ob_imb_w1":        ob_imb_w1,
             "ob_imb_w2":        ob_imb_w2,
         }
@@ -1203,71 +1198,50 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
 
         up_tks = [t for t in ticks if t.get("outcome") == "Up"]
         dn_tks = [t for t in ticks if t.get("outcome") == "Down"]
-        vwap_up = sum(t["price"] * t["size_usdc"] for t in up_tks) / (vol_up + 1e-8) if up_tks else 0.5
-        vwap_dn = sum(t["price"] * t["size_usdc"] for t in dn_tks) / (vol_dn + 1e-8) if dn_tks else 0.5
 
         def _ur_w(subset: list[dict]) -> float:
             vu = sum(t["size_usdc"] for t in subset if t.get("outcome") == "Up")
             tt = sum(t["size_usdc"] for t in subset) + 1e-8
             return float(vu / tt)
 
-        # 6x30s sub-windows
+        # 2x30s sub-windows (w0/w1 only — w2-w5 always 0.5 with OBS=60s, removed)
         sw: dict = {}
-        for i in range(6):
+        for i in range(2):
             t0_w, t1_w = i * 30, (i + 1) * 30
             sub = [t for t in ticks if t0_w <= t["t_sec"] < t1_w]
             sw[f"btc_up_w{i}"] = _ur_w(sub) if sub else 0.5
 
-        # Momentum: mean(last 3 windows) - mean(first 3 windows)
-        w_vals = [sw[f"btc_up_w{i}"] for i in range(6)]
-        btc_momentum = float(np.mean(w_vals[3:]) - np.mean(w_vals[:3]))
+        # Momentum: w1 - w0 (only real windows)
+        btc_momentum = float(sw["btc_up_w1"] - sw["btc_up_w0"])
 
-        # ── v9 features ────────────────────────────────────────────────────────
-        # Signal consistency across 6 windows (needed by btc_signal_conviction)
-        w_vals_list = [sw[f"btc_up_w{i}"] for i in range(6)]
-        # v24 fix: use only REAL windows for stability (not padded 0.5)
-        # Training uses std(w_vals[:n_windows]) where n_windows = obs_secs // 30
-        n_real_windows = OBSERVE_SECS // 30  # 2 for obs_secs=60
-        up_ratio_stability = float(np.std(w_vals_list[:n_real_windows]))
+        # Stability: std of 2 real windows
+        up_ratio_stability = float(np.std([sw["btc_up_w0"], sw["btc_up_w1"]]))
 
         # Size disparity: avg trade size Up vs Down
-        up_tks_v9   = [t for t in ticks if t.get("outcome") == "Up"]
-        dn_tks_v9   = [t for t in ticks if t.get("outcome") == "Down"]
-        avg_up_sz   = float(sum(t["size_usdc"] for t in up_tks_v9) / (len(up_tks_v9) + 1e-8))
-        avg_dn_sz   = float(sum(t["size_usdc"] for t in dn_tks_v9) / (len(dn_tks_v9) + 1e-8))
+        avg_up_sz  = float(sum(t["size_usdc"] for t in up_tks) / (len(up_tks) + 1e-8))
+        avg_dn_sz  = float(sum(t["size_usdc"] for t in dn_tks) / (len(dn_tks) + 1e-8))
         size_disparity = float(avg_up_sz - avg_dn_sz)
 
+        cur_up_ratio = float(vol_up / total)
+
         feat.update({
-            "btc_up_ratio":    float(vol_up / total),
-            "btc_n_ticks":     float(n),
-            "btc_vol_up":      float(vol_up),
-            "btc_vol_dn":      float(vol_dn),
-            "btc_vwap_up":     float(vwap_up),
-            "btc_vwap_dn":     float(vwap_dn),
-            "btc_vwap_spread": float(vwap_up - vwap_dn),
-            "btc_buy_ratio":   float(sum(t["size_usdc"] for t in ticks if t.get("side") == "BUY") / (total + 1e-8)),
-            "btc_momentum":    btc_momentum,
-            # v9
+            "btc_up_ratio":           cur_up_ratio,
+            "btc_n_ticks":            float(n),
+            "btc_buy_ratio":          float(sum(t["size_usdc"] for t in ticks if t.get("side") == "BUY") / total),
+            "btc_momentum":           btc_momentum,
             "btc_size_disparity":     size_disparity,
             "btc_up_ratio_stability": up_ratio_stability,
-            # v10 interaction features
-            "btc_signal_conviction":  float((vol_up / total) * (1.0 - up_ratio_stability)),
             **sw,
         })
-        cur_up_ratio = float(vol_up / total)
     else:
-        # No ticks — neutral fill (only v21 features)
-        feat.update({
-            "btc_up_ratio": 0.5,
-            "btc_n_ticks": 0.0,
-            "btc_vol_up": 0.0, "btc_vol_dn": 0.0,
-            "btc_vwap_up": 0.5, "btc_vwap_dn": 0.5, "btc_vwap_spread": 0.0,
-            "btc_buy_ratio": 0.5, "btc_momentum": 0.0,
-            "btc_size_disparity": 0.0,
-            "btc_signal_conviction": 0.0,
-            **{f"btc_up_w{i}": 0.5 for i in range(6)},
-        })
+        # No ticks — neutral fill
         cur_up_ratio = 0.5
+        feat.update({
+            "btc_up_ratio": 0.5, "btc_n_ticks": 0.0,
+            "btc_buy_ratio": 0.5, "btc_momentum": 0.0,
+            "btc_size_disparity": 0.0, "btc_up_ratio_stability": 0.0,
+            "btc_up_w0": 0.5, "btc_up_w1": 0.5,
+        })
 
     # ── Historical zscore features (from ring buffer) ──────────────────────────
     # _slot_history: list of {"slot_ts", "up_ratio", "target", "sw": [6 floats]}
@@ -1361,14 +1335,10 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
         if sd20 < 0.01:
             sd20 = 0.01
         feat["btc_up_ratio_zscore_20s"] = float(np.clip((cur_up_ratio - mu20) / sd20, -5.0, 5.0))
-        # v22: zscore of last sub-window (w5) vs 20-slot history
-        feat["btc_up_w5_zscore"] = float(np.clip((feat.get("btc_up_w5", 0.5) - mu20) / sd20, -5.0, 5.0))
-        # v26: lag_ur_zscore_20 uses prev_slot_up_ratio_1 as current value
         prev_ur_1 = feat.get("prev_slot_up_ratio_1", 0.5)
         feat["lag_ur_zscore_20"] = float(np.clip((prev_ur_1 - mu20) / sd20, -5.0, 5.0))
     else:
         feat["btc_up_ratio_zscore_20s"] = 0.0
-        feat["btc_up_w5_zscore"] = 0.0
         feat["lag_ur_zscore_20"] = 0.0
 
     hist_vals_5 = _hist_ur(5)
@@ -1431,18 +1401,19 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
         )
         feat.update(pc_feats)
 
-        # ob_imb_w0/w1/w2: windowed imbalance from real book snapshots
+        # ob_imb_w0/1/2: windowed imbalance from real book snapshots
         # Overwrites the interpolated values from _build_ob_features if we have real data.
+        # ob_imb_w0 excluded from model (sparse live coverage) — only w1/w2 used.
         imb_windows = _acc.get_windowed_imbalance(
             up_token_id,
             slot_ts=slot_ts,
-            windows=[(0, 60), (60, 120), (120, 168)],
+            windows=[(60, 120), (120, 168)],
         )
-        # Only override if we have at least one real data point in the window
-        # (value 0.0 from get_windowed_imbalance means no data — keep interpolated fallback)
-        for k, v in imb_windows.items():
-            if v != 0.0 or feat.get(k, None) is None:
-                feat[k] = v
+        # Map to ob_imb_w1/w2 (index shifts since we skip w0)
+        if "ob_imb_w0" in imb_windows:
+            feat["ob_imb_w1"] = imb_windows["ob_imb_w0"]
+        if "ob_imb_w1" in imb_windows:
+            feat["ob_imb_w2"] = imb_windows["ob_imb_w1"]
 
     # ── Final: fill any remaining model features with context-aware defaults ────
     _neutral_defaults = {
@@ -1454,8 +1425,7 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
         "ob_spread":       0.02,
         "ob_pc_up_ratio":  0.5,   # neutral — no directional info
         "ob_pc_volatility": 0.0,
-        "ob_pc_count":     0.0,
-        "ob_fill_imbalance": 0.0,
+
     }
     for f in features:
         if f not in feat:
