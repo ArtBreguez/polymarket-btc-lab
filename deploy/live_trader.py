@@ -1270,7 +1270,7 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
                 feat[f"prev_slot_up_ratio_{lag}"]  = float(h.get("up_ratio", 0.5))
                 feat[f"prev_slot_n_ticks_{lag}"]   = float(h.get("n_ticks", 0.0))
                 feat[f"prev_slot_vol_{lag}"]       = float(h.get("vol_total", 0.0))
-                feat[f"lag_{lag}_outcome"]         = float(h.get("target", 0.5))
+                feat[f"lag_{lag}_outcome"]         = float(h.get("target") or 0.5)
         else:
             feat[f"prev_slot_up_ratio_{lag}"]  = 0.5
             feat[f"prev_slot_n_ticks_{lag}"]   = 0.0
