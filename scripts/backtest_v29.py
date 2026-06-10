@@ -108,24 +108,33 @@ def backtest_v29():
     log.info("Champion: %s | %d features | WF AUC=%.4f", version, len(features), wf_auc)
     log.info("Features: %s", features)
 
-    # ── Step 3: Carregar mercados ─────────────────────────────────────────
-    log.info("Step 3: Loading markets...")
-    m1 = pd.read_csv(DATA_DIR / "all_markets.csv")
-    new_path = DATA_DIR / "new_markets.csv"
-    if new_path.exists():
-        m2 = pd.read_csv(new_path)
-        if "target" in m2.columns:
-            markets = pd.concat([m1, m2], ignore_index=True)
-        else:
-            markets = m1
-    else:
-        markets = m1
+    # ── Step 3: Carregar holdout (mercados que o modelo NUNCA viu) ───────
+    # Holdout = mercados com slot_ts > TRAIN_CUTOFF do v29 (6 jun 19:10 UTC)
+    # Ver docs/holdout_policy.md
+    log.info("Step 3: Loading holdout markets (genuinely OOS)...")
+    import datetime as _dt
+    holdout_path = DATA_DIR / "holdout_markets.csv"
+    if not holdout_path.exists():
+        raise RuntimeError(
+            "holdout_markets.csv nao encontrado. "
+            "Rode fetch_holdout_pipeline.py primeiro."
+        )
+    markets = pd.read_csv(holdout_path)
     markets = markets[markets["target"].notna()].sort_values("slot_ts").reset_index(drop=True)
-    log.info("Total markets: %d (%.1f%% UP)", len(markets), 100 * markets["target"].mean())
+    log.info("Holdout: %d markets (%.1f%% UP) | %s → %s",
+             len(markets), 100 * markets["target"].mean(),
+             _dt.datetime.utcfromtimestamp(int(markets["slot_ts"].min())),
+             _dt.datetime.utcfromtimestamp(int(markets["slot_ts"].max())))
 
-    # ── Step 4: OB features — apenas colunas sem leakage ─────────────────
-    log.info("Step 4: Loading OB features...")
-    ob_df = pd.read_parquet(str(DATA_DIR / "ob_features_full.parquet"))
+    # ── Step 4: OB features do holdout ───────────────────────────────────
+    log.info("Step 4: Loading holdout OB features...")
+    ob_path = DATA_DIR / "holdout_ob_features.parquet"
+    if not ob_path.exists():
+        raise RuntimeError(
+            "holdout_ob_features.parquet nao encontrado. "
+            "Rode fetch_holdout_pipeline.py primeiro."
+        )
+    ob_df = pd.read_parquet(str(ob_path))
 
     # Features com leakage temporal (capturadas em t=108-168s no training)
     # Removidas explicitamente — mesmo que o modelo v29 não as use, mantemos
@@ -151,16 +160,14 @@ def backtest_v29():
     log.info("OB features loaded: %d markets | columns: %s",
              len(ob_df), [c for c in ob_df.columns if c != "market_id"])
 
-    # Filtrar mercados com OB e fazer split
+    # Filtrar mercados com OB
     markets["market_id"] = markets["market_id"].astype(str)
-    markets_with_ob = markets[markets["market_id"].isin(ob_by_id.keys())].reset_index(drop=True)
-    log.info("Markets with OB: %d (%.1f%% UP)", len(markets_with_ob), 100 * markets_with_ob["target"].mean())
-
-    # ── Walk-forward split: último 10% por slot_ts ────────────────────────
-    split_i     = int(len(markets_with_ob) * 0.90)
-    markets_oos = markets_with_ob.iloc[split_i:].reset_index(drop=True)
-    log.info("OOS split: %d mercados (últimos 10%%) | cutoff slot_ts=%d",
-             len(markets_oos), int(markets_with_ob.iloc[split_i]["slot_ts"]))
+    markets_oos = markets[markets["market_id"].isin(ob_by_id.keys())].reset_index(drop=True)
+    log.info("Holdout with OB: %d / %d (%.1f%% UP)",
+             len(markets_oos), len(markets), 100 * markets_oos["target"].mean())
+    if len(markets_oos) < len(markets):
+        log.warning("  %d holdout markets sem OB features (serão skipped)",
+                    len(markets) - len(markets_oos))
 
     all_ids = set(markets_oos["market_id"].tolist())
 
@@ -198,27 +205,16 @@ def backtest_v29():
             return 0.0
         return float(np.std(np.diff(np.log(px + 1e-9))))
 
-    # ── Step 6: Ticks ─────────────────────────────────────────────────────
-    log.info("Step 6: Loading ticks...")
+    # ── Step 6: Ticks do holdout ──────────────────────────────────────────
+    log.info("Step 6: Loading holdout ticks...")
     tick_cols = ["market_id", "timestamp_ms", "outcome", "side", "price", "size_usdc"]
-    tick_dfs = []
-    pf = pq.ParquetFile(str(DATA_DIR / "ticks_btc_full_clean.parquet"))
-    for batch in pf.iter_batches(batch_size=200_000, columns=tick_cols):
-        tb = batch.to_pandas()
-        tb = tb[tb["market_id"].isin(all_ids)]
-        if len(tb):
-            tick_dfs.append(tb)
-    new_tick_path = DATA_DIR / "new_ticks_pmdata.parquet"
-    if new_tick_path.exists():
-        nt = pd.read_parquet(str(new_tick_path), columns=tick_cols)
-        nt = nt[nt["market_id"].isin(all_ids)]
-        if len(nt):
-            tick_dfs.append(nt)
-    if not tick_dfs:
-        log.warning("No ticks found for OOS markets!")
-        ticks_df = pd.DataFrame(columns=tick_cols)
+    holdout_ticks_path = DATA_DIR / "holdout_ticks.parquet"
+    if holdout_ticks_path.exists():
+        ticks_df = pd.read_parquet(str(holdout_ticks_path), columns=tick_cols)
+        ticks_df = ticks_df[ticks_df["market_id"].isin(all_ids)]
     else:
-        ticks_df = pd.concat(tick_dfs, ignore_index=True)
+        log.warning("holdout_ticks.parquet nao encontrado — sem ticks")
+        ticks_df = pd.DataFrame(columns=tick_cols)
 
     ticks_df["t_sec"] = ticks_df["timestamp_ms"] // 1000
     tick_by_market = {}
@@ -227,12 +223,13 @@ def backtest_v29():
     log.info("Ticks loaded: %d markets with ticks", len(tick_by_market))
 
     # ── Histórico global de up_ratio por slot (para lags e zscores) ──────
-    # Usa TODOS os mercados (não só OOS) para construir a série histórica
-    # Isso espelha o live_trader que tem histórico acumulado de slots passados
+    # Usa ticks de TREINO (pre-cutoff) para construir série histórica
+    # Espelha o live_trader que tem histórico acumulado de slots passados
     all_ticks_dfs = []
     pf2 = pq.ParquetFile(str(DATA_DIR / "ticks_btc_full_clean.parquet"))
     for batch in pf2.iter_batches(batch_size=500_000, columns=["market_id", "timestamp_ms", "outcome", "size_usdc"]):
         all_ticks_dfs.append(batch.to_pandas())
+    new_tick_path = DATA_DIR / "new_ticks_pmdata.parquet"
     if new_tick_path.exists():
         nt2 = pd.read_parquet(str(new_tick_path), columns=["market_id", "timestamp_ms", "outcome", "size_usdc"])
         all_ticks_dfs.append(nt2)
