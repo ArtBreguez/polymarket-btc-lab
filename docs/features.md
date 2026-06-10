@@ -1,10 +1,10 @@
 # BTC 5-min Model — Feature Brain
-**Versão:** v28 (73f) | **OBS_SECS:** 60 | **SLOT_DURATION:** 300s  
-**Última atualização:** 2026-06-10 | **Commit:** 6bc06fa  
-**Auditoria paridade:** train=73 == live=73, diff=0 ✅  
-**Auditoria viabilidade:** 73/73 ✅ OK — zero divergências, zero fallbacks estruturais
+**Versão:** v29 (TBD — auto feature selection em progresso) | **OBS_SECS:** 60 | **SLOT_DURATION:** 300s  
+**Última atualização:** 2026-06-10 | **Commit:** 3ef091f  
+**Auditoria paridade:** train == live (v29 pendente resultado treino)  
+**Auditoria viabilidade:** v29 — removidas features com leakage temporal confirmado
 
-> Fonte de verdade de todas as features. Atualizar sempre que mudar `train_v28_modal.py` ou `live_trader.py`.
+> Fonte de verdade de todas as features. Atualizar sempre que mudar `train_v29_modal.py` ou `live_trader.py`.
 
 ---
 
@@ -441,7 +441,8 @@ lag_streak=0.0, lag_ur_zscore_*=0.0, btc_up_ratio_zscore_*=0.0
 | v27 | ~50 | `ob_features_full.parquet` com clob_*. |
 | v28 | 104 | Full train==live parity. Tick features no treino. |
 | v28 (88f) | 88 | 1ª remoção: 16 features inviáveis óbvias. |
-| **v28 (73f)** | **73** | **2ª remoção: 15 features com divergência/fallback. Auditoria rígida de fontes. 73/73 ✅ OK, zero divergências.** |
+| v28 (73f) | 73 | 2ª remoção: 15 features com divergência/fallback. Auditoria rígida de fontes. 73/73 ✅ OK, zero divergências. |
+| **v29 (TBD)** | **TBD** | **Remoção de features com leakage temporal confirmado (ob_mid corr=0.60, ob_imbalance_end, ob_spread_end, ob_imb_momentum, ob_depth_change capturadas em t=108-168s, além de clob_mid_velocity janela 108-168s, ob_weighted_imb, ob_bid/ask_depth_5c). Auto feature selection com threshold de importância relativa (15% da mediana) e critério MAX_AUC_LOSS=0.003.** |
 
 ---
 
