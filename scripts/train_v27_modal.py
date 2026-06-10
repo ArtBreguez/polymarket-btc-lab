@@ -1,5 +1,5 @@
 """
-train_v26_modal.py — BTC 5min model v26 (REAL-TIME ONLY + REALISTIC BACKTEST)
+train_v27_modal.py — BTC 5min model v27 (REAL-TIME ONLY + REALISTIC BACKTEST)
 ================================================================================
 Philosophy: Only use features computable in real-time with <5s lag.
   - Binance spot (WebSocket, <2s lag): price returns, volatility, distance to round numbers
@@ -39,7 +39,7 @@ image = (
 )
 
 vol = modal.Volume.from_name("btc-training-cache", create_if_missing=True)
-app = modal.App("btc-v26-run", image=image)
+app = modal.App("btc-v27-run", image=image)
 
 
 @app.function(
@@ -49,7 +49,7 @@ app = modal.App("btc-v26-run", image=image)
     secrets=[modal.Secret.from_name("hf-token")],
     volumes={"/cache": vol},
 )
-def train_v26():
+def train_v27():
     import gc, json, logging, math, os, pickle, sys, time, warnings
     from datetime import datetime, timezone
     from pathlib import Path
@@ -760,7 +760,7 @@ def train_v26():
              "Y" if beats_acc else "N", mean_acc, champion["wf_acc"],
              score)
 
-    version_tag = f"v26_{TOP_N_FEATS}f_rt"
+    version_tag = f"v27_{TOP_N_FEATS}f_rt"
 
     if (score >= 1 or mean_auc > 0.845) and sanity_ok:
         log.info("PROMOTING %s! (%d/3 metrics, backtest P&L=$%.2f)", version_tag, score, total_pnl)
@@ -796,7 +796,7 @@ def train_v26():
                 "by_edge": pnl_by_edge,
             },
             "changes": (
-                f"v26: REAL-TIME features only (no tick-based features with 120s lag). "
+                f"v27: REAL-TIME features only (no tick-based features with 120s lag). "
                 f"{len(top_features)} features from Binance spot + L2 OB + lag history. "
                 f"Rigorous feature pruning: tested {FEATURE_COUNTS}. "
                 f"Realistic backtest: {total_trades} trades, {wr:.1f}% WR, P&L=${total_pnl:.2f}. "
@@ -827,9 +827,9 @@ def train_v26():
         log.info("NOT PROMOTED: %s. Reasons: %s", version_tag, "; ".join(reasons))
 
     log.info("=" * 70)
-    log.info("v26 training complete.")
+    log.info("v27 training complete.")
 
 
 @app.local_entrypoint()
 def main():
-    train_v26.remote()
+    train_v27.remote()
