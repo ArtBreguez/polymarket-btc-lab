@@ -188,8 +188,16 @@ def train_v28():
     ob_df = pd.read_parquet(str(ob_path))
     ob_df["market_id"] = ob_df["market_id"].astype(str)
     ob_by_market = ob_df.set_index("market_id").to_dict("index")
-    # Exclude features with poor live coverage (sparse, quasi-constant, or unreliable)
-    OB_EXCLUDED = {"ob_imb_w0", "ob_pc_count", "ob_fill_imbalance"}
+    # Exclude features removed from model: divergent live coverage, warm-up deps, or unreliable
+    OB_EXCLUDED = {
+        "ob_imb_w0", "ob_pc_count", "ob_fill_imbalance",  # removed previously
+        "ob_imb_w1", "ob_imb_w2",                         # ❌ quase sempre 0.0 live (1 WS book snap)
+        "ob_pc_up_ratio", "ob_pc_volatility",              # ⚠️ reset em reconexão WS
+        "ob_mid_drift",                                    # ⚠️ timing gap ~72s; cascata: x_drift/x_ob_drift
+        "clob_imb_mean", "clob_imb_std", "clob_imb_drift", # ❌ quase sempre 0.0 live (1 WS book snap)
+        "clob_depth_trend",                                # ❌ idem
+        "clob_activity_rate",                              # ⚠️ levemente diferente do treino
+    }
     ob_cols = [c for c in ob_df.columns if c != "market_id" and c not in OB_EXCLUDED]
     log.info("OB features: %d markets, %d features (excluded %s): %s",
              len(ob_df), len(ob_cols), OB_EXCLUDED, ob_cols[:5])
@@ -327,7 +335,6 @@ def train_v28():
         feat["btc_pre_15m_ret"] = pre_ret(900)
         feat["btc_pre_30m_ret"] = pre_ret(1800)
         feat["btc_pre_1h_ret"]  = pre_ret(3600)
-        feat["btc_pre_4h_ret"]  = pre_ret(14400)
 
         # In-slot return/range during [slot_ts, slot_ts+OBS_SECS]
         t0_idx = int(np.searchsorted(spot_ts_arr, slot_ts, side="left"))
@@ -346,17 +353,10 @@ def train_v28():
 
         # Volatility features
         feat["btc_vol_1h"]  = spot_volatility(slot_ts - 3600, slot_ts)
-        feat["btc_vol_4h"]  = spot_volatility(slot_ts - 14400, slot_ts)
 
-        # Momentum consistency
-        px_1h  = spot_at(slot_ts - 3600)
-        px_4h  = spot_at(slot_ts - 14400)
-        if px_now > 0 and px_1h > 0 and px_4h > 0 and abs(px_now - px_4h) > 1:
-            feat["btc_pre_1h_4h_ratio"] = (px_now - px_1h) / (px_now - px_4h + 1e-9)
-        else:
-            feat["btc_pre_1h_4h_ratio"] = 0.0
+        # Momentum consistency — removed btc_pre_1h_4h_ratio (warm-up 4h dependency)
 
-        # Round-number proximity — only btc_dist_1k (dist_5k/10k removed: quasi-constant for BTC ~$95k)
+        # Round-number proximity
         if px_now > 0:
             px_k = px_now / 1000
             feat["btc_dist_1k"] = float(min(px_k - math.floor(px_k), math.ceil(px_k) - px_k))
@@ -537,15 +537,13 @@ def train_v28():
         feat["hour_x_tw_ur"]    = feat.get("btc_tw_up_ratio", 0.5) * (hour / 24.0)
 
         # ── F. CROSS-DOMAIN INTERACTIONS (OB x CLOB x Spot) ─────────
-        # Matches live_trader.py cross-feature block exactly
-        feat["x_imb_x_inslot"]      = feat.get("ob_imbalance", 0.0) * feat.get("btc_inslot_ret", 0.0)
-        feat["x_imb_end_x_ret"]     = feat.get("ob_imbalance_end", 0.0) * feat.get("btc_inslot_ret", 0.0)
-        feat["x_drift_x_ret5m"]     = feat.get("ob_mid_drift", 0.0) * feat.get("btc_pre_5m_ret", 0.0)
-        feat["x_spread_x_vol"]      = feat.get("ob_spread", 0.02) * feat.get("btc_vol_1h", 0.0)
-        feat["x_depth_x_vol"]       = feat.get("ob_depth_ratio", 1.0) * feat.get("btc_vol_1h", 0.0)
-        feat["x_imb_x_ur"]          = feat.get("ob_imbalance", 0.0) * cur_up_ratio
-        feat["x_depth_x_momentum"]  = feat.get("ob_depth_ratio", 1.0) * feat.get("btc_momentum", 0.0)
-        feat["x_ob_drift_x_inslot"] = feat.get("ob_mid_drift", 0.0) * feat.get("btc_inslot_ret", 0.0)
+        # ob_mid_drift removed → x_drift_x_ret5m and x_ob_drift_x_inslot removed too
+        feat["x_imb_x_inslot"]     = feat.get("ob_imbalance", 0.0) * feat.get("btc_inslot_ret", 0.0)
+        feat["x_imb_end_x_ret"]    = feat.get("ob_imbalance_end", 0.0) * feat.get("btc_inslot_ret", 0.0)
+        feat["x_spread_x_vol"]     = feat.get("ob_spread", 0.02) * feat.get("btc_vol_1h", 0.0)
+        feat["x_depth_x_vol"]      = feat.get("ob_depth_ratio", 1.0) * feat.get("btc_vol_1h", 0.0)
+        feat["x_imb_x_ur"]         = feat.get("ob_imbalance", 0.0) * cur_up_ratio
+        feat["x_depth_x_momentum"] = feat.get("ob_depth_ratio", 1.0) * feat.get("btc_momentum", 0.0)
 
         feat["target"] = target
         rows.append(feat)

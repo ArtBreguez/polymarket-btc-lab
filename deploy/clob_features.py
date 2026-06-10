@@ -29,17 +29,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 
-# Feature names returned by get_features (all prefixed with clob_)
+# Feature names returned by get_features — only the 5 OK ones
+# Removed: clob_imb_mean/std/drift (❌ quase sempre 0.0 live, 1 WS book snap)
+#          clob_depth_trend (❌ idem)
+#          clob_activity_rate (⚠️ levemente diferente do treino)
 FEATURE_NAMES: List[str] = [
-    "clob_imb_mean",
-    "clob_imb_std",
-    "clob_imb_drift",
     "clob_spread_mean",
     "clob_spread_trend",
     "clob_mid_velocity",
     "clob_mid_volatility",
-    "clob_activity_rate",
-    "clob_depth_trend",
     "clob_ask_pressure",
 ]
 

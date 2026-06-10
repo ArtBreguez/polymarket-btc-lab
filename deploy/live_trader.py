@@ -694,17 +694,13 @@ def build_spot_features(slot_ts: int) -> dict:
     idx_obs = np.searchsorted(ts_arr, obs_end_ts, side="right") - 1
     px_obs_end = float(px_arr[idx_obs]) if idx_obs >= 0 else 0.0
 
-    for w_s, lbl in [(300, "5m"), (900, "15m"), (1800, "30m"), (3600, "1h"), (14400, "4h")]:
+    for w_s, lbl in [(300, "5m"), (900, "15m"), (1800, "30m"), (3600, "1h")]:
         idx_h = np.searchsorted(ts_arr, slot_ts - w_s, side="right") - 1
         px_h = float(px_arr[idx_h]) if idx_h >= 0 else 0.0
         if px_h > 0 and px_obs_end > 0:
             feat[f"btc_pre_{lbl}_ret"] = float(px_obs_end / px_h - 1)
         else:
             feat[f"btc_pre_{lbl}_ret"] = 0.0
-        # Pre-window volatility: stddev/mean of prices in the window
-        seg_pre = _seg(slot_ts - w_s, slot_ts)
-        _, pre_vol = _ret_vol(seg_pre)
-        feat[f"btc_pre_{lbl}_vol"] = pre_vol
 
     # Round-number proximity (use obs-end price to match training)
     if px_obs_end > 0:
@@ -713,17 +709,7 @@ def build_spot_features(slot_ts: int) -> dict:
     else:
         feat["btc_dist_1k"] = 0.5
 
-    # 1h/4h ratio — (px_now - px_1h_ago) / (px_now - px_4h_ago)
-    # MUST use px at observation end (slot_ts + OBS_SECS) to match training
-    px_now = px_obs_end  # use observation-end price, not slot-start
-    idx_1h = np.searchsorted(ts_arr, slot_ts - 3600, side="right") - 1
-    idx_4h = np.searchsorted(ts_arr, slot_ts - 14400, side="right") - 1
-    px_1h_ago = float(px_arr[idx_1h]) if idx_1h >= 0 else 0.0
-    px_4h_ago = float(px_arr[idx_4h]) if idx_4h >= 0 else 0.0
-    if px_now > 0 and px_1h_ago > 0 and px_4h_ago > 0 and abs(px_now - px_4h_ago) > 1:
-        feat["btc_pre_1h_4h_ratio"] = (px_now - px_1h_ago) / (px_now - px_4h_ago + 1e-9)
-    else:
-        feat["btc_pre_1h_4h_ratio"] = 0.0  # cold buffer or no meaningful 4h move
+    # btc_pre_1h_4h_ratio removed (warm-up 4h dependency)
 
     # ── v26 NEW spot features ─────────────────────────────────────────────────
     # btc_inslot_range: (high - low) / px during [slot_ts, slot_ts+OBS]
@@ -746,7 +732,7 @@ def build_spot_features(slot_ts: int) -> dict:
         return 0.0
 
     feat["btc_vol_1h"] = _volatility(slot_ts - 3600, slot_ts)
-    feat["btc_vol_4h"] = _volatility(slot_ts - 14400, slot_ts)
+    # btc_vol_4h removed (warm-up 4h dependency)
 
     # btc_spot_vol_ratio: recent 5m volume / avg hourly 5m volume
     # Uses actual Binance candle volume (matching training formula)
@@ -1077,24 +1063,18 @@ def _build_ob_features(up_token_id: str) -> dict:
             "ob_total_depth":   float(open_snap.get("total_depth", 0)),
             "ob_weighted_imb":  float(open_snap["imbalance"]),  # approx
             # Temporal features = 0 (no change from open to close)
-            "ob_mid_drift":     0.0,
+            "ob_mid_drift":     0.0,    # removed from model — kept as 0 for compatibility
             "ob_imbalance_end": float(open_snap["imbalance"]),
             "ob_spread_end":    float(open_snap.get("spread", 0.02)),
             "ob_depth_change":  0.0,
             "ob_imb_momentum":  0.0,
-            # ob_imb_w1/w2 from WS accumulator will overwrite; w0 removed (sparse live)
-            "ob_imb_w1":        float(open_snap["imbalance"]),
-            "ob_imb_w2":        float(open_snap["imbalance"]),
+            # ob_imb_w1/w2 removed from model
         }
 
     # ── Temporal features from open vs close ──────────────────────────
-    ob_mid_drift    = float(snap["mid"] - open_snap["mid"])
+    # ob_mid_drift removed from model (timing gap ~72s live vs treino)
     ob_imb_momentum = float(snap["imbalance"] - open_snap["imbalance"])
-
-    # Windowed imbalance w1/w2 — interpolated fallback (overwritten by WS accumulator)
-    # ob_imb_w0 removed: live coverage too sparse (1 real book snap from WS)
-    ob_imb_w2 = float(snap["imbalance"])
-    ob_imb_w1 = float((float(open_snap["imbalance"]) + ob_imb_w2) / 2.0)
+    # ob_imb_w1/w2 removed from model (quase sempre 0.0 live)
 
     # Use close snapshot for all other features
     book = snap
@@ -1134,8 +1114,6 @@ def _build_ob_features(up_token_id: str) -> dict:
         weighted_imb = float((bid_wt - ask_wt) / (bid_wt + ask_wt + 1e-8))
 
         return {
-            # Base OB features use OPEN snapshot to match training
-            # (training uses first book snapshot in observation window)
             "ob_mid":           float(open_snap["mid"]),
             "ob_spread":        float(open_snap.get("spread", spread)),
             "ob_imbalance":     float(open_snap.get("imbalance", imbalance)),
@@ -1144,15 +1122,11 @@ def _build_ob_features(up_token_id: str) -> dict:
             "ob_ask_depth_5c":  float(ask_depth_5c),
             "ob_total_depth":   float(total_depth),
             "ob_weighted_imb":  float(weighted_imb),
-            # Temporal features — real values from open vs close snapshots
-            "ob_mid_drift":     ob_mid_drift,
+            # ob_mid_drift removed; ob_imb_w1/w2 removed
             "ob_imbalance_end": float(imbalance),
             "ob_spread_end":    float(spread),
             "ob_depth_change":  float(total_depth - open_snap.get("total_depth", total_depth)),
             "ob_imb_momentum":  ob_imb_momentum,
-            # Windowed imbalance — w1/w2 only (w0 removed: sparse live)
-            "ob_imb_w1":        ob_imb_w1,
-            "ob_imb_w2":        ob_imb_w2,
         }
     except Exception as e:
         log.warning("OB fetch failed for %s: %s", up_token_id[:20], e)
@@ -1364,56 +1338,31 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
     # ── Spot features ──────────────────────────────────────────────────────────
     feat.update(build_spot_features(slot_ts))
 
-    # ── Cross-domain interaction features (OB x CLOB x Spot) ─────────────────
-    # MUST be computed AFTER both OB and spot features exist in feat dict.
-    # v26 cross-features: all real-time, no tick-based
-    feat["x_imb_x_ur"]          = feat.get("ob_imbalance", 0.0) * feat.get("btc_up_ratio", 0.5)
-    feat["x_depth_x_momentum"]  = feat.get("ob_depth_ratio", 1.0) * feat.get("btc_momentum", 0.0)
-    feat["x_ob_drift_x_inslot"] = feat.get("ob_mid_drift", 0.0) * feat.get("btc_inslot_ret", 0.0)
-    # v26 NEW cross-features
-    feat["x_drift_x_ret5m"]     = feat.get("ob_mid_drift", 0.0) * feat.get("btc_pre_5m_ret", 0.0)
-    feat["x_imb_end_x_ret"]     = feat.get("ob_imbalance_end", 0.0) * feat.get("btc_inslot_ret", 0.0)
-    feat["x_imb_x_inslot"]      = feat.get("ob_imbalance", 0.0) * feat.get("btc_inslot_ret", 0.0)
-    feat["x_spread_x_vol"]      = feat.get("ob_spread", 0.02) * feat.get("btc_vol_1h", 0.0)
-    feat["x_depth_x_vol"]       = feat.get("ob_depth_ratio", 1.0) * feat.get("btc_vol_1h", 0.0)
+    # ── Cross-domain interaction features (OB x Spot) ────────────────────────
+    # ob_mid_drift removed → x_drift_x_ret5m and x_ob_drift_x_inslot removed
+    feat["x_imb_x_ur"]         = feat.get("ob_imbalance", 0.0) * feat.get("btc_up_ratio", 0.5)
+    feat["x_depth_x_momentum"] = feat.get("ob_depth_ratio", 1.0) * feat.get("btc_momentum", 0.0)
+    feat["x_imb_end_x_ret"]    = feat.get("ob_imbalance_end", 0.0) * feat.get("btc_inslot_ret", 0.0)
+    feat["x_imb_x_inslot"]     = feat.get("ob_imbalance", 0.0) * feat.get("btc_inslot_ret", 0.0)
+    feat["x_spread_x_vol"]     = feat.get("ob_spread", 0.02) * feat.get("btc_vol_1h", 0.0)
+    feat["x_depth_x_vol"]      = feat.get("ob_depth_ratio", 1.0) * feat.get("btc_vol_1h", 0.0)
 
-    # ── CLOB + OB_PC real-time features (from WS stream, slot-anchored) ─────────
-    # All windows anchored to slot_ts so t=[0,168) and t=[108,168) match training.
-    # clob_* : window [slot_ts+108, slot_ts+168) — same as fetch_ob_features_modal
-    # ob_pc_*: window [slot_ts,     slot_ts+168) — same as fetch_ob_features_modal
-    # ob_imb_w0/1/2: windows [0,60) / [60,120) / [120,168) relative to slot_ts
+    # CLOB WS features — only the 5 OK ones (clob_spread/mid/ask_pressure)
+    # clob_imb_*/depth_trend/activity_rate removed (❌ quase sempre 0.0 live)
     if up_token_id:
         _acc = get_accumulator()
-        # clob_* features: 60s window ending at obs cutoff t=168s
         clob_feats = _acc.get_features(
             up_token_id,
             slot_ts=slot_ts,
-            obs_secs=168,       # cutoff = slot_ts + 168s (matches training CUTOFF_SEC)
-            window_secs=60.0,   # 60s lookback → window [108, 168)
+            obs_secs=168,
+            window_secs=60.0,
         )
-        feat.update(clob_feats)
-
-        # ob_pc_* features: price-change aggregates over [slot_ts, slot_ts+168)
-        pc_feats = _acc.get_ob_pc_features(
-            up_token_id,
-            slot_ts=slot_ts,
-            cutoff_secs=168.0,  # matches training CUTOFF_SEC
-        )
-        feat.update(pc_feats)
-
-        # ob_imb_w0/1/2: windowed imbalance from real book snapshots
-        # Overwrites the interpolated values from _build_ob_features if we have real data.
-        # ob_imb_w0 excluded from model (sparse live coverage) — only w1/w2 used.
-        imb_windows = _acc.get_windowed_imbalance(
-            up_token_id,
-            slot_ts=slot_ts,
-            windows=[(60, 120), (120, 168)],
-        )
-        # Map to ob_imb_w1/w2 (index shifts since we skip w0)
-        if "ob_imb_w0" in imb_windows:
-            feat["ob_imb_w1"] = imb_windows["ob_imb_w0"]
-        if "ob_imb_w1" in imb_windows:
-            feat["ob_imb_w2"] = imb_windows["ob_imb_w1"]
+        # Only keep the 5 OK clob features; discard the divergent ones
+        CLOB_KEEP = {"clob_spread_mean", "clob_spread_trend",
+                     "clob_mid_velocity", "clob_mid_volatility", "clob_ask_pressure"}
+        for k, v in clob_feats.items():
+            if k in CLOB_KEEP:
+                feat[k] = v
 
     # ── Final: fill any remaining model features with context-aware defaults ────
     _neutral_defaults = {
@@ -1423,9 +1372,6 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
         "ob_depth_ratio":  1.0,
         "ob_total_depth":  1000.0,
         "ob_spread":       0.02,
-        "ob_pc_up_ratio":  0.5,   # neutral — no directional info
-        "ob_pc_volatility": 0.0,
-
     }
     for f in features:
         if f not in feat:
