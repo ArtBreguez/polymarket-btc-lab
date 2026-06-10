@@ -216,6 +216,148 @@ def fetch_ob_features():
 
         return features
 
+    def _compute_clob_features(book_rows: pd.DataFrame, pc_rows: pd.DataFrame,
+                                window_start: float = 120.0, window_end: float = 180.0) -> dict:
+        """
+        Compute clob_* features matching exactly what the live trader computes
+        in clob_features.py — using the last 60s of the observation window
+        (t=120-180s), which corresponds to the entry window in live trading.
+
+        Uses the same poly_l2 data (book + price_change events) but from
+        historical data instead of the live WS feed.
+
+        Mirrors live: real book snapshots for imbalance/depth,
+        all snapshots (including synthetic-equivalent from price_change
+        best_bid/best_ask) for mid/spread/velocity.
+        """
+        zeros = {
+            "clob_imb_mean": 0.0, "clob_imb_std": 0.0, "clob_imb_drift": 0.0,
+            "clob_spread_mean": 0.0, "clob_spread_trend": 0.0,
+            "clob_mid_velocity": 0.0, "clob_mid_volatility": 0.0,
+            "clob_activity_rate": 0.0, "clob_depth_trend": 0.0,
+            "clob_ask_pressure": 0.0,
+        }
+
+        def _linslope(t, y):
+            if len(t) < 2 or t[-1] == t[0]:
+                return 0.0
+            try:
+                return float(np.polyfit(t, y, 1)[0])
+            except Exception:
+                return 0.0
+
+        # ── Filter to window ───────────────────────────────────────────────
+        w_books = book_rows[
+            (book_rows["t_sec"] >= window_start) & (book_rows["t_sec"] < window_end)
+        ] if book_rows is not None and len(book_rows) > 0 else pd.DataFrame()
+
+        w_pcs = pc_rows[
+            (pc_rows["t_sec"] >= window_start) & (pc_rows["t_sec"] < window_end)
+        ] if pc_rows is not None and len(pc_rows) > 0 else pd.DataFrame()
+
+        n_real_books = len(w_books)
+        n_pcs = len(w_pcs)
+
+        # Minimum data gate — same as live (5 real events, 5s span)
+        if n_real_books + n_pcs < 5:
+            return zeros
+
+        time_span = window_end - window_start  # always 60s for historical
+
+        # ── Real book snapshots: imbalance, depth, mid, spread ─────────────
+        real_imb, real_depth, real_mid, real_spread = [], [], [], []
+        real_ts = []
+        for _, row in w_books.iterrows():
+            try:
+                ap = np.array(row["ask_prices"], dtype=np.float64)
+                bp = np.array(row["bid_prices"], dtype=np.float64)
+                as_ = np.array(row["ask_sizes"], dtype=np.float64)
+                bs = np.array(row["bid_sizes"], dtype=np.float64)
+                if len(ap) == 0 or len(bp) == 0:
+                    continue
+                mid = float((ap[0] + bp[0]) / 2)
+                spread = float(ap[0] - bp[0])
+                total_sz = float(as_[0] + bs[0])
+                imb = float((bs[0] - as_[0]) / total_sz) if total_sz > 0 else 0.0
+                depth = float(ap.sum() + bp.sum())  # approximation — consistent with live
+                real_imb.append(imb)
+                real_depth.append(depth)
+                real_mid.append(mid)
+                real_spread.append(spread)
+                real_ts.append(float(row["t_sec"]))
+            except Exception:
+                continue
+
+        # ── price_change events: best_bid/best_ask for mid/spread series ───
+        # Mirrors live: use best_ask/best_bid from each price_change as
+        # synthetic book snapshot for mid/spread/velocity computation.
+        all_mid, all_spread, all_ts = list(real_mid), list(real_spread), list(real_ts)
+        ask_prices_seq = []  # for ask_pressure
+
+        for _, row in w_pcs.iterrows():
+            try:
+                ba = float(row["best_ask"]) if pd.notna(row.get("best_ask")) else None
+                bb = float(row["best_bid"]) if pd.notna(row.get("best_bid")) else None
+                if ba is not None and bb is not None and ba > bb > 0:
+                    all_mid.append((ba + bb) / 2)
+                    all_spread.append(ba - bb)
+                    all_ts.append(float(row["t_sec"]))
+                # ask_pressure: track SELL-side (ask) price moves
+                side = str(row.get("pc_side", "")).upper()
+                pc_price = row.get("pc_price")
+                if side == "SELL" and pd.notna(pc_price):
+                    ask_prices_seq.append(float(pc_price))
+            except Exception:
+                continue
+
+        if len(all_mid) < 2:
+            return zeros
+
+        # Sort by time
+        order = np.argsort(all_ts)
+        all_ts_arr = np.array(all_ts)[order]
+        all_mid_arr = np.array(all_mid)[order]
+        all_spread_arr = np.array(all_spread)[order]
+        t_rel = all_ts_arr - all_ts_arr[0]
+
+        # ── Compute features ───────────────────────────────────────────────
+        feats = {}
+
+        # Imbalance — real books only
+        feats["clob_imb_mean"]  = float(np.mean(real_imb))   if real_imb else 0.0
+        feats["clob_imb_std"]   = float(np.std(real_imb))    if len(real_imb) > 1 else 0.0
+        feats["clob_imb_drift"] = float(real_imb[-1] - real_imb[0]) if len(real_imb) > 1 else 0.0
+
+        # Spread — all (synthetic has real best_ask/best_bid)
+        feats["clob_spread_mean"]  = float(np.mean(all_spread_arr))
+        feats["clob_spread_trend"] = _linslope(t_rel, all_spread_arr)
+
+        # Mid — all
+        feats["clob_mid_velocity"]   = _linslope(t_rel, all_mid_arr)
+        mid_diffs = np.diff(all_mid_arr)
+        feats["clob_mid_volatility"] = float(np.std(mid_diffs)) if len(mid_diffs) > 0 else 0.0
+
+        # Activity rate — real books + price_changes (no double-count)
+        feats["clob_activity_rate"] = float((n_real_books + n_pcs) / time_span)
+
+        # Depth trend — real books only
+        if len(real_depth) > 1:
+            real_ts_arr = np.array(real_ts)
+            t_real_rel = real_ts_arr - real_ts_arr[0]
+            feats["clob_depth_trend"] = _linslope(t_real_rel, np.array(real_depth))
+        else:
+            feats["clob_depth_trend"] = 0.0
+
+        # Ask pressure — fraction of consecutive ASK moves that went DOWN
+        if len(ask_prices_seq) >= 2:
+            diffs = np.diff(ask_prices_seq)
+            moves = diffs[diffs != 0]
+            feats["clob_ask_pressure"] = float((moves < 0).sum() / len(moves)) if len(moves) > 0 else 0.0
+        else:
+            feats["clob_ask_pressure"] = 0.0
+
+        return feats
+
     def _fetch_one(market_id: str, slug: str, slot_ts: int) -> tuple[str, dict | None]:
         """Fetch poly_l2 parquet and extract OB + price_change features."""
         try:
@@ -233,9 +375,9 @@ def fetch_ob_features():
 
             df = pd.read_parquet(io.BytesIO(r2.content))
 
-            # Convert timestamp
+            # Convert timestamp — poly_l2 uses datetime64[ms], convert to Unix seconds
             if pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
-                df["ts_sec"] = df["timestamp"].astype("int64") / 1e3  # ms → s for datetime64[ms]
+                df["ts_sec"] = df["timestamp"].astype("int64") / 1000.0  # ms → seconds
             else:
                 df["ts_sec"] = pd.to_numeric(df["timestamp"], errors="coerce").fillna(0)
             df["t_sec"] = df["ts_sec"] - slot_ts
@@ -252,6 +394,14 @@ def fetch_ob_features():
                 slot_ts
             )
             if feats is not None:
+                # Compute clob_* features from the same data (last 60s window)
+                # to match exactly what the live trader sees at entry time (t=120-180s)
+                clob_feats = _compute_clob_features(
+                    books if len(books) > 0 else pd.DataFrame(),
+                    pcs   if len(pcs)   > 0 else pd.DataFrame(),
+                    window_start=120.0, window_end=180.0,
+                )
+                feats.update(clob_feats)
                 feats["market_id"] = market_id
             return (market_id, feats)
         except Exception as e:
