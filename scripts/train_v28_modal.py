@@ -581,7 +581,7 @@ def train_v28():
         log.info("  %3d. %-35s importance=%.1f", i+1, FEATURE_COLS[idx], feat_importances[idx])
 
     # Test multiple feature counts
-    FEATURE_COUNTS = [40, 30, 25, 20, 15]
+    FEATURE_COUNTS = [73, 60, 50, 40, 30, 25, 20]
     best_combo = None
     best_auc = -1
 
