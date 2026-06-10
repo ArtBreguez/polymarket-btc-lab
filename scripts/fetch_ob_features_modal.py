@@ -41,9 +41,9 @@ app = modal.App("btc-fetch-ob", image=image)
 
 
 @app.function(
-    cpu=4,
-    memory=16384,
-    timeout=10800,  # 3 hours — 22k markets takes a while
+    cpu=8,
+    memory=32768,
+    timeout=86400,  # 24 hours — resumable, skips already-done markets
     secrets=[modal.Secret.from_name("pmdata-api-key")],
     volumes={"/btc_local": LOCAL_VOL},
 )
@@ -73,14 +73,16 @@ def fetch_ob_features():
     if not PMDATA_KEY:
         raise RuntimeError("PMDATA_API_KEY required — set as Modal Secret 'pmdata-api-key'")
 
-    # ── Full recompute — delete progress to regenerate all markets ────────
-    # Required when feature schema changes (new clob_* columns, cutoff fix).
-    if PROGRESS_FILE.exists():
-        PROGRESS_FILE.unlink()
-        log.info("Deleted progress file — full recompute (feature schema changed)")
-    if OUT_FILE.exists():
-        OUT_FILE.unlink()
-        log.info("Deleted existing ob_features_full.parquet — will rebuild from scratch")
+    # ── Resume mode — skip already-processed markets ──────────────────────
+    # Progress file tracks done market_ids so we can resume after timeout.
+    # Set FORCE_RECOMPUTE=1 env var to wipe and start fresh.
+    FORCE = os.environ.get("FORCE_RECOMPUTE", "0") == "1"
+    if FORCE:
+        if PROGRESS_FILE.exists():
+            PROGRESS_FILE.unlink()
+        if OUT_FILE.exists():
+            OUT_FILE.unlink()
+        log.info("FORCE_RECOMPUTE=1 — starting fresh")
 
     # ── Load markets ───────────────────────────────────────────────────────
     markets = pd.read_csv(LOCAL_DIR / "all_markets.csv")
@@ -94,8 +96,28 @@ def fetch_ob_features():
 
     done_ids: set = set()
     existing_rows = []
-    todo = markets
-    log.info("Markets to process: %d", len(todo))
+
+    # Load existing progress + data if resuming
+    if PROGRESS_FILE.exists():
+        try:
+            with open(PROGRESS_FILE) as f:
+                done_ids = set(json.load(f))
+            log.info("Resuming: %d markets already done", len(done_ids))
+        except Exception as e:
+            log.warning("Could not load progress file: %s — starting fresh", e)
+            done_ids = set()
+
+    if OUT_FILE.exists() and done_ids:
+        try:
+            prev_df = pd.read_parquet(OUT_FILE)
+            existing_rows = prev_df.to_dict("records")
+            log.info("Loaded %d existing rows from parquet", len(existing_rows))
+        except Exception as e:
+            log.warning("Could not load existing parquet: %s", e)
+            existing_rows = []
+
+    todo = markets[~markets["market_id"].isin(list(done_ids))]
+    log.info("Markets remaining to process: %d / %d", len(todo), len(markets))
 
     # ── OB feature extraction ──────────────────────────────────────────────
     def _compute_ob_features(book_rows: pd.DataFrame, pc_rows: pd.DataFrame,
@@ -397,8 +419,8 @@ def fetch_ob_features():
     new_rows = []
     success = 0
     failed  = 0
-    BATCH_SIZE = 200
-    WORKERS    = 20
+    BATCH_SIZE = 500
+    WORKERS    = 40
 
     for batch_start in range(0, len(todo), BATCH_SIZE):
         batch = todo.iloc[batch_start:batch_start + BATCH_SIZE]
