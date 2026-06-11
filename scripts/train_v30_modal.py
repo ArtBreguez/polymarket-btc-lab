@@ -917,19 +917,21 @@ def train_v29():
     # v28 champion AUC (0.848) is NOT comparable — it was inflated by temporal leakage.
     # Promotion threshold: AUC > 0.76 (honest baseline) + sanity check.
     # ── Noise canary check ──────────────────────────────────────────────────
-    # Se canary_importance > 0 → modelo usa feature aleatória → overfitting
+    # Se canary em top_features → checa importância; se não entrou → sinal limpo
     canary_ok = True
     try:
-        canary_imp = float(final_model.named_steps["clf"].feature_importances_[-1]
-                           if hasattr(final_model, "named_steps")
-                           else final_model.feature_importances_[
-                               list(FEATURE_COLS_WITH_CANARY).index("__noise_canary__")
-                           ] if "__noise_canary__" in FEATURE_COLS_WITH_CANARY else 0)
-        if canary_imp > 0:
-            log.warning("⚠️  NOISE CANARY TRIGGERED: importance=%.1f → overfitting", canary_imp)
-            canary_ok = False
+        if "__noise_canary__" not in top_features:
+            log.info("✅  Noise canary: dropped in feature selection (clean)")
         else:
-            log.info("✅  Noise canary: 0 importance (clean)")
+            # CalibratedClassifierCV: estimador base em .calibrated_classifiers_[0].estimator
+            base_est = final_model.calibrated_classifiers_[0].estimator
+            canary_idx = list(top_features).index("__noise_canary__")
+            canary_imp = float(base_est.feature_importances_[canary_idx])
+            if canary_imp > 0:
+                log.warning("⚠️  NOISE CANARY TRIGGERED: importance=%.1f → overfitting", canary_imp)
+                canary_ok = False
+            else:
+                log.info("✅  Noise canary: 0 importance (clean)")
     except Exception as e:
         log.warning("Canary check failed: %s", e)
 
