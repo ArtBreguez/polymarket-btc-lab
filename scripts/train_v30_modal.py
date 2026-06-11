@@ -1000,11 +1000,49 @@ def train_v29():
     else:
         reasons = []
         if not sanity_ok: reasons.append("sanity check failed")
-        if mean_auc <= 0.74: reasons.append(f"AUC too low ({mean_auc:.4f})")
+        if mean_auc <= 0.76: reasons.append(f"AUC too low ({mean_auc:.4f})")
+        if score < 2: reasons.append(f"lost {3-score}/3 metrics vs champion")
         log.info("NOT PROMOTED: %s. Reasons: %s", version_tag, "; ".join(reasons))
 
+        # Salvar como candidato para avaliar OOS no holdout antes de promover
+        candidate_data = {
+            "version":  version_tag,
+            "features": top_features,
+            "model":    final_model,
+            "wf_auc":   mean_auc,
+            "wf_brier": mean_brier,
+            "wf_acc":   mean_acc,
+            "obs_secs": OBS_SECS,
+        }
+        candidate_meta = {
+            "version":   version_tag,
+            "wf_auc":    mean_auc,
+            "wf_brier":  mean_brier,
+            "wf_acc":    mean_acc,
+            "features":  top_features,
+            "n_features": len(top_features),
+            "obs_secs":  OBS_SECS,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "candidate": True,
+            "not_promoted_reasons": reasons,
+        }
+        import tempfile
+        api = HfApi(token=HF_TOKEN)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pkl_path  = Path(tmpdir) / "candidate.pkl"
+            meta_path = Path(tmpdir) / "candidate_meta.json"
+            with open(pkl_path, "wb") as f:
+                pickle.dump(candidate_data, f)
+            with open(meta_path, "w") as f:
+                json.dump(candidate_meta, f, indent=2)
+            api.upload_file(path_or_fileobj=str(pkl_path), path_in_repo="candidate.pkl",
+                            repo_id=HF_MODEL_REPO, repo_type="model", token=HF_TOKEN)
+            api.upload_file(path_or_fileobj=str(meta_path), path_in_repo="candidate_meta.json",
+                            repo_id=HF_MODEL_REPO, repo_type="model", token=HF_TOKEN)
+        log.info("Saved as CANDIDATE on HF (not champion). Run backtest to evaluate OOS AUC.")
+
     log.info("=" * 70)
-    log.info("v28 training complete.")
+    log.info("v30 training complete.")
 
 
 @app.local_entrypoint()
