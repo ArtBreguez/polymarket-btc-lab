@@ -735,6 +735,13 @@ def build_spot_features(slot_ts: int) -> dict:
 
     feat["btc_vol_1h"] = _volatility(slot_ts - 3600, slot_ts)
     # btc_vol_4h removed (warm-up 4h dependency)
+    # Normalizar retornos pelo vol_1h — remove sensibilidade de regime
+    # floor=1e-4 evita divisao por zero em mercados flat
+    _vol_norm = max(feat["btc_vol_1h"], 1e-4)
+    for _fk in ("btc_inslot_ret", "btc_pre_5m_ret", "btc_pre_15m_ret",
+                "btc_pre_30m_ret", "btc_pre_1h_ret", "btc_inslot_range"):
+        if _fk in feat:
+            feat[_fk] = feat[_fk] / _vol_norm
 
     # btc_spot_vol_ratio: recent 5m volume / avg hourly 5m volume
     # Uses actual Binance candle volume (matching training formula)

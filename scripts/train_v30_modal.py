@@ -63,7 +63,7 @@ app = modal.App("btc-v30-trainer", image=image)
     secrets=[modal.Secret.from_name("hf-token")],
     volumes={"/cache": vol},
 )
-def train_v29():
+def train_v30():
     import gc, json, logging, math, os, pickle, sys, time, warnings
     from datetime import datetime, timezone
     from pathlib import Path
@@ -364,6 +364,13 @@ def train_v29():
 
         # Volatility features
         feat["btc_vol_1h"]  = spot_volatility(slot_ts - 3600, slot_ts)
+        # Normalizar retornos pelo vol_1h — remove sensibilidade de regime
+        # floor=1e-4 (~0.01%/candle) evita divisao por zero em mercados flat
+        _vol_norm = max(feat["btc_vol_1h"], 1e-4)
+        for _fk in ("btc_inslot_ret", "btc_pre_5m_ret", "btc_pre_15m_ret",
+                    "btc_pre_30m_ret", "btc_pre_1h_ret", "btc_inslot_range"):
+            if _fk in feat:
+                feat[_fk] = feat[_fk] / _vol_norm
 
         # Momentum consistency — removed btc_pre_1h_4h_ratio (warm-up 4h dependency)
 
@@ -875,14 +882,14 @@ def train_v29():
     baseline_feats = {f: _neutral_value(f) for f in top_features}
     up_feats = dict(baseline_feats)
     up_feats.update({k: v for k, v in {
-        "btc_inslot_ret": 0.002, "btc_pre_5m_ret": 0.001, "btc_pre_1h_ret": 0.003,
+        "btc_inslot_ret": 2.0, "btc_pre_5m_ret": 1.5, "btc_pre_1h_ret": 2.0,
         "ob_imbalance": 0.3, "ob_imbalance_end": 0.3, "ob_mid_drift": 0.02,
         "ob_depth_ratio": 1.3, "ob_fill_imbalance": 0.2, "ob_imb_momentum": 0.1,
     }.items() if k in up_feats})
 
     down_feats = dict(baseline_feats)
     down_feats.update({k: v for k, v in {
-        "btc_inslot_ret": -0.002, "btc_pre_5m_ret": -0.001, "btc_pre_1h_ret": -0.003,
+        "btc_inslot_ret": -2.0, "btc_pre_5m_ret": -1.5, "btc_pre_1h_ret": -2.0,
         "ob_imbalance": -0.3, "ob_imbalance_end": -0.3, "ob_mid_drift": -0.02,
         "ob_depth_ratio": 0.7, "ob_fill_imbalance": -0.2, "ob_imb_momentum": -0.1,
     }.items() if k in down_feats})
@@ -911,7 +918,7 @@ def train_v29():
              "Y" if beats_acc else "N", mean_acc, champion["wf_acc"],
              score)
 
-    version_tag = f"v29_{TOP_N_FEATS}f_rt"
+    version_tag = f"v30_{TOP_N_FEATS}f_rt"
 
     # v29 uses a clean feature set (ob_mid and other leaky OB features removed).
     # v28 champion AUC (0.848) is NOT comparable — it was inflated by temporal leakage.
@@ -1047,4 +1054,4 @@ def train_v29():
 
 @app.local_entrypoint()
 def main():
-    train_v29.remote()
+    train_v30.remote()
