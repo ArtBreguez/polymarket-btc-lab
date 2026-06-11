@@ -207,6 +207,7 @@ def train_v29():
         "ob_weighted_imb",    # static snapshot de timing incerto, corr=0.45
         "ob_bid_depth_5c",    # static snapshot suspeito, corr=0.28
         "ob_ask_depth_5c",    # static snapshot suspeito, corr=0.28
+        "ob_total_depth",     # u274c v30: adversarial AUC=1.0, drift OB sintetico holdout vs real treino
     }
     ob_cols = [c for c in ob_df.columns if c != "market_id" and c not in OB_EXCLUDED]
     log.info("OB features: %d markets, %d features (excluded %s): %s",
@@ -868,7 +869,6 @@ def train_v29():
         if "ob_mid" in fname and "drift" not in fname: return 0.5
         if "ob_spread" in fname: return 0.02
         if "ob_depth_5c" in fname: return 0.5
-        if "ob_total_depth" in fname: return 1000.0
         if "depth_ratio" in fname: return 1.0
         return 0.0
 
