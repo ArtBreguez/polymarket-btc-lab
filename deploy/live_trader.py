@@ -735,13 +735,9 @@ def build_spot_features(slot_ts: int) -> dict:
 
     feat["btc_vol_1h"] = _volatility(slot_ts - 3600, slot_ts)
     # btc_vol_4h removed (warm-up 4h dependency)
-    # Normalizar retornos pelo vol_1h — remove sensibilidade de regime
-    # floor=1e-4 evita divisao por zero em mercados flat
-    _vol_norm = max(feat["btc_vol_1h"], 1e-4)
-    for _fk in ("btc_inslot_ret", "btc_pre_5m_ret", "btc_pre_15m_ret",
-                "btc_pre_30m_ret", "btc_pre_1h_ret", "btc_inslot_range"):
-        if _fk in feat:
-            feat[_fk] = feat[_fk] / _vol_norm
+    # NOTA: normalização por vol_1h foi testada no v30 mas resultou em AUC=0.778
+    # abaixo do champion v29 (AUC=0.792) que usa retornos brutos.
+    # Mantido bruto para paridade com v29. Será revisado quando houver parquet [0,168s).
 
     # btc_spot_vol_ratio: recent 5m volume / avg hourly 5m volume
     # Uses actual Binance candle volume (matching training formula)
@@ -2111,6 +2107,10 @@ def run(client, model, features):
                                 "reason": f"ask ${ask_price:.3f} outside valid range [0.42, 0.65]",
                                 "entered_at": now})
                 save_trades(trades)
+                # ask == 0.0 means market decided/one-sided — no point retrying this slot
+                if ask_price == 0.0:
+                    already.add(slot_ts)
+                    log.info("  Market decided/one-sided — blocking re-entry for slot %d", slot_ts)
                 continue
             edge_vs_ask = model_prob - ask_price
 
