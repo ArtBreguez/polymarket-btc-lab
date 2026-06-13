@@ -54,7 +54,10 @@ RETURN_FEATURES = {
     "btc_inslot_ret", "btc_pre_5m_ret", "btc_pre_15m_ret",
     "btc_pre_30m_ret", "btc_pre_1h_ret", "btc_pre_4h_ret",
 }
-RETURN_RANGE = (-0.05, 0.05)  # 5% move in 5min is extreme; beyond = corrupt
+# Since v30, return features are normalised by btc_vol_1h (floor=1e-4).
+# Raw 5% move / 0.0003 vol = ~167 normalised units. ±50 catches only
+# genuine data corruption (e.g. stale candle, wrong timestamp).
+RETURN_RANGE = (-50.0, 50.0)
 
 RATIO_FEATURES = {
     "btc_up_ratio", "btc_buy_ratio", "btc_tw_up_ratio",
