@@ -1,41 +1,34 @@
 """
-train_v28_modal.py — BTC 5min model v28 (FULL FEATURE PARITY train == live)
-================================================================================
-Philosophy: EXACT same features as deploy/live_trader.py build_features().
-  No lookahead, no train/live mismatch.
+train_v30_modal.py — BTC 5min model v30 (ZERO LOOKAHEAD + WS-PARITY + vol_1h normalization)
+======================================================================
+Filosofia: APENAS features computáveis em tempo real via WS em t<60s.
 
-Feature groups (all computed at OBS_SECS=60 cutoff):
-  A. Binance spot (<2s lag): pre-slot returns, in-slot ret/range/vol, round-number
-     proximity, vol ratios, 1h/4h ratio
-  B. L2 OB snapshot (<5s lag, from pmdata poly_l2): all 30 ob_* + clob_* columns
-  C. Tick-based order flow (data-api, lags ~120s but t<60s so available at decision):
-     btc_up_ratio, btc_n_ticks, btc_momentum, btc_buy_ratio,
-     btc_tw_up_ratio, btc_vwap_up/dn/spread, btc_vol_up/dn,
-     btc_up_ratio_stability, btc_up_ratio_zscore_5s/20s, btc_up_w5_zscore,
-     btc_signal_conviction, btc_size_disparity
-  D. Lag history (ring buffer from previous resolved slots):
-     lag_1..5_outcome, prev_slot_up_ratio/n_ticks/vol_1..5,
-     lag_streak, lag_ur_zscore_5, lag_ur_zscore_20
-  E. Temporal: hour_sin/cos, dow_sin/cos, hour_x_up_ratio, hour_x_tw_ur
-  F. Cross-domain interactions:
-     x_imb_x_inslot, x_imb_end_x_ret, x_drift_x_ret5m, x_spread_x_vol,
-     x_depth_x_vol, x_imb_x_ur, x_depth_x_momentum, x_ob_drift_x_inslot
+v30 vs v31:
+  FIX: btc_inslot_ret/range/pre_*_ret normalizados por vol_1h — match exato com live_trader.py
+       live divide esses retornos por vol_1h antes da predição; v31 usava valores brutos.
+  CLOB: usa ob60_clob_* (t=[0,60s)) do ob_features_v31.parquet — mais próximo de live [0,168s).
+  - Binance kline WS: price returns, vol, range, dist round numbers
+  - CLOB L2 OB REST snapshot (t~5s): imbalance, spread, depth
+  - CLOB WS price_change (ob60_*): spread/mid dynamics, fill imbalance
+  - CLOB WS last_trade_price: up_ratio, buy_ratio, momentum, vwap
+  - Lag history (ring buffer de slots anteriores)
+  - Temporais + cross-features
 
-LOOKAHEAD AUDIT:
-  - All spot features use obs_end_ts = slot_ts + OBS_SECS (t=60s) as reference — NO future data
-  - Tick features window: t ∈ [0, OBS_SECS) — resolved data only
-  - OB features: snapshot at ~t=150-170s in training (poly_l2 book), same in live
-  - Lag features: use only PREVIOUS slots (rank-1 .. rank-5) — NO current market data
-  - Temporal: slot_ts only — no future
+EXCLUÍDOS por lookahead ou impossibilidade WS:
+  - ob180_* features (requerem dados t=60-180s — além de OBS_SECS=60)
+  - ob_mid_drift, ob_imbalance_end, ob_spread_end (snapshot t>60s)
+  - ob_imb_w1, ob_imb_w2 (book real t=60-180s — WS só entrega no subscribe)
+  - clob_imb_mean/std/drift, clob_depth_trend (múltiplos book reais)
+  - clob_activity_rate (mismatch train vs live)
 
 Pipeline:
-  1. Download from HF
-  2. Build features (full parity with live)
-  3. Feature importance screening → select top N
-  4. Optuna tuning (150 trials)
-  5. Walk-forward evaluation (5-fold)
-  6. Realistic P&L backtest
-  7. Promote if beats champion
+  1. Download HF: markets, ticks, spot, ob_features_v31
+  2. Build 71 features (grupos A-F do features.md)
+  3. Noise canary + adversarial validation (anti-overfitting)
+  4. Purged WF CV (gap=5) feature screening
+  5. Optuna 200 trials com variance penalty
+  6. Walk-forward evaluation (5-fold, gap=5)
+  7. Promote se bate champion AUC
 """
 import modal
 
@@ -49,22 +42,23 @@ image = (
         "numpy>=1.26",
         "optuna>=3.6",
         "huggingface_hub>=0.26",
+        "scipy>=1.13",
     )
 )
 
 vol = modal.Volume.from_name("btc-training-cache", create_if_missing=True)
-app = modal.App("btc-v30-trainer", image=image)
+app = modal.App("btc-v30-run", image=image)
 
 
 @app.function(
     cpu=8,
     memory=32768,
-    timeout=7200,
+    timeout=10800,
     secrets=[modal.Secret.from_name("hf-token")],
     volumes={"/cache": vol},
 )
 def train_v30():
-    import gc, json, logging, math, os, pickle, sys, time, warnings
+    import gc, json, logging, math, os, pickle, sys, time, warnings, shutil
     from datetime import datetime, timezone
     from pathlib import Path
 
@@ -72,7 +66,7 @@ def train_v30():
     import optuna
     import pandas as pd
     import pyarrow.parquet as pq
-    from sklearn.calibration import CalibratedClassifierCV
+    from scipy import stats
     from sklearn.metrics import brier_score_loss, roc_auc_score
     from sklearn.model_selection import TimeSeriesSplit
     import lightgbm as lgb
@@ -86,9 +80,11 @@ def train_v30():
 
     HF_TOKEN      = os.environ.get("HF_TOKEN", "")
     HF_MODEL_REPO = "artbreguez/polymarket-btc-model"
+    HF_DATA_REPO  = "artbreguez/polymarket-btc-updown"
     SLOT_DURATION = 300
-    OPTUNA_TRIALS = 150
-    WF_GAP        = 288   # 288 barras de 5min = 24h de gap entre train e val (purge)
+    OBS_SECS      = 60
+    OPTUNA_TRIALS = 200
+    WF_GAP        = 5
     N_SPLITS      = 5
     DATA_DIR      = Path("/tmp/btc_data")
     DATA_DIR.mkdir(exist_ok=True)
@@ -101,18 +97,17 @@ def train_v30():
     # ══════════════════════════════════════════════════════════════════════
     log.info("=" * 70)
     log.info("STEP 0: Downloading training data from HuggingFace...")
-    import shutil
 
-    DATA_FILES = {
-        "all_markets.csv": "data/all_markets.csv",
-        "new_markets.csv": "data/new_markets.csv",
-        "ticks_btc_full_clean.parquet": "data/ticks_btc_full_clean.parquet",
-        "new_ticks_pmdata.parquet": "data/new_ticks_pmdata.parquet",
-        "binance_spot_full.parquet": "data/binance_spot_full.parquet",
+    MODEL_FILES = {
+        "all_markets.csv":            "data/all_markets.csv",
+        "binance_spot_full.parquet":  "data/binance_spot_full.parquet",
         "binance_spot_local.parquet": "data/binance_spot_local.parquet",
-        "ob_features_full.parquet": "data/ob_features_full.parquet",
     }
-    for local_name, hf_path in DATA_FILES.items():
+    # ob_features_v31 fica separado — deve ser upado via upload_data_to_hf.py antes do treino
+    OB_FILES = {
+        "ob_features_v31.parquet": "data/ob_features_v31.parquet",
+    }
+    for local_name, hf_path in MODEL_FILES.items():
         local_path = DATA_DIR / local_name
         if local_path.exists():
             log.info("  %s already cached", local_name)
@@ -128,10 +123,51 @@ def train_v30():
                 shutil.move(str(src), str(local_path))
             log.info("  Downloaded %s (%.1fMB)", local_name, local_path.stat().st_size / 1e6)
         except Exception as e:
-            log.warning("  Could not download %s: %s (may be optional)", local_name, e)
+            log.warning("  Could not download %s: %s", local_name, e)
+
+    for local_name, hf_path in OB_FILES.items():
+        local_path = DATA_DIR / local_name
+        if local_path.exists():
+            log.info("  %s already cached", local_name)
+            continue
+        try:
+            hf_hub_download(
+                repo_id=HF_MODEL_REPO, filename=hf_path,
+                token=HF_TOKEN, repo_type="model",
+                local_dir=str(DATA_DIR), local_dir_use_symlinks=False,
+            )
+            src = DATA_DIR / hf_path
+            if src.exists() and not local_path.exists():
+                shutil.move(str(src), str(local_path))
+            log.info("  Downloaded %s (%.1fMB)", local_name, local_path.stat().st_size / 1e6)
+        except Exception as e:
+            raise RuntimeError(f"ob_features_v31.parquet nao encontrado no HF! Rode upload_data_to_hf.py primeiro. Erro: {e}")
+
+    # Ticks vem do dataset repo
+    TICK_FILES = {
+        "ticks_btc_full_clean.parquet": "data/ticks_btc_full_clean.parquet",
+        "new_ticks_pmdata.parquet":     "data/new_ticks_pmdata.parquet",
+    }
+    for local_name, hf_path in TICK_FILES.items():
+        local_path = DATA_DIR / local_name
+        if local_path.exists():
+            log.info("  %s already cached", local_name)
+            continue
+        try:
+            hf_hub_download(
+                repo_id=HF_MODEL_REPO, filename=hf_path,
+                token=HF_TOKEN, repo_type="model",
+                local_dir=str(DATA_DIR), local_dir_use_symlinks=False,
+            )
+            src = DATA_DIR / hf_path
+            if src.exists() and not local_path.exists():
+                shutil.move(str(src), str(local_path))
+            log.info("  Downloaded %s (%.1fMB)", local_name, local_path.stat().st_size / 1e6)
+        except Exception as e:
+            log.warning("  Could not download %s: %s (opcional)", local_name, e)
 
     # Champion metrics
-    champion = {"version": "v25-v25_60s_30f", "wf_auc": 0.8575, "wf_brier": 0.1539, "wf_acc": 0.7739}
+    champion = {"version": "v26_40f_rt", "wf_auc": 0.857, "wf_brier": 0.999, "wf_acc": 0.0}
     try:
         meta_path = hf_hub_download(
             repo_id=HF_MODEL_REPO, filename="champion_meta.json",
@@ -139,10 +175,9 @@ def train_v30():
         )
         with open(meta_path) as f:
             champion = json.load(f)
-        log.info("Champion: %s AUC=%.4f Brier=%.4f Acc=%.4f",
-                 champion["version"], champion["wf_auc"], champion["wf_brier"], champion["wf_acc"])
+        log.info("Champion: %s AUC=%.4f", champion["version"], champion["wf_auc"])
     except Exception as e:
-        log.warning("Could not load champion meta: %s — using defaults", e)
+        log.warning("Could not load champion meta: %s — usando default", e)
 
     # ══════════════════════════════════════════════════════════════════════
     # STEP 1: LOAD MARKETS
@@ -153,71 +188,62 @@ def train_v30():
     markets = pd.read_csv(DATA_DIR / "all_markets.csv")
     markets["market_id"] = markets["market_id"].astype(str)
     markets["slot_ts"]   = markets["slot_ts"].astype(int)
-
-    # Merge expansion markets
-    new_mkt_path = DATA_DIR / "new_markets.csv"
-    if new_mkt_path.exists():
-        new_mkts = pd.read_csv(new_mkt_path)
-        new_mkts["market_id"] = new_mkts["market_id"].astype(str)
-        new_mkts["slot_ts"]   = new_mkts["slot_ts"].astype(int)
-        if "target" in new_mkts.columns:
-            existing_ids = set(markets["market_id"])
-            truly_new = new_mkts[~new_mkts["market_id"].isin(existing_ids)]
-            if len(truly_new) > 0:
-                markets = pd.concat([markets, truly_new[markets.columns]], ignore_index=True)
-                log.info("  Added %d expansion markets", len(truly_new))
-
     markets = markets.sort_values("slot_ts").reset_index(drop=True)
     log.info("Total markets: %d (%.1f%% UP)", len(markets), 100 * markets["target"].mean())
 
     markets["rank"] = range(len(markets))
-    slot_to_rank  = dict(zip(markets["slot_ts"], markets["rank"]))
-    all_targets   = markets["target"].values
-    all_slot_ts   = markets["slot_ts"].values
-    all_mids      = markets["market_id"].values
+    slot_to_rank = dict(zip(markets["slot_ts"], markets["rank"]))
+    all_targets  = markets["target"].values
+    all_slot_ts  = markets["slot_ts"].values
+    all_mids     = markets["market_id"].values
 
     # ══════════════════════════════════════════════════════════════════════
-    # STEP 2: LOAD OB FEATURES
+    # STEP 2: LOAD OB FEATURES v31 (ob60_* apenas — sem lookahead)
     # ══════════════════════════════════════════════════════════════════════
     log.info("=" * 70)
-    log.info("STEP 2: Loading L2 orderbook features...")
-    ob_path = DATA_DIR / "ob_features_full.parquet"
+    log.info("STEP 2: Loading ob_features_v31 (ob60_* only, t<60s)...")
+
+    ob_path = DATA_DIR / "ob_features_v31.parquet"
     if not ob_path.exists():
-        raise RuntimeError("ob_features_full.parquet not found!")
+        raise RuntimeError("ob_features_v31.parquet não encontrado! Aguarde o fetch completar.")
 
     ob_df = pd.read_parquet(str(ob_path))
     ob_df["market_id"] = ob_df["market_id"].astype(str)
-    ob_by_market = ob_df.set_index("market_id").to_dict("index")
-    # Exclude features removed from model: divergent live coverage, warm-up deps, or unreliable
-    OB_EXCLUDED = {
-        "ob_imb_w0", "ob_pc_count", "ob_fill_imbalance",  # removed previously
-        "ob_imb_w1", "ob_imb_w2",                         # ❌ quase sempre 0.0 live (1 WS book snap)
-        "ob_pc_up_ratio", "ob_pc_volatility",              # ⚠️ reset em reconexão WS
-        "ob_mid_drift",                                    # ⚠️ timing gap ~72s; cascata: x_drift/x_ob_drift
-        "clob_imb_mean", "clob_imb_std", "clob_imb_drift", # ❌ quase sempre 0.0 live (1 WS book snap)
-        "clob_depth_trend",                                # ❌ idem
-        "clob_activity_rate",                              # ⚠️ levemente diferente do treino
-        # v29: removidas por leakage temporal (capturadas em t=108-168s, após OBS_SECS=60s)
-        "ob_mid",             # corr=0.60 com target — snapshot em t arbitrário pós-60s
-        "ob_imbalance_end",   # close_snap em t=150-168s → leakage
-        "ob_spread_end",      # close_snap em t=150-168s → leakage
-        "ob_imb_momentum",    # close_snap - open_snap → leakage
-        "ob_depth_change",    # close_snap - open_snap → leakage
-        "clob_mid_velocity",  # janela 108-168s → leakage
-        "ob_weighted_imb",    # static snapshot de timing incerto, corr=0.45
-        "ob_bid_depth_5c",    # static snapshot suspeito, corr=0.28
-        "ob_ask_depth_5c",    # static snapshot suspeito, corr=0.28
-        "ob_total_depth",     # u274c v30: adversarial AUC=1.0, drift OB sintetico holdout vs real treino
-    }
-    ob_cols = [c for c in ob_df.columns if c != "market_id" and c not in OB_EXCLUDED]
-    log.info("OB features: %d markets, %d features (excluded %s): %s",
-             len(ob_df), len(ob_cols), OB_EXCLUDED, ob_cols[:5])
+
+    # Usar APENAS ob60_* — ob180_* contém t>60s (lookahead)
+    ob60_cols = [c for c in ob_df.columns if c.startswith("ob60_")]
+    ob_df_60  = ob_df[["market_id"] + ob60_cols].copy()
+
+    # REMOVER features não disponíveis no live:
+    #   pc_volatility   — não existe no live
+    #   clob_mid_velocity — não está no CLOB_KEEP do live (removido por divergência)
+    DROP_OB60 = {"ob60_pc_volatility", "ob60_clob_mid_velocity"}
+    ob60_cols = [c for c in ob60_cols if c not in DROP_OB60]
+    ob_df_60  = ob_df_60[["market_id"] + ob60_cols]
+
+    # Rename ob60_X → nome canônico do live:
+    #   ob60_clob_* → clob_*  (sem prefixo ob_)
+    #   ob60_*      → ob_*    (substitui ob60_ por ob_)
+    def _canonical(col: str) -> str:
+        col = col.replace("ob60_clob_", "clob_")
+        col = col.replace("ob60_",      "ob_")
+        return col
+
+    rename_map = {c: _canonical(c) for c in ob60_cols}
+    ob_df_60.rename(columns=rename_map, inplace=True)
+    ob_cols = list(rename_map.values())
+
+    ob_by_market = ob_df_60.set_index("market_id").to_dict("index")
+    log.info("OB features: %d markets, %d cols: %s", len(ob_df_60), len(ob_cols), ob_cols)
+    del ob_df
+    gc.collect()
 
     # ══════════════════════════════════════════════════════════════════════
     # STEP 3: LOAD BINANCE SPOT
     # ══════════════════════════════════════════════════════════════════════
     log.info("=" * 70)
     log.info("STEP 3: Loading Binance spot...")
+
     spot_dfs = []
     for sp in ["binance_spot_full.parquet", "binance_spot_local.parquet"]:
         sp_path = DATA_DIR / sp
@@ -225,100 +251,143 @@ def train_v30():
             spot_dfs.append(pd.read_parquet(str(sp_path)))
     spot_df = pd.concat(spot_dfs, ignore_index=True) if spot_dfs else pd.DataFrame()
     spot_df = spot_df.sort_values("timestamp_ms").drop_duplicates("timestamp_ms")
-    spot_ts_arr = (spot_df["timestamp_ms"].values // 1000).astype(np.int64)
-    spot_px_arr = spot_df["close"].values.astype(np.float64)
-    spot_vol_arr = spot_df["volume"].values.astype(np.float64) if "volume" in spot_df.columns else np.zeros(len(spot_df))
-    spot_hi_arr = spot_df["high"].values.astype(np.float64) if "high" in spot_df.columns else spot_px_arr.copy()
-    spot_lo_arr = spot_df["low"].values.astype(np.float64) if "low" in spot_df.columns else spot_px_arr.copy()
-    log.info("Binance spot: %d candles (%.0f days)", len(spot_ts_arr), (spot_ts_arr[-1] - spot_ts_arr[0]) / 86400)
+    spot_ts_arr  = (spot_df["timestamp_ms"].values // 1000).astype(np.int64)
+    spot_px_arr  = spot_df["close"].values.astype(np.float64)
+    spot_vol_arr = spot_df["volume"].values.astype(np.float64) if "volume" in spot_df else np.zeros(len(spot_df))
+    spot_hi_arr  = spot_df["high"].values.astype(np.float64)  if "high"   in spot_df else spot_px_arr.copy()
+    spot_lo_arr  = spot_df["low"].values.astype(np.float64)   if "low"    in spot_df else spot_px_arr.copy()
+    log.info("Binance spot: %d candles (%.0f days)", len(spot_ts_arr),
+             (spot_ts_arr[-1] - spot_ts_arr[0]) / 86400)
 
     # ══════════════════════════════════════════════════════════════════════
-    # STEP 4: LOAD TICKS (for lag history + tick features)
+    # STEP 4: LOAD TICKS (lag history + Grupo D features)
     # ══════════════════════════════════════════════════════════════════════
     log.info("=" * 70)
-    log.info("STEP 4: Loading ticks (lag features + tick-based order flow)...")
-    all_mids_set = set(markets["market_id"].tolist())
-    tick_cols = ["market_id", "timestamp_ms", "outcome", "side", "price", "size_usdc"]
+    log.info("STEP 4: Loading ticks (lag + Grupo D features, t<60s)...")
 
-    pf = pq.ParquetFile(str(DATA_DIR / "ticks_btc_full_clean.parquet"))
+    all_mids_set = set(markets["market_id"].tolist())
+    tick_cols    = ["market_id", "timestamp_ms", "outcome", "side", "price", "size_usdc"]
+
     chunks = []
-    for rg_i in range(pf.metadata.num_row_groups):
-        chunk = pf.read_row_group(rg_i, columns=tick_cols).to_pandas()
-        chunk["market_id"] = chunk["market_id"].astype(str)
-        chunk = chunk[chunk["market_id"].isin(all_mids_set)]
-        if len(chunk):
-            chunks.append(chunk)
+    tick_path = DATA_DIR / "ticks_btc_full_clean.parquet"
+    if tick_path.exists():
+        pf = pq.ParquetFile(str(tick_path))
+        for rg_i in range(pf.metadata.num_row_groups):
+            chunk = pf.read_row_group(rg_i, columns=tick_cols).to_pandas()
+            chunk["market_id"] = chunk["market_id"].astype(str)
+            chunk = chunk[chunk["market_id"].isin(all_mids_set)]
+            if len(chunk):
+                chunks.append(chunk)
 
     new_tick_path = DATA_DIR / "new_ticks_pmdata.parquet"
     if new_tick_path.exists():
-        new_ticks = pd.read_parquet(str(new_tick_path))
-        new_ticks["market_id"] = new_ticks["market_id"].astype(str)
-        new_ticks = new_ticks[new_ticks["market_id"].isin(all_mids_set)]
-        if len(new_ticks) > 0:
+        nt = pd.read_parquet(str(new_tick_path))
+        nt["market_id"] = nt["market_id"].astype(str)
+        nt = nt[nt["market_id"].isin(all_mids_set)]
+        if len(nt):
             for col in tick_cols:
-                if col not in new_ticks.columns:
-                    new_ticks[col] = 0
-            chunks.append(new_ticks[tick_cols])
+                if col not in nt.columns:
+                    nt[col] = 0
+            chunks.append(nt[tick_cols])
 
+    gc.collect()
     btc = pd.concat(chunks, ignore_index=True)
     btc = btc[btc["timestamp_ms"] > 0]
 
     slot_ts_map = dict(zip(markets["market_id"], markets["slot_ts"]))
     btc["slot_ts_val"] = btc["market_id"].map(slot_ts_map).astype(float)
     btc["t_sec"] = btc["timestamp_ms"].astype(float) / 1000 - btc["slot_ts_val"]
-    btc = btc[(btc["t_sec"] >= 0) & (btc["t_sec"] < 300)]
-    log.info("Total ticks: %d for %d markets", len(btc), btc["market_id"].nunique())
 
-    # ── Compute per-slot aggregates for lag features ─────────────────────
-    OBS_SECS = 60
-    filtered = btc[(btc["t_sec"] >= 0) & (btc["t_sec"] < OBS_SECS)]
-    up_f = filtered[filtered["outcome"] == "Up"]
-    dn_f = filtered[filtered["outcome"] == "Down"]
-    slot_vol_up  = up_f.groupby("market_id")["size_usdc"].sum()
-    slot_vol_dn  = dn_f.groupby("market_id")["size_usdc"].sum()
+    # CORTE ESTRITO t<60s — nunca usar dados além de OBS_SECS
+    btc = btc[(btc["t_sec"] >= 0) & (btc["t_sec"] < OBS_SECS)]
+    log.info("Ticks t<60s: %d para %d markets", len(btc), btc["market_id"].nunique())
+
+    # ── Grupo D: features de order flow por mercado ───────────────────────
+    log.info("Computando Grupo D (order flow features)...")
+
+    def _safe_div(a, b, fill=0.5):
+        return np.where(b > 1e-9, a / b, fill)
+
+    up_mask  = btc["outcome"] == "Up"
+    dn_mask  = btc["outcome"] == "Down"
+    buy_mask = btc["side"]    == "BUY"
+    sel_mask = btc["side"]    == "SELL"
+
+    up_ticks = btc[up_mask]
+    dn_ticks = btc[dn_mask]
+
+    slot_vol_up  = up_ticks.groupby("market_id")["size_usdc"].sum()
+    slot_vol_dn  = dn_ticks.groupby("market_id")["size_usdc"].sum()
     slot_vol_tot = slot_vol_up.add(slot_vol_dn, fill_value=0)
-    slot_up_ratio = slot_vol_up / slot_vol_tot.clip(lower=1e-9)
-    slot_nticks   = filtered.groupby("market_id").size()
+    slot_nticks  = btc.groupby("market_id").size()
 
-    # ── Pre-compute per-market tick features (t ∈ [0, OBS_SECS)) ─────────
-    # These match live build_features() exactly — same window, same formula.
-    # LOOKAHEAD NOTE: we use t ∈ [0, OBS_SECS=60s) only — bot observes until
-    # t=60s, so this data is already resolved at prediction time (t=170-240s).
-    log.info("Pre-computing tick features for %d markets...", len(markets))
+    # btc_up_ratio (vol-weighted)
+    slot_up_ratio = (slot_vol_up / slot_vol_tot.clip(lower=1e-9)).fillna(0.5)
 
-    tick_by_market: dict = {}  # market_id -> list of tick dicts
-    for mid, grp in btc[btc["t_sec"] < OBS_SECS].groupby("market_id"):
-        tick_by_market[mid] = grp[["t_sec", "outcome", "side", "price", "size_usdc"]].to_dict("records")
+    # btc_buy_ratio (count-based)
+    n_buy = btc[buy_mask].groupby("market_id").size()
+    n_sel = btc[sel_mask].groupby("market_id").size()
+    n_tot = n_buy.add(n_sel, fill_value=0)
+    slot_buy_ratio = (n_buy / n_tot.clip(lower=1)).fillna(0.5)
 
-    del chunks, filtered, up_f, dn_f
+    # Janelas temporais w0=[0,30s) e w1=[30,60s)
+    w0_mask = btc["t_sec"] <  30
+    w1_mask = btc["t_sec"] >= 30
+
+    def _win_up_ratio(mask):
+        sub = btc[mask]
+        vu = sub[sub["outcome"] == "Up"].groupby("market_id")["size_usdc"].sum()
+        vd = sub[sub["outcome"] == "Down"].groupby("market_id")["size_usdc"].sum()
+        vt = vu.add(vd, fill_value=0)
+        return (vu / vt.clip(lower=1e-9)).fillna(0.5)
+
+    slot_up_w0 = _win_up_ratio(w0_mask)
+    slot_up_w1 = _win_up_ratio(w1_mask)
+    slot_momentum = slot_up_w1.sub(slot_up_w0, fill_value=0).fillna(0.0)
+    slot_ur_stability = pd.concat([slot_up_w0, slot_up_w1], axis=1).std(axis=1).fillna(0.0)
+
+    # size disparity
+    avg_up_size = up_ticks.groupby("market_id")["size_usdc"].mean().fillna(0)
+    avg_dn_size = dn_ticks.groupby("market_id")["size_usdc"].mean().fillna(0)
+    slot_size_disp = avg_up_size.sub(avg_dn_size, fill_value=0)
+
+    # btc_vwap_up/dn/spread REMOVIDOS — não existem no live; cálculo omitido
+
+    # time-weighted up_ratio (exp decay, recentes têm mais peso)
+    def _tw_up_ratio():
+        sub = btc.copy()
+        sub["w"] = np.exp(-0.02 * (OBS_SECS - sub["t_sec"])) * sub["size_usdc"]
+        sub["w_up"] = sub["w"] * (sub["outcome"] == "Up").astype(float)
+        tw_up  = sub.groupby("market_id")["w_up"].sum()
+        tw_tot = sub.groupby("market_id")["w"].sum().clip(lower=1e-9)
+        return (tw_up / tw_tot).fillna(0.5)
+
+    slot_tw_up_ratio = _tw_up_ratio()
+
+    del btc, chunks, up_ticks, dn_ticks
     gc.collect()
-    log.info("Tick features ready. Memory partial-freed.")
+    log.info("Grupo D computado. Memória liberada.")
 
     # ══════════════════════════════════════════════════════════════════════
-    # STEP 5: BUILD FEATURES (FULL PARITY WITH live_trader.py build_features)
+    # STEP 5: BUILD FEATURE MATRIX (71 features, grupos A-F)
     # ══════════════════════════════════════════════════════════════════════
     log.info("=" * 70)
-    log.info("STEP 5: Building features (train == live parity) for %d markets...", len(markets))
+    log.info("STEP 5: Building feature matrix (%d markets)...", len(markets))
 
     def spot_at(ts_s):
         idx = np.searchsorted(spot_ts_arr, ts_s, side="right") - 1
-        idx = max(0, min(idx, len(spot_px_arr) - 1))
-        return float(spot_px_arr[idx])
+        return float(spot_px_arr[max(0, min(idx, len(spot_px_arr) - 1))])
 
     def spot_vol_at(ts_start, ts_end):
-        """Sum of Binance candle volumes in [ts_start, ts_end)."""
         i0 = int(np.searchsorted(spot_ts_arr, ts_start, side="left"))
-        i1 = int(np.searchsorted(spot_ts_arr, ts_end, side="right"))
-        if i1 > i0:
-            return float(spot_vol_arr[i0:i1].sum())
-        return 0.0
+        i1 = int(np.searchsorted(spot_ts_arr, ts_end,   side="right"))
+        return float(spot_vol_arr[i0:i1].sum()) if i1 > i0 else 0.0
 
     def spot_volatility(ts_start, ts_end):
-        """Std of 1-min returns in [ts_start, ts_end)."""
         i0 = int(np.searchsorted(spot_ts_arr, ts_start, side="left"))
-        i1 = int(np.searchsorted(spot_ts_arr, ts_end, side="right"))
+        i1 = int(np.searchsorted(spot_ts_arr, ts_end,   side="right"))
         if i1 - i0 >= 3:
-            px = spot_px_arr[i0:i1]
+            px   = spot_px_arr[i0:i1]
             rets = np.diff(px) / px[:-1]
             return float(np.std(rets))
         return 0.0
@@ -327,154 +396,83 @@ def train_v30():
     skipped_no_ob = 0
 
     for rank_i, row in markets.iterrows():
-        mid     = row["market_id"]
-        slot_ts = int(row["slot_ts"])
-        target  = int(row["target"])
+        mid      = row["market_id"]
+        slot_ts  = int(row["slot_ts"])
+        target   = int(row["target"])
         ext_rank = slot_to_rank.get(slot_ts, rank_i)
 
         feat = {}
 
-        # ── A. SPOT FEATURES (Binance, <2s lag) ──────────────────────
-        obs_end_ts = slot_ts + OBS_SECS  # t=60s — NO future data
-        px_now = spot_at(obs_end_ts)
+        obs_end = slot_ts + OBS_SECS  # t=60s
 
-        def pre_ret(h_sec):
-            px_h = spot_at(slot_ts - h_sec)
-            return (px_now / px_h - 1) if px_h > 0 else 0.0
+        # ── Grupo A: Spot Binance ─────────────────────────────────────────
+        px_now = spot_at(obs_end)
 
-        feat["btc_pre_5m_ret"]  = pre_ret(300)
-        feat["btc_pre_15m_ret"] = pre_ret(900)
-        feat["btc_pre_30m_ret"] = pre_ret(1800)
-        feat["btc_pre_1h_ret"]  = pre_ret(3600)
+        feat["btc_pre_5m_ret"]  = (px_now / spot_at(slot_ts - 300)  - 1) if spot_at(slot_ts - 300)  > 0 else 0.0
+        feat["btc_pre_15m_ret"] = (px_now / spot_at(slot_ts - 900)  - 1) if spot_at(slot_ts - 900)  > 0 else 0.0
+        feat["btc_pre_30m_ret"] = (px_now / spot_at(slot_ts - 1800) - 1) if spot_at(slot_ts - 1800) > 0 else 0.0
+        feat["btc_pre_1h_ret"]  = (px_now / spot_at(slot_ts - 3600) - 1) if spot_at(slot_ts - 3600) > 0 else 0.0
+        feat["btc_pre_4h_ret"]  = (px_now / spot_at(slot_ts - 14400)- 1) if spot_at(slot_ts - 14400)> 0 else 0.0
+        # btc_pre_1h_4h_ratio REMOVIDO — warm-up 4h, não existe no live
 
-        # In-slot return/range during [slot_ts, slot_ts+OBS_SECS]
         t0_idx = int(np.searchsorted(spot_ts_arr, slot_ts, side="left"))
-        t1_idx = int(np.searchsorted(spot_ts_arr, obs_end_ts, side="right"))
+        t1_idx = int(np.searchsorted(spot_ts_arr, obs_end,  side="right"))
         if t1_idx > t0_idx:
             inslot_px = spot_px_arr[t0_idx:t1_idx]
-            feat["btc_inslot_ret"] = float(inslot_px[-1] / inslot_px[0] - 1) if inslot_px[0] > 0 else 0.0
-            feat["btc_inslot_vol"] = float(np.std(inslot_px) / (np.mean(inslot_px) + 1e-8)) if len(inslot_px) > 1 else 0.0
-            inslot_hi = spot_hi_arr[t0_idx:t1_idx]
-            inslot_lo = spot_lo_arr[t0_idx:t1_idx]
-            feat["btc_inslot_range"] = float((inslot_hi.max() - inslot_lo.min()) / px_now) if px_now > 0 else 0.0
+            feat["btc_inslot_ret"]   = float(inslot_px[-1] / inslot_px[0] - 1) if inslot_px[0] > 0 else 0.0
+            feat["btc_inslot_range"] = float((spot_hi_arr[t0_idx:t1_idx].max() - spot_lo_arr[t0_idx:t1_idx].min()) / px_now) if px_now > 0 else 0.0
         else:
-            feat["btc_inslot_ret"] = 0.0
-            feat["btc_inslot_vol"] = 0.0
-            feat["btc_inslot_range"] = 0.0
+            feat["btc_inslot_ret"] = feat["btc_inslot_range"] = 0.0
 
-        # Volatility features
-        feat["btc_vol_1h"]  = spot_volatility(slot_ts - 3600, slot_ts)
-        # Normalizar retornos pelo vol_1h — remove sensibilidade de regime
-        # floor=1e-4 (~0.01%/candle) evita divisao por zero em mercados flat
+        feat["btc_vol_1h"]  = spot_volatility(slot_ts - 3600,  slot_ts)
+        # v30 FIX: normalizar retornos por vol_1h — idêntico ao live_trader.py
         _vol_norm = max(feat["btc_vol_1h"], 1e-4)
         for _fk in ("btc_inslot_ret", "btc_pre_5m_ret", "btc_pre_15m_ret",
                     "btc_pre_30m_ret", "btc_pre_1h_ret", "btc_inslot_range"):
             if _fk in feat:
                 feat[_fk] = feat[_fk] / _vol_norm
 
-        # Momentum consistency — removed btc_pre_1h_4h_ratio (warm-up 4h dependency)
+        # btc_vol_4h REMOVIDO — warm-up 4h, não existe no live
 
-        # Round-number proximity
-        if px_now > 0:
-            px_k = px_now / 1000
-            feat["btc_dist_1k"] = float(min(px_k - math.floor(px_k), math.ceil(px_k) - px_k))
-        else:
-            feat["btc_dist_1k"] = 0.5
+        px_k = px_now / 1000
+        feat["btc_dist_1k"] = min(px_k - math.floor(px_k), math.ceil(px_k) - px_k)
 
-        # Volume ratio
-        feat["btc_spot_vol_ratio"] = (
-            spot_vol_at(slot_ts - 300, slot_ts) / (spot_vol_at(slot_ts - 3600, slot_ts - 300) / 11 + 1e-9)
-        )
+        slot_vol = spot_vol_at(slot_ts - 300, slot_ts)
+        h1_vol   = spot_vol_at(slot_ts - 3600, slot_ts - 300)
+        feat["btc_spot_vol_ratio"] = slot_vol / (h1_vol / 11 + 1e-9)
 
-        # ── B. L2 ORDERBOOK FEATURES (<5s lag) ───────────────────────
+        # ── Grupo B: L2 Orderbook (ob60_* → nomes canônicos) ─────────────
         ob = ob_by_market.get(mid)
         if ob is not None:
             for col in ob_cols:
-                key = col if (col.startswith("ob_") or col.startswith("clob_")) else f"ob_{col}"
-                feat[key] = float(ob.get(col, 0.0))
+                feat[col] = float(ob.get(col, 0.0))
         else:
             skipped_no_ob += 1
             for col in ob_cols:
-                key = col if (col.startswith("ob_") or col.startswith("clob_")) else f"ob_{col}"
                 if "ratio" in col or "imbalance" in col or "imb" in col:
-                    feat[key] = 0.0
+                    feat[col] = 0.5
                 elif "spread" in col:
-                    feat[key] = 0.02
-                elif "depth" in col and "5c" in col:
-                    feat[key] = 0.5
-                elif "mid" in col and "drift" not in col:
-                    feat[key] = 0.5
-                elif "total_depth" in col:
-                    feat[key] = 1000.0
-                elif "depth_ratio" in col:
-                    feat[key] = 1.0
+                    feat[col] = 0.02
+                elif "depth_5c" in col:
+                    feat[col] = 0.5
+                elif col == "ob_mid":
+                    feat[col] = 0.5
                 else:
-                    feat[key] = 0.0
+                    feat[col] = 0.0
 
-        # ── C. TICK-BASED ORDER FLOW (t ∈ [0, OBS_SECS)) ────────────
-        # Matches live build_features() exactly — same formula, same window.
-        ticks = tick_by_market.get(mid, [])
-        if ticks:
-            n      = len(ticks)
-            vol_up = sum(t["size_usdc"] for t in ticks if t.get("outcome") == "Up")
-            vol_dn = sum(t["size_usdc"] for t in ticks if t.get("outcome") == "Down")
-            total  = vol_up + vol_dn + 1e-8
+        # ── Grupo D: Order Flow (ticks t<60s) ────────────────────────────
+        feat["btc_up_ratio"]        = float(slot_up_ratio.get(mid, 0.5))
+        feat["btc_n_ticks"]         = float(slot_nticks.get(mid, 0.0))
+        feat["btc_buy_ratio"]       = float(slot_buy_ratio.get(mid, 0.5))
+        feat["btc_tw_up_ratio"]     = float(slot_tw_up_ratio.get(mid, 0.5))
+        feat["btc_momentum"]        = float(slot_momentum.get(mid, 0.0))
+        feat["btc_up_w0"]           = float(slot_up_w0.get(mid, 0.5))
+        feat["btc_up_w1"]           = float(slot_up_w1.get(mid, 0.5))
+        feat["btc_size_disparity"]  = float(slot_size_disp.get(mid, 0.0))
+        feat["btc_up_ratio_stability"] = float(slot_ur_stability.get(mid, 0.0))
+        # btc_vwap_up/dn/spread REMOVIDOS — não existem no live
 
-            up_tks = [t for t in ticks if t.get("outcome") == "Up"]
-            dn_tks = [t for t in ticks if t.get("outcome") == "Down"]
-
-            def _ur_w(subset):
-                vu = sum(t["size_usdc"] for t in subset if t.get("outcome") == "Up")
-                tt = sum(t["size_usdc"] for t in subset) + 1e-8
-                return float(vu / tt)
-
-            # 2x30s sub-windows (only w0/w1 real for OBS_SECS=60; w2-w5 always 0.5 → removed)
-            sw = {}
-            n_real_windows = OBS_SECS // 30  # 2
-            for i in range(2):
-                t0_w, t1_w = i * 30, (i + 1) * 30
-                sub = [t for t in ticks if t0_w <= t["t_sec"] < t1_w]
-                sw[f"btc_up_w{i}"] = _ur_w(sub) if sub else 0.5
-
-            w_vals = [sw[f"btc_up_w{i}"] for i in range(2)]
-            btc_momentum = float(sw["btc_up_w1"] - sw["btc_up_w0"])  # w1 - w0 (only real windows)
-            # Stability: std of real windows only
-            up_ratio_stability = float(np.std(w_vals))
-
-            avg_up_sz = float(sum(t["size_usdc"] for t in up_tks) / (len(up_tks) + 1e-8))
-            avg_dn_sz = float(sum(t["size_usdc"] for t in dn_tks) / (len(dn_tks) + 1e-8))
-            size_disparity = float(avg_up_sz - avg_dn_sz)
-
-            cur_up_ratio = float(vol_up / total)
-
-            feat.update({
-                "btc_up_ratio":           cur_up_ratio,
-                "btc_n_ticks":            float(n),
-                "btc_buy_ratio":          float(sum(t["size_usdc"] for t in ticks if t.get("side") == "BUY") / total),
-                "btc_momentum":           btc_momentum,
-                "btc_size_disparity":     size_disparity,
-                "btc_up_ratio_stability": up_ratio_stability,
-                **sw,
-            })
-
-            # Time-weighted up ratio (exponential recency decay — matches live)
-            t_arr  = np.array([t["t_sec"] for t in ticks], dtype=np.float64)
-            sz_arr = np.array([t.get("size_usdc", 1.0) for t in ticks], dtype=np.float64)
-            up_arr = np.array([1.0 if t.get("outcome") == "Up" else 0.0 for t in ticks])
-            w_exp  = np.exp(-0.02 * (OBS_SECS - t_arr))
-            feat["btc_tw_up_ratio"] = float(np.sum(up_arr * sz_arr * w_exp) / (np.sum(sz_arr * w_exp) + 1e-9))
-        else:
-            # No ticks — neutral fill
-            cur_up_ratio = 0.5
-            feat.update({
-                "btc_up_ratio": 0.5, "btc_n_ticks": 0.0,
-                "btc_buy_ratio": 0.5, "btc_momentum": 0.0,
-                "btc_size_disparity": 0.0, "btc_up_ratio_stability": 0.0,
-                "btc_tw_up_ratio": 0.5,
-                "btc_up_w0": 0.5, "btc_up_w1": 0.5,
-            })
-
-        # ── D. LAG FEATURES (from previous resolved slots) ───────────
+        # ── Grupo E: Lag History (ring buffer) ───────────────────────────
         lag_streak = 0
         streak_dir = None
 
@@ -485,18 +483,18 @@ def train_v30():
                 prev_slot   = int(all_slot_ts[prev_rank])
                 prev_mid    = all_mids[prev_rank]
 
-                time_gap = slot_ts - prev_slot
-                if time_gap > lag_n * SLOT_DURATION * 3:
+                # Gap muito grande → janela perdida
+                if (slot_ts - prev_slot) > lag_n * SLOT_DURATION * 3:
                     feat[f"lag_{lag_n}_outcome"]       = 0.5
                     feat[f"prev_slot_up_ratio_{lag_n}"] = 0.5
                     feat[f"prev_slot_n_ticks_{lag_n}"]  = 0.0
-                    feat[f"prev_slot_vol_{lag_n}"]       = 0.0
+                    feat[f"prev_slot_vol_{lag_n}"]      = 0.0
                     continue
 
                 feat[f"lag_{lag_n}_outcome"]        = float(prev_target)
                 feat[f"prev_slot_up_ratio_{lag_n}"] = float(slot_up_ratio.get(prev_mid, 0.5))
                 feat[f"prev_slot_n_ticks_{lag_n}"]  = float(slot_nticks.get(prev_mid, 0.0))
-                feat[f"prev_slot_vol_{lag_n}"]       = float(slot_vol_tot.get(prev_mid, 0.0))
+                feat[f"prev_slot_vol_{lag_n}"]      = float(slot_vol_tot.get(prev_mid, 0.0) if prev_mid in slot_vol_tot else 0.0)
 
                 if lag_n == 1:
                     streak_dir = prev_target; lag_streak = 1
@@ -509,7 +507,6 @@ def train_v30():
 
         feat["lag_streak"] = float(lag_streak)
 
-        # Z-scores from lag history
         def _hist_ur(lookback=20):
             vals = []
             for d in range(1, lookback + 1):
@@ -523,533 +520,332 @@ def train_v30():
             return vals
 
         hist_vals = _hist_ur(20)
-        prev_ur_1 = feat.get("prev_slot_up_ratio_1", 0.5)
+        cur_ur    = feat.get("prev_slot_up_ratio_1", 0.5)
         if len(hist_vals) >= 3:
             mu20 = np.mean(hist_vals); sd20 = max(np.std(hist_vals), 0.01)
-            feat["lag_ur_zscore_20"] = float(np.clip((prev_ur_1 - mu20) / sd20, -5, 5))
-            feat["btc_up_ratio_zscore_20s"] = float(np.clip((cur_up_ratio - mu20) / sd20, -5, 5))
+            feat["lag_ur_zscore_20"] = float(np.clip((cur_ur - mu20) / sd20, -5, 5))
         else:
             feat["lag_ur_zscore_20"] = 0.0
-            feat["btc_up_ratio_zscore_20s"] = 0.0
 
         hist5 = hist_vals[:5]
         if len(hist5) >= 2:
             mu5 = np.mean(hist5); sd5 = max(np.std(hist5), 0.01)
-            feat["lag_ur_zscore_5"] = float(np.clip((prev_ur_1 - mu5) / sd5, -5, 5))
-            feat["btc_up_ratio_zscore_5s"] = float(np.clip((cur_up_ratio - mu5) / sd5, -5, 5))
+            feat["lag_ur_zscore_5"] = float(np.clip((cur_ur - mu5) / sd5, -5, 5))
         else:
             feat["lag_ur_zscore_5"] = 0.0
-            feat["btc_up_ratio_zscore_5s"] = 0.0
 
-        # ── E. TEMPORAL FEATURES ─────────────────────────────────────
+        # btc_up_ratio z-scores — computados no Grupo E (lag_ur_zscore_5/20) — sem aliases
+
+        # ── Grupo F: Temporais + Cross-features ──────────────────────────
         dt   = datetime.fromtimestamp(slot_ts, tz=timezone.utc)
         hour = dt.hour + dt.minute / 60.0
         dow  = dt.weekday()
 
         feat["hour_sin"] = math.sin(2 * math.pi * hour / 24)
         feat["hour_cos"] = math.cos(2 * math.pi * hour / 24)
-        feat["dow_sin"]  = math.sin(2 * math.pi * dow / 7)
-        feat["dow_cos"]  = math.cos(2 * math.pi * dow / 7)
-        # Temporal interaction features (matches live)
-        feat["hour_x_up_ratio"] = cur_up_ratio * (hour / 24.0)
-        feat["hour_x_tw_ur"]    = feat.get("btc_tw_up_ratio", 0.5) * (hour / 24.0)
+        feat["dow_sin"]  = math.sin(2 * math.pi * dow  / 7)
+        feat["dow_cos"]  = math.cos(2 * math.pi * dow  / 7)
 
-        # ── F. CROSS-DOMAIN INTERACTIONS (OB x CLOB x Spot) ─────────
-        # ob_mid_drift removed → x_drift_x_ret5m and x_ob_drift_x_inslot removed too
-        feat["x_imb_x_inslot"]     = feat.get("ob_imbalance", 0.0) * feat.get("btc_inslot_ret", 0.0)
-        feat["x_imb_end_x_ret"]    = feat.get("ob_imbalance_end", 0.0) * feat.get("btc_inslot_ret", 0.0)
-        feat["x_spread_x_vol"]     = feat.get("ob_spread", 0.02) * feat.get("btc_vol_1h", 0.0)
-        feat["x_depth_x_vol"]      = feat.get("ob_depth_ratio", 1.0) * feat.get("btc_vol_1h", 0.0)
-        feat["x_imb_x_ur"]         = feat.get("ob_imbalance", 0.0) * cur_up_ratio
-        feat["x_depth_x_momentum"] = feat.get("ob_depth_ratio", 1.0) * feat.get("btc_momentum", 0.0)
+        feat["hour_x_up_ratio"] = feat["btc_up_ratio"]    * (hour / 24)
+        feat["hour_x_tw_ur"]    = feat["btc_tw_up_ratio"] * (hour / 24)
+
+        # Cross-features: usar nomes canônicos do live (ob_imbalance/ob_spread/ob_depth_ratio)
+        ob_imb = feat.get("ob_imbalance", 0.0)
+        feat["x_imb_x_inslot"]     = ob_imb * feat["btc_inslot_ret"]
+        feat["x_imb_x_ur"]         = ob_imb * feat["btc_up_ratio"]
+        feat["x_spread_x_vol"]     = feat.get("ob_spread", 0.0) * feat["btc_vol_1h"]
+        feat["x_depth_x_vol"]      = feat.get("ob_depth_ratio", 1.0) * feat["btc_vol_1h"]
+        feat["x_depth_x_momentum"] = feat.get("ob_depth_ratio", 1.0) * feat["btc_momentum"]
 
         feat["target"] = target
         rows.append(feat)
 
     df = pd.DataFrame(rows)
     FEATURE_COLS = [c for c in df.columns if c != "target"]
-    log.info("Feature matrix: %d rows x %d features (no_ob=%d)", len(df), len(FEATURE_COLS), skipped_no_ob)
+    log.info("Feature matrix: %d rows × %d features (no_ob=%d)", len(df), len(FEATURE_COLS), skipped_no_ob)
+    log.info("Features: %s", FEATURE_COLS[:10])
 
     X = df[FEATURE_COLS].values.astype(np.float32)
     y = df["target"].values.astype(int)
-    log.info("Class balance: %d UP, %d DOWN (%.1f%% UP)", y.sum(), (y == 0).sum(), 100 * y.mean())
+    log.info("Class balance: %d UP / %d DOWN (%.1f%% UP)", y.sum(), (y==0).sum(), 100*y.mean())
 
     # ══════════════════════════════════════════════════════════════════════
-    # STEP 6: FEATURE SELECTION
+    # STEP 6: ANTI-OVERFITTING — NOISE CANARY + ADVERSARIAL VALIDATION
     # ══════════════════════════════════════════════════════════════════════
     log.info("=" * 70)
-    log.info("STEP 6: Feature importance screening...")
+    log.info("STEP 6: Anti-overfitting checks...")
 
-    # ── NOISE CANARY — anti-overfitting check ───────────────────────────────
-    # Adiciona feature de ruído puro. Se o modelo a usa (importance > 0) → overfitting.
-    rng = np.random.RandomState(42)
-    noise_canary = rng.randn(len(df))
-    df["__noise_canary__"] = noise_canary
-    FEATURE_COLS_WITH_CANARY = FEATURE_COLS + ["__noise_canary__"]
-    X_canary = df[FEATURE_COLS_WITH_CANARY].values.astype(np.float32)
+    # Noise canary: feature aleatória deve ter importância ~0
+    rng = np.random.default_rng(42)
+    canary = rng.random(len(X)).reshape(-1, 1).astype(np.float32)
+    X_canary = np.hstack([X, canary])
+    canary_name = "__noise_canary__"
+    feat_names_canary = FEATURE_COLS + [canary_name]
+
+    # Adversarial validation: train consegue separar primeiros 50% vs últimos 50%?
+    # Se AUC > 0.6 → dataset tem drift temporal (feature criadas antes do target vazam)
+    n_half = len(X) // 2
+    av_labels = np.array([0] * n_half + [1] * (len(X) - n_half))
+    av_model  = lgb.LGBMClassifier(n_estimators=200, max_depth=4, num_leaves=15,
+                                    min_child_samples=50, random_state=42, verbose=-1)
+    from sklearn.model_selection import cross_val_score
+    av_auc = cross_val_score(av_model, X, av_labels, cv=5, scoring="roc_auc").mean()
+    log.info("Adversarial validation AUC=%.4f (ideal < 0.55, preocupante > 0.65)", av_auc)
+    if av_auc > 0.70:
+        log.warning("⚠️  AV AUC=%.4f — possível data drift temporal severo! Checar features.", av_auc)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # STEP 7: PURGED WALK-FORWARD FEATURE SCREENING
+    # ══════════════════════════════════════════════════════════════════════
+    log.info("=" * 70)
+    log.info("STEP 7: Purged WF feature screening (gap=%d)...", WF_GAP)
 
     tscv = TimeSeriesSplit(n_splits=N_SPLITS, gap=WF_GAP)
     screen = lgb.LGBMClassifier(
         n_estimators=300, learning_rate=0.05, max_depth=4,
-        num_leaves=15, min_child_samples=50,  # v30: mais conservador
-        reg_alpha=0.1, reg_lambda=0.1,        # v30: regularização L1+L2
-        random_state=42, verbose=-1
+        num_leaves=15, min_child_samples=30, random_state=42, verbose=-1
     )
-    feat_importances = np.zeros(len(FEATURE_COLS))
-    for fold, (tr_idx, val_idx) in enumerate(tscv.split(X)):
-        screen.fit(X[tr_idx], y[tr_idx])
+    feat_importances = np.zeros(len(feat_names_canary))
+    for tr_idx, val_idx in tscv.split(X_canary):
+        screen.fit(X_canary[tr_idx], y[tr_idx])
         feat_importances += screen.feature_importances_
     feat_importances /= N_SPLITS
 
-    feat_rank = np.argsort(feat_importances)[::-1]
+    canary_imp = feat_importances[-1]
+    log.info("Noise canary importance: %.2f", canary_imp)
+    if canary_imp > 5:
+        log.warning("⚠️  Canary importance=%.2f — modelo pode estar sofrendo overfitting", canary_imp)
 
-    # Log ALL features by importance
-    log.info("Feature importance ranking (ALL %d features):", len(FEATURE_COLS))
-    for i, idx in enumerate(feat_rank):
-        log.info("  %3d. %-35s importance=%.1f", i+1, FEATURE_COLS[idx], feat_importances[idx])
+    # Filtrar features com importância > canary
+    feat_rank_full = np.argsort(feat_importances[:-1])[::-1]  # excluir canary
+    log.info("Feature importance ranking:")
+    for i, idx in enumerate(feat_rank_full):
+        marker = " ← canary threshold" if feat_importances[idx] <= canary_imp else ""
+        log.info("  %3d. %-40s importance=%.1f%s",
+                 i+1, FEATURE_COLS[idx], feat_importances[idx], marker)
 
-    # ── AUTO FEATURE SELECTION v29 ────────────────────────────────────────
-    # Estratégia: remover features com importância < threshold relativo
-    # threshold = IMPORTANCE_THRESHOLD_PCT * mediana das importâncias
-    # Depois, testar contagens candidatas e escolher a menor que perde < MAX_AUC_LOSS vs all-features
-    IMPORTANCE_THRESHOLD_PCT = 0.15   # remove features com import < 15% da mediana
-    MAX_AUC_LOSS             = 0.003  # tolera até 0.003 de AUC vs usar todas features
+    # Features acima do canary
+    selected_above_canary = [FEATURE_COLS[i] for i in feat_rank_full
+                             if feat_importances[i] > canary_imp]
+    log.info("%d features acima do noise canary (importance > %.2f)",
+             len(selected_above_canary), canary_imp)
 
-    median_imp = np.median(feat_importances)
-    threshold  = IMPORTANCE_THRESHOLD_PCT * median_imp
-    kept_mask  = feat_importances >= threshold
-    kept_idxs  = [i for i in feat_rank if kept_mask[i]]
-    log.info("Auto-select: median_imp=%.1f threshold=%.1f kept=%d/%d features",
-             median_imp, threshold, len(kept_idxs), len(FEATURE_COLS))
+    # ══════════════════════════════════════════════════════════════════════
+    # STEP 8: FEATURE COUNT SELECTION
+    # ══════════════════════════════════════════════════════════════════════
+    log.info("=" * 70)
+    log.info("STEP 8: Testando contagens de features...")
 
-    # AUC baseline com TODAS as features (sem remoção)
-    aucs_all = []
-    for tr_idx, val_idx in TimeSeriesSplit(n_splits=N_SPLITS, gap=WF_GAP).split(X):
-        m = lgb.LGBMClassifier(n_estimators=400, learning_rate=0.05, max_depth=5,
-                                num_leaves=20, min_child_samples=50,
-                                reg_alpha=0.1, reg_lambda=0.1, random_state=42, verbose=-1)
-        m.fit(X[tr_idx], y[tr_idx])
-        aucs_all.append(roc_auc_score(y[val_idx], m.predict_proba(X[val_idx])[:, 1]))
-    auc_baseline = np.mean(aucs_all)
-    log.info("Baseline AUC (all %d features): %.4f", len(FEATURE_COLS), auc_baseline)
+    FEATURE_COUNTS = [len(selected_above_canary), 50, 40, 35, 30, 25, 20]
+    FEATURE_COUNTS = sorted(set(n for n in FEATURE_COUNTS if 10 <= n <= len(FEATURE_COLS)), reverse=True)
 
-    # Testar contagens candidatas decrescentes (partindo das features acima do threshold)
-    n_kept = len(kept_idxs)
-    FEATURE_COUNTS = sorted(set([n_kept, min(n_kept, 50), min(n_kept, 40),
-                                  min(n_kept, 35), min(n_kept, 30), min(n_kept, 25),
-                                  min(n_kept, 20)]), reverse=True)
-    FEATURE_COUNTS = [n for n in FEATURE_COUNTS if n > 5]
-
-    best_combo = (len(FEATURE_COLS), FEATURE_COLS, auc_baseline)  # fallback: all features
+    best_combo = None
+    best_score = -1
 
     for n_feats in FEATURE_COUNTS:
-        top_n = [FEATURE_COLS[i] for i in kept_idxs[:n_feats]]
+        top_n = [FEATURE_COLS[i] for i in feat_rank_full[:n_feats]]
         X_n   = df[top_n].values.astype(np.float32)
 
         aucs = []
         for tr_idx, val_idx in TimeSeriesSplit(n_splits=N_SPLITS, gap=WF_GAP).split(X_n):
             m = lgb.LGBMClassifier(n_estimators=400, learning_rate=0.05, max_depth=5,
-                                    num_leaves=20, min_child_samples=30, random_state=42, verbose=-1)
+                                   num_leaves=20, min_child_samples=30, random_state=42, verbose=-1)
             m.fit(X_n[tr_idx], y[tr_idx])
-            aucs.append(roc_auc_score(y[val_idx], m.predict_proba(X_n[val_idx])[:, 1]))
-        mean_auc  = np.mean(aucs)
-        auc_delta = auc_baseline - mean_auc
-        log.info("  %2d features: AUC=%.4f (Δ=%.4f vs baseline) folds=%s",
-                 n_feats, mean_auc, auc_delta, [f"{a:.4f}" for a in aucs])
+            p = m.predict_proba(X_n[val_idx])[:, 1]
+            aucs.append(roc_auc_score(y[val_idx], p))
 
-        # Critério: menor contagem que perde menos que MAX_AUC_LOSS
-        if auc_delta <= MAX_AUC_LOSS:
-            best_combo = (n_feats, top_n, mean_auc)
+        mean_auc = np.mean(aucs)
+        std_auc  = np.std(aucs)
+        # Variance penalty: preferir menor variância
+        penalized = mean_auc - 0.5 * std_auc
+        log.info("  n=%d  WF_AUC=%.4f ± %.4f  penalized=%.4f", n_feats, mean_auc, std_auc, penalized)
 
-    TOP_N_FEATS, top_features, best_auc = best_combo
-    log.info("Selected: %d features (AUC=%.4f, delta=%.4f vs baseline)",
-             TOP_N_FEATS, best_auc, auc_baseline - best_auc)
-    log.info("Top features: %s", top_features[:15])
+        if penalized > best_score:
+            best_score = penalized
+            best_combo = {"n": n_feats, "feats": top_n, "auc": mean_auc, "std": std_auc}
+
+    log.info("Melhor combo: n=%d  AUC=%.4f ± %.4f", best_combo["n"], best_combo["auc"], best_combo["std"])
+    SELECTED_FEATURES = best_combo["feats"]
+    X_sel = df[SELECTED_FEATURES].values.astype(np.float32)
 
     # ══════════════════════════════════════════════════════════════════════
-    # STEP 7: OPTUNA TUNING
+    # STEP 9: OPTUNA HYPERPARAMETER TUNING (variance-penalized)
     # ══════════════════════════════════════════════════════════════════════
     log.info("=" * 70)
-    log.info("STEP 7: Optuna tuning (%d trials)...", OPTUNA_TRIALS)
-
-    X_top = df[top_features].values.astype(np.float32)
+    log.info("STEP 9: Optuna %d trials (variance-penalized)...", OPTUNA_TRIALS)
 
     def objective(trial):
         params = {
-            "n_estimators":      trial.suggest_int("n_estimators", 200, 800),
-            "learning_rate":     trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
-            "max_depth":         trial.suggest_int("max_depth", 3, 7),
-            "num_leaves":        trial.suggest_int("num_leaves", 8, 31),  # v30: mais estreito
-            "min_child_samples": trial.suggest_int("min_child_samples", 50, 200),  # v30: mais conservador
-            "subsample":         trial.suggest_float("subsample", 0.6, 1.0),
-            "colsample_bytree":  trial.suggest_float("colsample_bytree", 0.6, 1.0),
-            "reg_alpha":         trial.suggest_float("reg_alpha", 0.01, 2.0, log=True),   # v30: range maior
-            "reg_lambda":        trial.suggest_float("reg_lambda", 0.01, 2.0, log=True),  # v30: range maior
+            "n_estimators":      trial.suggest_int("n_estimators", 200, 1500),
+            "learning_rate":     trial.suggest_float("learning_rate", 0.005, 0.15, log=True),
+            "max_depth":         trial.suggest_int("max_depth", 3, 8),
+            "num_leaves":        trial.suggest_int("num_leaves", 8, 63),
+            "min_child_samples": trial.suggest_int("min_child_samples", 20, 200),
+            "subsample":         trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree":  trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "reg_alpha":         trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
+            "reg_lambda":        trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
+            "min_split_gain":    trial.suggest_float("min_split_gain", 0.0, 0.5),
             "random_state": 42, "verbose": -1,
         }
         aucs = []
-        for tr_idx, val_idx in TimeSeriesSplit(n_splits=N_SPLITS, gap=WF_GAP).split(X_top):
+        for tr_idx, val_idx in TimeSeriesSplit(n_splits=N_SPLITS, gap=WF_GAP).split(X_sel):
             m = lgb.LGBMClassifier(**params)
-            m.fit(X_top[tr_idx], y[tr_idx])
-            p = m.predict_proba(X_top[val_idx])[:, 1]
+            m.fit(X_sel[tr_idx], y[tr_idx],
+                  eval_set=[(X_sel[val_idx], y[val_idx])],
+                  callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)])
+            p = m.predict_proba(X_sel[val_idx])[:, 1]
             aucs.append(roc_auc_score(y[val_idx], p))
         mean_auc = float(np.mean(aucs))
         std_auc  = float(np.std(aucs))
-        # v30: penaliza variância — favorece modelos estáveis
-        return mean_auc - 2.0 * std_auc
+        # Variance penalty: punir instabilidade entre folds
+        return mean_auc - 0.5 * std_auc
 
-    study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=OPTUNA_TRIALS, n_jobs=4, show_progress_bar=False)
+    study = optuna.create_study(direction="maximize",
+                                sampler=optuna.samplers.TPESampler(seed=42))
+    study.optimize(objective, n_trials=OPTUNA_TRIALS, show_progress_bar=False)
     best_params = study.best_params
-    best_params.update({"random_state": 42, "verbose": -1})
-    log.info("Best Optuna AUC=%.4f, params=%s", study.best_value, best_params)
+    best_params["random_state"] = 42
+    best_params["verbose"]      = -1
+    log.info("Best params: %s", best_params)
+    log.info("Best penalized score: %.4f", study.best_value)
 
     # ══════════════════════════════════════════════════════════════════════
-    # STEP 8: WALK-FORWARD EVALUATION + CALIBRATION
+    # STEP 10: WALK-FORWARD EVALUATION (métricas finais)
     # ══════════════════════════════════════════════════════════════════════
     log.info("=" * 70)
-    log.info("STEP 8: Walk-forward evaluation with calibration...")
+    log.info("STEP 10: Walk-forward evaluation...")
 
     wf_aucs, wf_briers, wf_accs = [], [], []
-    fold_preds = []  # Store for backtest
-
-    for fold, (tr_idx, val_idx) in enumerate(
-        TimeSeriesSplit(n_splits=N_SPLITS, gap=WF_GAP).split(X_top)
-    ):
-        base = lgb.LGBMClassifier(**best_params)
-        cal  = CalibratedClassifierCV(base, cv=3, method="isotonic")
-        cal.fit(X_top[tr_idx], y[tr_idx])
-        p = cal.predict_proba(X_top[val_idx])[:, 1]
-
-        auc = roc_auc_score(y[val_idx], p)
+    for fold_i, (tr_idx, val_idx) in enumerate(
+            TimeSeriesSplit(n_splits=N_SPLITS, gap=WF_GAP).split(X_sel)):
+        m = lgb.LGBMClassifier(**best_params)
+        m.fit(X_sel[tr_idx], y[tr_idx])
+        p    = m.predict_proba(X_sel[val_idx])[:, 1]
+        pred = (p >= 0.5).astype(int)
+        auc  = roc_auc_score(y[val_idx], p)
         brier = brier_score_loss(y[val_idx], p)
-        acc = (p.round() == y[val_idx]).mean()
-        wf_aucs.append(auc)
-        wf_briers.append(brier)
-        wf_accs.append(acc)
+        acc   = (pred == y[val_idx]).mean()
+        wf_aucs.append(auc); wf_briers.append(brier); wf_accs.append(acc)
+        log.info("  Fold %d: AUC=%.4f  Brier=%.4f  Acc=%.4f", fold_i+1, auc, brier, acc)
 
-        for vi, pi in zip(val_idx, p):
-            fold_preds.append({"idx": vi, "prob_up": float(pi), "target": int(y[vi]), "fold": fold})
-
-        log.info("  Fold %d: AUC=%.4f Brier=%.4f Acc=%.4f (n=%d)", fold, auc, brier, acc, len(val_idx))
-
-    mean_auc   = float(np.mean(wf_aucs))
-    mean_brier = float(np.mean(wf_briers))
-    mean_acc   = float(np.mean(wf_accs))
-    log.info("WALK-FORWARD: AUC=%.4f Brier=%.4f Acc=%.4f", mean_auc, mean_brier, mean_acc)
+    wf_auc   = float(np.mean(wf_aucs))
+    wf_brier = float(np.mean(wf_briers))
+    wf_acc   = float(np.mean(wf_accs))
+    wf_std   = float(np.std(wf_aucs))
+    log.info("WF AUC=%.4f ± %.4f  Brier=%.4f  Acc=%.4f", wf_auc, wf_std, wf_brier, wf_acc)
 
     # ══════════════════════════════════════════════════════════════════════
-    # STEP 9: REALISTIC P&L BACKTEST
+    # STEP 11: TREINO FINAL + CALIBRAÇÃO
     # ══════════════════════════════════════════════════════════════════════
     log.info("=" * 70)
-    log.info("STEP 9: Realistic P&L backtest...")
+    log.info("STEP 11: Treino final + calibração isotônica...")
 
-    # Polymarket fee structure
-    FEE_RATE = 0.02  # 2% on net profit (only charged when you win)
-    MIN_CONF = 0.55   # minimum model confidence to trade
-    MIN_EDGE = 0.03   # minimum edge (model_prob - market_price)
-    # Market ask is approximated from ob_mid (the real polymarket price)
-    # ob_mid is the midpoint of the order book, close to the market price
+    from sklearn.calibration import CalibratedClassifierCV
+    final_model = lgb.LGBMClassifier(**best_params)
+    final_model.fit(X_sel, y)
 
-    preds_df = pd.DataFrame(fold_preds)
-    preds_df = preds_df.sort_values("idx")
-    # Attach ob features from the feature matrix
-    # ob_mid is the OPEN snapshot (~t=0-30s), ob_mid + ob_mid_drift = close snapshot (~t=150-300s)
-    # In live, bot buys at t=170-240s, so the close_mid is the realistic ask price
-    preds_df["ob_mid"] = [df.iloc[int(i)].get("ob_mid", 0.5) for i in preds_df["idx"]]
-    preds_df["ob_mid_drift"] = [df.iloc[int(i)].get("ob_mid_drift", 0.0) for i in preds_df["idx"]]
-    preds_df["close_mid"] = preds_df["ob_mid"] + preds_df["ob_mid_drift"]  # realistic entry price
+    # Calibração isotônica (holdout = últimos 10%)
+    cal_split = int(len(X_sel) * 0.90)
+    # Treinar base LightGBM separado e calibrar no holdout
+    base_for_cal = lgb.LGBMClassifier(**best_params)
+    base_for_cal.fit(X_sel[:cal_split], y[:cal_split])
+    # cv="prefit" removido no sklearn 1.4+ — usar set_params após fit manual
+    cal_model = CalibratedClassifierCV(
+        estimator=base_for_cal,
+        method="isotonic", cv=5
+    )
+    cal_model.fit(X_sel[:cal_split], y[:cal_split])
 
-    # Simulate trading
-    total_trades = 0
-    wins = 0
-    losses = 0
-    total_pnl = 0.0
-    total_fees = 0.0
-    total_staked = 0.0
-    pnl_by_conf = {}  # Track P&L by confidence bucket
-    pnl_by_edge = {}  # Track P&L by edge bucket
-
-    for _, pred in preds_df.iterrows():
-        prob = pred["prob_up"]
-        target = pred["target"]
-        ob_mid_val = pred["ob_mid"]
-        close_mid_val = pred["close_mid"]
-        # Clamp close_mid to reasonable range
-        close_mid_val = max(0.05, min(0.95, close_mid_val))
-
-        # Use CLOSE_MID as realistic entry price (bot buys at t=170-240s)
-        # ob_mid is the price of the UP token on Polymarket
-        if prob > 0.5:
-            direction = "UP"
-            confidence = prob
-            market_ask = close_mid_val  # price to buy UP token at entry time
-        else:
-            direction = "DOWN"
-            confidence = 1 - prob
-            market_ask = 1 - close_mid_val  # price to buy DOWN token at entry time
-
-        # Edge = model confidence - market price
-        edge = confidence - market_ask
-
-        # Apply trading filters
-        if confidence < MIN_CONF:
-            continue
-        if edge < MIN_EDGE:
-            continue
-        if market_ask < 0.30 or market_ask > 0.70:
-            continue
-
-        # Simulate trade with $10 per trade
-        stake = 10.0
-        shares = stake / market_ask
-
-        # Did we win?
-        won = (direction == "UP" and target == 1) or (direction == "DOWN" and target == 0)
-
-        if won:
-            gross_profit = shares * 1.0 - stake  # shares * $1 payout - cost
-            fee = gross_profit * FEE_RATE
-            net_pnl = gross_profit - fee
-            total_fees += fee
-            wins += 1
-        else:
-            net_pnl = -stake
-            losses += 1
-
-        total_pnl += net_pnl
-        total_staked += stake
-        total_trades += 1
-
-        # Track by confidence bucket
-        bucket = f"{int(confidence * 100)}%"
-        if bucket not in pnl_by_conf:
-            pnl_by_conf[bucket] = {"trades": 0, "wins": 0, "pnl": 0.0}
-        pnl_by_conf[bucket]["trades"] += 1
-        pnl_by_conf[bucket]["wins"] += int(won)
-        pnl_by_conf[bucket]["pnl"] += net_pnl
-
-        # Track by edge bucket
-        edge_bucket = f"{int(edge * 100)}%"
-        if edge_bucket not in pnl_by_edge:
-            pnl_by_edge[edge_bucket] = {"trades": 0, "wins": 0, "pnl": 0.0}
-        pnl_by_edge[edge_bucket]["trades"] += 1
-        pnl_by_edge[edge_bucket]["wins"] += int(won)
-        pnl_by_edge[edge_bucket]["pnl"] += net_pnl
-
-    wr = wins / total_trades * 100 if total_trades > 0 else 0
-    log.info("BACKTEST RESULTS:")
-    log.info("  Trades: %d (W:%d / L:%d = %.1f%% WR)", total_trades, wins, losses, wr)
-    log.info("  P&L: $%.2f (fees: $%.2f, staked: $%.2f)", total_pnl, total_fees, total_staked)
-    log.info("  Avg P&L per trade: $%.3f", total_pnl / total_trades if total_trades > 0 else 0)
-    log.info("  ROI: %.1f%%", (total_pnl / total_staked) * 100 if total_staked > 0 else 0)
-
-    log.info("  BY CONFIDENCE BUCKET:")
-    for bucket in sorted(pnl_by_conf.keys()):
-        b = pnl_by_conf[bucket]
-        bwr = b["wins"] / b["trades"] * 100 if b["trades"] > 0 else 0
-        log.info("    %s: %d trades, %.1f%% WR, P&L=$%.2f", bucket, b["trades"], bwr, b["pnl"])
-
-    log.info("  BY EDGE BUCKET:")
-    for bucket in sorted(pnl_by_edge.keys()):
-        b = pnl_by_edge[bucket]
-        bwr = b["wins"] / b["trades"] * 100 if b["trades"] > 0 else 0
-        log.info("    %s edge: %d trades, %.1f%% WR, P&L=$%.2f", bucket, b["trades"], bwr, b["pnl"])
+    # Brier no holdout (calibrado vs não-calibrado)
+    p_raw = final_model.predict_proba(X_sel[cal_split:])[:, 1]
+    p_cal = cal_model.predict_proba(X_sel[cal_split:])[:, 1]
+    log.info("Holdout Brier raw=%.4f  cal=%.4f",
+             brier_score_loss(y[cal_split:], p_raw),
+             brier_score_loss(y[cal_split:], p_cal))
 
     # ══════════════════════════════════════════════════════════════════════
-    # STEP 10: SANITY CHECK + PROMOTE
+    # STEP 12: PROMOTE IF CHAMPION
     # ══════════════════════════════════════════════════════════════════════
     log.info("=" * 70)
-    log.info("STEP 10: Sanity check + promotion decision...")
+    log.info("STEP 12: Champion check...")
 
-    # Train final model on ALL data
-    final_base  = lgb.LGBMClassifier(**best_params)
-    final_model = CalibratedClassifierCV(final_base, cv=3, method="isotonic")
-    final_model.fit(X_top, y)
+    champ_auc = float(champion.get("wf_auc", 0.0))
+    VERSION   = f"v30_{best_combo['n']}f_ws"
+    is_new_champ = wf_auc > champ_auc
 
-    # Sanity: UP signal → high prob, DOWN signal → low prob
-    def _neutral_value(fname):
-        if "dist_1k" in fname: return 0.25
-        if "ticks" in fname or "count" in fname: return 100.0
-        if "ratio" in fname and "depth" not in fname and "1h_4h" not in fname: return 0.5
-        if "vwap" in fname: return 0.5
-        if "ob_mid" in fname and "drift" not in fname: return 0.5
-        if "ob_spread" in fname: return 0.02
-        if "ob_depth_5c" in fname: return 0.5
-        if "depth_ratio" in fname: return 1.0
-        return 0.0
+    log.info("Champion AUC=%.4f | Candidate AUC=%.4f | %s",
+             champ_auc, wf_auc, "🏆 NOVO CHAMPION!" if is_new_champ else "Não supera champion")
 
-    baseline_feats = {f: _neutral_value(f) for f in top_features}
-    up_feats = dict(baseline_feats)
-    up_feats.update({k: v for k, v in {
-        "btc_inslot_ret": 2.0, "btc_pre_5m_ret": 1.5, "btc_pre_1h_ret": 2.0,
-        "ob_imbalance": 0.3, "ob_imbalance_end": 0.3, "ob_mid_drift": 0.02,
-        "ob_depth_ratio": 1.3, "ob_fill_imbalance": 0.2, "ob_imb_momentum": 0.1,
-    }.items() if k in up_feats})
+    api = HfApi(token=HF_TOKEN)
 
-    down_feats = dict(baseline_feats)
-    down_feats.update({k: v for k, v in {
-        "btc_inslot_ret": -2.0, "btc_pre_5m_ret": -1.5, "btc_pre_1h_ret": -2.0,
-        "ob_imbalance": -0.3, "ob_imbalance_end": -0.3, "ob_mid_drift": -0.02,
-        "ob_depth_ratio": 0.7, "ob_fill_imbalance": -0.2, "ob_imb_momentum": -0.1,
-    }.items() if k in down_feats})
+    # Sempre salva o modelo candidato (para análise)
+    model_payload = {
+        "model":            cal_model,
+        "feature_cols":     SELECTED_FEATURES,
+        "version":          VERSION,
+        "wf_auc":           wf_auc,
+        "wf_brier":         wf_brier,
+        "wf_acc":           wf_acc,
+        "wf_std":           wf_std,
+        "best_params":      best_params,
+        "n_features":       best_combo["n"],
+        "obs_secs":         OBS_SECS,
+        "av_auc":           float(av_auc),
+        "canary_importance": float(canary_imp),
+        "trained_at":       datetime.utcnow().isoformat(),
+    }
+    cand_path = Path(f"/tmp/{VERSION}.pkl")
+    with open(cand_path, "wb") as f:
+        pickle.dump(model_payload, f)
 
-    up_arr    = pd.DataFrame([up_feats])[top_features].values.astype(np.float32)
-    neut_arr  = pd.DataFrame([baseline_feats])[top_features].values.astype(np.float32)
-    down_arr  = pd.DataFrame([down_feats])[top_features].values.astype(np.float32)
-    prob_up   = final_model.predict_proba(up_arr)[0, 1]
-    prob_neut = final_model.predict_proba(neut_arr)[0, 1]
-    prob_down = final_model.predict_proba(down_arr)[0, 1]
-    log.info("Sanity: UP -> %.3f | Neutral -> %.3f | DOWN -> %.3f", prob_up, prob_neut, prob_down)
-    sanity_ok = prob_up > prob_neut > prob_down
-    if not sanity_ok:
-        log.error("SANITY CHECK FAILED! UP=%.3f Neutral=%.3f DOWN=%.3f", prob_up, prob_neut, prob_down)
+    api.upload_file(
+        path_or_fileobj=str(cand_path),
+        path_in_repo=f"models/{VERSION}.pkl",
+        repo_id=HF_MODEL_REPO, repo_type="model", token=HF_TOKEN
+    )
+    log.info("Candidato salvo: models/%s.pkl", VERSION)
 
-    # Promotion decision
-    beats_auc   = mean_auc   > champion["wf_auc"]
-    beats_brier = mean_brier < champion["wf_brier"]
-    beats_acc   = mean_acc   > champion["wf_acc"]
-    score = sum([beats_auc, beats_brier, beats_acc])
-
-    log.info("vs Champion (%s): AUC %s (%.4f vs %.4f) | Brier %s (%.4f vs %.4f) | Acc %s (%.4f vs %.4f) -> %d/3",
-             champion["version"],
-             "Y" if beats_auc else "N", mean_auc, champion["wf_auc"],
-             "Y" if beats_brier else "N", mean_brier, champion["wf_brier"],
-             "Y" if beats_acc else "N", mean_acc, champion["wf_acc"],
-             score)
-
-    version_tag = f"v30_{TOP_N_FEATS}f_rt"
-
-    # v29 uses a clean feature set (ob_mid and other leaky OB features removed).
-    # v28 champion AUC (0.848) is NOT comparable — it was inflated by temporal leakage.
-    # Promotion threshold: AUC > 0.76 (honest baseline) + sanity check.
-    # ── Noise canary check ──────────────────────────────────────────────────
-    # Se canary em top_features → checa importância; se não entrou → sinal limpo
-    canary_ok = True
-    try:
-        if "__noise_canary__" not in top_features:
-            log.info("✅  Noise canary: dropped in feature selection (clean)")
-        else:
-            # CalibratedClassifierCV: estimador base em .calibrated_classifiers_[0].estimator
-            base_est = final_model.calibrated_classifiers_[0].estimator
-            canary_idx = list(top_features).index("__noise_canary__")
-            canary_imp = float(base_est.feature_importances_[canary_idx])
-            if canary_imp > 0:
-                log.warning("⚠️  NOISE CANARY TRIGGERED: importance=%.1f → overfitting", canary_imp)
-                canary_ok = False
-            else:
-                log.info("✅  Noise canary: 0 importance (clean)")
-    except Exception as e:
-        log.warning("Canary check failed: %s", e)
-
-    FORCE_PROMOTE = False  # v30: não forçar — exige AUC honesto
-    promote = (FORCE_PROMOTE or (mean_auc > 0.76 and score >= 2)) and sanity_ok and canary_ok  # v30
-
-    if promote:
-        log.info("PROMOTING %s! (%d/3 metrics, backtest P&L=$%.2f)", version_tag, score, total_pnl)
-
-        model_data = {
-            "version":  version_tag,
-            "features": top_features,
-            "model":    final_model,
-            "wf_auc":   mean_auc,
-            "wf_brier": mean_brier,
-            "wf_acc":   mean_acc,
-            "obs_secs": OBS_SECS,
-        }
+    if is_new_champ:
+        # Promove como champion.pkl
+        api.upload_file(
+            path_or_fileobj=str(cand_path),
+            path_in_repo="champion.pkl",
+            repo_id=HF_MODEL_REPO, repo_type="model", token=HF_TOKEN
+        )
         meta = {
-            "version":   version_tag,
-            "wf_auc":    mean_auc,
-            "wf_brier":  mean_brier,
-            "wf_acc":    mean_acc,
-            "features":  top_features,
-            "n_samples": len(y),
-            "n_features": len(top_features),
-            "obs_secs":  OBS_SECS,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "backtest": {
-                "trades": total_trades,
-                "wins": wins,
-                "losses": losses,
-                "win_rate": wr,
-                "pnl": total_pnl,
-                "fees": total_fees,
-                "roi_pct": (total_pnl / total_staked) * 100 if total_staked > 0 else 0,
-                "by_confidence": pnl_by_conf,
-                "by_edge": pnl_by_edge,
-            },
-            "changes": (
-                f"v28: FULL feature parity train==live. Added tick-based features "
-                f"(btc_up_ratio/momentum/tw_up_ratio/zscore/etc), dow_cos/sin, "
-                f"hour_x_up_ratio/tw_ur, all cross-domain interactions. "
-                f"{len(top_features)} features. "
-                f"Realistic backtest: {total_trades} trades, {wr:.1f}% WR, P&L=${total_pnl:.2f}. "
-                f"OBS_SECS={OBS_SECS}."
-            ),
+            "version":          VERSION,
+            "wf_auc":           wf_auc,
+            "wf_brier":         wf_brier,
+            "wf_acc":           wf_acc,
+            "wf_std":           wf_std,
+            "n_features":       best_combo["n"],
+            "obs_secs":         OBS_SECS,
+            "av_auc":           float(av_auc),
+            "canary_importance": float(canary_imp),
+            "promoted_at":      datetime.utcnow().isoformat(),
         }
-
-        import tempfile
-        api = HfApi(token=HF_TOKEN)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            pkl_path  = Path(tmpdir) / "champion.pkl"
-            meta_path = Path(tmpdir) / "champion_meta.json"
-            with open(pkl_path, "wb") as f:
-                pickle.dump(model_data, f)
-            with open(meta_path, "w") as f:
-                json.dump(meta, f, indent=2)
-            api.upload_file(path_or_fileobj=str(pkl_path), path_in_repo="champion.pkl",
-                            repo_id=HF_MODEL_REPO, repo_type="model", token=HF_TOKEN)
-            api.upload_file(path_or_fileobj=str(meta_path), path_in_repo="champion_meta.json",
-                            repo_id=HF_MODEL_REPO, repo_type="model", token=HF_TOKEN)
-
-        log.info("%s promoted to HF! AUC=%.4f Brier=%.4f Acc=%.4f (%d features, %ds obs)",
-                 version_tag, mean_auc, mean_brier, mean_acc, len(top_features), OBS_SECS)
+        meta_path = Path("/tmp/champion_meta.json")
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+        api.upload_file(
+            path_or_fileobj=str(meta_path),
+            path_in_repo="champion_meta.json",
+            repo_id=HF_MODEL_REPO, repo_type="model", token=HF_TOKEN
+        )
+        log.info("🏆 CHAMPION ATUALIZADO: %s  AUC=%.4f", VERSION, wf_auc)
     else:
-        reasons = []
-        if not sanity_ok: reasons.append("sanity check failed")
-        if mean_auc <= 0.76: reasons.append(f"AUC too low ({mean_auc:.4f})")
-        if score < 2: reasons.append(f"lost {3-score}/3 metrics vs champion")
-        log.info("NOT PROMOTED: %s. Reasons: %s", version_tag, "; ".join(reasons))
-
-        # Salvar como candidato para avaliar OOS no holdout antes de promover
-        candidate_data = {
-            "version":  version_tag,
-            "features": top_features,
-            "model":    final_model,
-            "wf_auc":   mean_auc,
-            "wf_brier": mean_brier,
-            "wf_acc":   mean_acc,
-            "obs_secs": OBS_SECS,
-        }
-        candidate_meta = {
-            "version":   version_tag,
-            "wf_auc":    mean_auc,
-            "wf_brier":  mean_brier,
-            "wf_acc":    mean_acc,
-            "features":  top_features,
-            "n_features": len(top_features),
-            "obs_secs":  OBS_SECS,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "candidate": True,
-            "not_promoted_reasons": reasons,
-        }
-        import tempfile
-        api = HfApi(token=HF_TOKEN)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            pkl_path  = Path(tmpdir) / "candidate.pkl"
-            meta_path = Path(tmpdir) / "candidate_meta.json"
-            with open(pkl_path, "wb") as f:
-                pickle.dump(candidate_data, f)
-            with open(meta_path, "w") as f:
-                json.dump(candidate_meta, f, indent=2)
-            api.upload_file(path_or_fileobj=str(pkl_path), path_in_repo="candidate.pkl",
-                            repo_id=HF_MODEL_REPO, repo_type="model", token=HF_TOKEN)
-            api.upload_file(path_or_fileobj=str(meta_path), path_in_repo="candidate_meta.json",
-                            repo_id=HF_MODEL_REPO, repo_type="model", token=HF_TOKEN)
-        log.info("Saved as CANDIDATE on HF (not champion). Run backtest to evaluate OOS AUC.")
+        log.info("Champion mantido: %s  AUC=%.4f", champion.get("version"), champ_auc)
 
     log.info("=" * 70)
-    log.info("v30 training complete.")
+    log.info("DONE. v30 concluído.")
+    log.info("  WF AUC   = %.4f ± %.4f", wf_auc, wf_std)
+    log.info("  WF Brier = %.4f", wf_brier)
+    log.info("  WF Acc   = %.4f", wf_acc)
+    log.info("  AV AUC   = %.4f (adversarial)", av_auc)
+    log.info("  Canary   = %.2f importance", canary_imp)
+    log.info("  Features = %d", best_combo["n"])
+    log.info("  Champion = %s", "SIM 🏆" if is_new_champ else "NÃO")
 
 
 @app.local_entrypoint()
