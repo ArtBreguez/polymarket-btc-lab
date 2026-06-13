@@ -1,187 +1,219 @@
 # BTC 5-min Model — Feature Brain
-**Versão:** v29_20f_rt | **OBS_SECS:** 60 | **SLOT_DURATION:** 300s
-**Última atualização:** 2026-06-10 | Auditoria paridade: train == live ✅
-**Features ativas:** 20 (seleção automática por permutation importance, threshold=15% mediana)
 
-> Fonte de verdade de todas as features. Atualizar sempre que mudar `train_v29_modal.py` ou `live_trader.py`.
+**Versão ativa:** v29_20f_rt | **OBS_SECS:** 60 | **SLOT_DURATION:** 300s
+**Última atualização:** 2026-06-13 | **WF AUC:** 0.792
 
----
-
-## Índice
-1. [Timeline de um slot](#1-timeline-de-um-slot)
-2. [Fontes de dados](#2-fontes-de-dados)
-3. [Tabela canônica — 20 features ativas (train == live ✅)](#3-tabela-canônica--20-features-ativas)
-4. [Auditoria de lookahead](#4-auditoria-de-lookahead)
-5. [Histórico de remoções](#5-histórico-de-remoções)
-6. [Grupo A — Spot Binance](#6-grupo-a--spot-binance)
-7. [Grupo B — L2 Orderbook](#7-grupo-b--l2-orderbook)
-8. [Grupo C — CLOB Real-time](#8-grupo-c--clob-real-time)
-9. [Grupo D — Order Flow (ticks)](#9-grupo-d--order-flow-ticks)
-10. [Grupo E — Lag History](#10-grupo-e--lag-history)
-11. [Grupo F — Cross features](#11-grupo-f--cross-features)
+> Fonte de verdade de todas as features. Só entram features 100% computáveis em
+> tempo real com os dados que chegam nos WebSockets. Cada feature tem o campo
+> de dados exato validado ao vivo (13/13 sanity checks passando, 2026-06-13).
 
 ---
 
-## 1. Timeline de um slot
+## 1. Features do modelo ativo (v29 — 20 features)
+
+| # | Feature | Grupo | Fonte |
+|---|---------|-------|-------|
+| 1 | `btc_inslot_ret` | A | Binance kline (normalizado por vol_1h) |
+| 2 | `btc_inslot_range` | A | Binance kline (normalizado por vol_1h) |
+| 3 | `btc_pre_5m_ret` | A | Binance kline buffer (normalizado por vol_1h) |
+| 4 | `btc_dist_1k` | A | Binance kline (close) |
+| 5 | `btc_spot_vol_ratio` | A | Binance kline (volume) |
+| 6 | `ob_total_depth` | B | CLOB REST /book (snapshot open t~60s) |
+| 7 | `ob_imbalance` | B | CLOB REST /book (snapshot open) |
+| 8 | `ob_depth_ratio` | B | CLOB REST /book (snapshot open) |
+| 9 | `clob_spread_mean` | C | CLOB WS price_change (janela t=[0,168s)) |
+| 10 | `clob_spread_trend` | C | CLOB WS price_change (janela t=[0,168s)) |
+| 11 | `clob_mid_volatility` | C | CLOB WS price_change (janela t=[0,168s)) |
+| 12 | `clob_ask_pressure` | C | CLOB WS price_change (janela t=[0,168s)) |
+| 13 | `btc_up_w1` | D | Data-API trades (t=30-60s) |
+| 14 | `btc_size_disparity` | D | Data-API trades (avg_up - avg_dn) |
+| 15 | `btc_up_ratio_zscore_5s` | D | Ring buffer (zscore 5 slots) |
+| 16 | `prev_slot_up_ratio_3` | E | Ring buffer (t-3) |
+| 17 | `prev_slot_up_ratio_5` | E | Ring buffer (t-5) |
+| 18 | `lag_ur_zscore_20` | E | Ring buffer (zscore 20 slots) |
+| 19 | `x_imb_x_ur` | F | ob_imbalance × btc_up_ratio |
+| 20 | `x_depth_x_vol` | F | ob_depth_ratio × btc_vol_1h |
+
+---
+
+## 2. Dados reais observados nos WebSockets
+
+### Binance WS (`btcusdt@kline_1m`)
+Mensagem: `{stream, data: {k: {...}}}`
+Campos do kline:
+- `t` — open time (ms)
+- `o` — open price
+- `c` — close price (atualizado em tempo real)
+- `h` — high do candle
+- `l` — low do candle
+- `v` — volume base (BTC)
+- `n` — número de trades no candle
+- `V` — taker buy volume (BTC)
+- `q` — quote volume (USDT)
+- `x` — candle fechado? (bool)
+
+### CLOB WS (`wss://ws-subscriptions-clob.polymarket.com/ws/market`)
+
+**Evento `book`** — chega ~1x por slot (no subscribe)
+```json
+{
+  "event_type": "book",
+  "asset_id": "...",
+  "bids": [{"price": "0.76", "size": "51543.9"}, ...],
+  "asks": [{"price": "0.77", "size": "49798.9"}, ...]
+}
+```
+
+**Evento `price_change`** — alta frequência (dezenas de milhares por slot)
+```json
+{
+  "event_type": "price_change",
+  "price_changes": [{
+    "asset_id": "...",
+    "price": "0.76",
+    "size": "49803.91",
+    "side": "BUY",
+    "best_bid": "0.76",
+    "best_ask": "0.77"
+  }]
+}
+```
+> Nota: `side` usa "BUY"/"SELL" (não "BID"/"ASK"). Mapeado internamente para BID/ASK.
+
+### CLOB REST (`/book?token_id=...`)
+- Snapshot estático com asks e bids ordenados DESC por preço
+- Melhor ask = `min(asks)` (não `asks[0]`, que é o mais caro)
+- Usado para open snapshot (t~60s) e hydration do acumulador no reconnect
+
+---
+
+## 3. Timeline de um slot
 
 ```
 slot_ts (t=0)
   │
-  ├─ t=0..60s  → OBS_SECS=60: coleta spot/tick/CLOB
-  │               ob snapshot "open" capturado em t~5-10s
+  ├─ t=0: reset_token() no acumulador CLOB — limpa buffers do slot anterior
+  │        CLOB WS re-subscrito → recebe book snapshot inicial (1 evento real)
+  │        Acumulador começa a receber price_change events
   │
-  ├─ t=60s     → predict_proba() com as 20 features
+  ├─ t=0..168s: acumula price_change via CLOB WS → janela [0, 168s)
+  │              Binance kline buffer atualiza continuamente
   │
-  └─ t=300s    → resolução (target = BTC subiu ou caiu?)
+  ├─ t~60s: OB early snapshot via CLOB REST /book (open_snap)
+  │          Usado para ob_imbalance, ob_depth_ratio, ob_total_depth
+  │
+  ├─ t~170s: ENTER_WINDOW — executa predict_proba() com features de [0, 168s)
+  │           Data-API ticks chegam com ~120s lag, disponíveis aqui
+  │           CLOB features: janela [0, 168s) (window_secs=168)
+  │
+  └─ t=300s: resolução do mercado
 ```
 
-**Regra inviolável:** nenhuma feature pode usar dados após t=60s.
-
 ---
 
-## 2. Fontes de dados
+## 4. Detalhamento por grupo
 
-| Fonte | Dados | Latência |
-|---|---|---|
-| Binance WebSocket | BTC/USDT klines + trades | ~real-time |
-| Polymarket CLOB WS | book snapshots, price_change | ~real-time |
-| Polymarket data-api | ticks históricos do slot | ~120s lag |
-| CLOB REST /book | ob snapshot on-demand | ~100-300ms |
+### Grupo A — Spot Binance (kline buffer)
 
----
+> **IMPORTANTE:** `btc_inslot_ret`, `btc_pre_5m_ret`, `btc_inslot_range` são
+> **normalizados por `btc_vol_1h`** antes de entrar no modelo.
+> `btc_vol_1h = std(returns_last_12_candles)`.
+> Isso significa que o DataQualityGate deve usar limites em torno de ±50 (não ±0.05).
 
-## 3. Tabela canônica — 20 features ativas
-
-Todas computadas em t<60s. Paridade train==live verificada.
-
-| # | Feature | Grupo | Fonte | Descrição |
-|---|---|---|---|---|
-| 1 | `btc_inslot_ret` | A | Binance spot | Retorno BTC no slot (px_end/px_start - 1) |
-| 2 | `btc_inslot_range` | A | Binance spot | (max-min)/px_end do slot |
-| 3 | `btc_pre_5m_ret` | A | Binance spot | Retorno dos 5min anteriores ao slot |
-| 4 | `btc_dist_1k` | A | Binance spot | Distância ao múltiplo de $1k mais próximo |
-| 5 | `btc_spot_vol_ratio` | A | Binance spot | Vol 5m / média de vol 5m na última 1h |
-| 6 | `ob_imbalance` | B | CLOB REST | Imbalance do OB no snapshot "open" (t~5-10s) |
-| 7 | `ob_depth_ratio` | B | CLOB REST | bid_depth / ask_depth no snapshot "open" |
-| 8 | `ob_total_depth` | B | CLOB REST | Profundidade total do OB no snapshot "open" |
-| 9 | `clob_spread_mean` | C | CLOB WS | Spread médio no período t=0..60s |
-| 10 | `clob_spread_trend` | C | CLOB WS | Tendência linear do spread no período |
-| 11 | `clob_mid_volatility` | C | CLOB WS | Desvio padrão das variações do mid-price |
-| 12 | `clob_ask_pressure` | C | CLOB WS | Pressão vendedora (asks dominam o book) |
-| 13 | `btc_up_w1` | D | data-api ticks | Up-ratio ponderado da segunda metade do slot |
-| 14 | `btc_size_disparity` | D | data-api ticks | Dispersão de tamanhos entre BUY e SELL |
-| 15 | `btc_up_ratio_zscore_5s` | D | data-api ticks | Z-score do up-ratio vs janela 5 slots |
-| 16 | `prev_slot_up_ratio_3` | E | histórico | Up-ratio do slot t-3 |
-| 17 | `prev_slot_up_ratio_5` | E | histórico | Up-ratio do slot t-5 |
-| 18 | `lag_ur_zscore_20` | E | histórico | Z-score do up-ratio do slot anterior vs janela 20 |
-| 19 | `x_imb_x_ur` | F | cross | ob_imbalance × btc_up_ratio |
-| 20 | `x_depth_x_vol` | F | cross | ob_depth_ratio × btc_vol_1h |
-
----
-
-## 4. Auditoria de lookahead
-
-**Regra:** feature deve usar exclusivamente dados de t < OBS_SECS (60s).
-
-Todas as 20 features acima passaram na auditoria. Ver seção 5 para features removidas por violação.
-
----
-
-## 5. Histórico de remoções
-
-### v29 — removidas por leakage temporal (2026-06-10)
-
-Estas features eram coletadas em t=108-168s no training (média do slot), mas o live as capturava em t<60s. Correlação artificial com o target inflou AUC de ~0.79 para 0.85.
-
-| Feature | Correlação c/ target | Motivo |
-|---|---|---|
-| `ob_mid` | 0.60 | OB capturado em t=108-168s no train |
-| `ob_imbalance_end` | — | snapshot "end" usa dados do slot completo |
-| `ob_spread_end` | — | idem |
-| `ob_imb_momentum` | — | end - open = depende do end |
-| `ob_depth_change` | — | end - open = depende do end |
-| `clob_mid_velocity` | — | slope do mid calculado sobre slot completo no train |
-| `ob_weighted_imb` | — | inclui dados pós-60s |
-| `ob_bid_depth_5c` | — | snapshot contaminado |
-| `ob_ask_depth_5c` | — | snapshot contaminado |
-
-**Efeito:** win rate caiu de 96.8% → baseline honesto. AUC v28=0.848 (inflado) → v29=0.792 (real).
-
-### v26-v28 — features de versões anteriores
-Features como `btc_pre_4h_ret`, `btc_vol_1h`, variantes de lag (1-20), `hour_sin/cos`, `dow_sin/cos`, `btc_up_ratio`, etc. foram computadas mas não selecionadas pelo permutation importance no v29. Presentes no código mas não usadas pelo modelo.
-
----
-
-## 6. Grupo A — Spot Binance
-
-Fonte: WebSocket Binance `btcusdt@kline_1m` + `btcusdt@trade`.
-
-| Feature | Cálculo |
-|---|---|
-| `btc_inslot_ret` | `px_end / px_start - 1` onde start/end são os ticks dentro do slot |
-| `btc_inslot_range` | `(high - low) / px_end` dos ticks do slot |
-| `btc_pre_5m_ret` | `px_obs_end / px_5m_ago - 1` |
+| Feature | Fórmula |
+|---------|---------|
+| `btc_inslot_ret` | `(close_at_obs / open_at_slot - 1) / vol_1h` |
+| `btc_inslot_range` | `((high - low) / close) / vol_1h` |
+| `btc_pre_5m_ret` | `(close_now / close_5m_ago - 1) / vol_1h` |
 | `btc_dist_1k` | `min(px % 1000, 1000 - px % 1000) / 1000` |
-| `btc_spot_vol_ratio` | `vol_5m / mean(vol_5m_per_slot_last_1h)` |
+| `btc_spot_vol_ratio` | `vol_slot_5m / mean(vol_12_slots_last_1h)` |
+| `btc_vol_1h` | `std(returns_last_12_candles)` — usado como normalizador, não feature |
 
----
+### Grupo B — L2 Orderbook (CLOB REST snapshot, t~60s)
 
-## 7. Grupo B — L2 Orderbook
+Open snapshot capturado em t~60s (OB early snapshot). Retry 3x com 0.5s backoff.
+Se `asks=0` → mercado skewed (ask >= 0.97), não retenta (correto não entrar).
 
-Fonte: CLOB REST `/book` — snapshot "open" capturado em t~5-10s após inicio do slot.
+| Feature | Fórmula |
+|---------|---------|
+| `ob_total_depth` | `sum(all bid_sz) + sum(all ask_sz)` |
+| `ob_imbalance` | `bid_sz / (bid_sz + ask_sz)` top-1 level |
+| `ob_depth_ratio` | `bid_depth_top5 / ask_depth_top5` |
 
-**Importante:** apenas o snapshot "open" é usado. Snapshots "end" (t>60s) foram removidos por leakage.
+### Grupo C — CLOB Real-time (price_change WS, janela t=[0,168s))
 
-| Feature | Cálculo |
-|---|---|
-| `ob_imbalance` | `bid_vol / (bid_vol + ask_vol)` top-10 levels |
-| `ob_depth_ratio` | `bid_depth / ask_depth` top-5 levels |
-| `ob_total_depth` | `bid_depth + ask_depth` total |
+Accumulator (`ClobFeatureAccumulator`) bufferiza eventos `price_change` e cria
+synthetic `BookSnapshot` com `best_bid`/`best_ask` de cada evento.
 
----
+`get_features(obs_secs=168, window_secs=168)` → janela `[slot_ts, slot_ts+168s)`.
 
-## 8. Grupo C — CLOB Real-time
+> **Bug histórico (corrigido 2026-06-13):** `window_secs` era 60, cobrindo apenas
+> [108s, 168s). Excluía ~64% dos eventos. Corrigido para 168 (slot inteiro).
 
-Fonte: WebSocket CLOB — eventos `book_snapshot` e `price_change` acumulados em t=0..60s.
+| Feature | Fórmula |
+|---------|---------|
+| `clob_spread_mean` | `mean(best_ask - best_bid)` sobre todos os eventos |
+| `clob_spread_trend` | slope linear do spread vs tempo |
+| `clob_mid_volatility` | `std(diff(mid_sequence))` |
+| `clob_ask_pressure` | fração de ASK moves consecutivos que foram DOWN |
 
-| Feature | Cálculo |
-|---|---|
-| `clob_spread_mean` | Média do spread (ask-bid) durante o período |
-| `clob_spread_trend` | Slope linear do spread vs tempo |
-| `clob_mid_volatility` | `std(diff(mid_prices))` — volatilidade do mid |
-| `clob_ask_pressure` | Razão de eventos onde ask domina o volume |
+### Grupo D — Order Flow (Data-API ticks, t=[0,60s))
 
----
+Ticks do Polymarket CLOB fetched via data-api com ~120s de lag (disponíveis em t~170s).
+`side` = "Up"/"Down" (outcome label).
 
-## 9. Grupo D — Order Flow (ticks)
-
-Fonte: Polymarket data-api `/trades` — ticks do slot atual com lag ~120s.
-
-| Feature | Cálculo |
-|---|---|
-| `btc_up_w1` | Up-ratio ponderado por volume na segunda metade do slot |
-| `btc_size_disparity` | `abs(mean_buy_size - mean_sell_size) / mean_size` |
+| Feature | Fórmula |
+|---------|---------|
+| `btc_up_w1` | `vol_Up / total_vol` na janela t=30-60s |
+| `btc_size_disparity` | `mean_size_Up - mean_size_Dn` |
 | `btc_up_ratio_zscore_5s` | `(up_ratio - mean_5slots) / std_5slots` |
 
----
+### Grupo E — Lag History (ring buffer)
 
-## 10. Grupo E — Lag History
+Computado de slots anteriores resolvidos. Nunca usa dados futuros.
 
-Fonte: histórico de slots resolvidos em memória.
+| Feature | Fonte |
+|---------|-------|
+| `prev_slot_up_ratio_3` | up_ratio do slot t-3 |
+| `prev_slot_up_ratio_5` | up_ratio do slot t-5 |
+| `lag_ur_zscore_20` | zscore do up_ratio atual vs janela 20 slots |
 
-| Feature | Cálculo |
-|---|---|
-| `prev_slot_up_ratio_3` | Up-ratio do slot t-3 |
-| `prev_slot_up_ratio_5` | Up-ratio do slot t-5 |
-| `lag_ur_zscore_20` | `(up_ratio[t-1] - mean_20) / std_20` |
+### Grupo F — Cross-features
 
----
-
-## 11. Grupo F — Cross features
-
-Interações multiplicativas entre grupos.
-
-| Feature | Cálculo |
-|---|---|
+| Feature | Fórmula |
+|---------|---------|
 | `x_imb_x_ur` | `ob_imbalance × btc_up_ratio` |
 | `x_depth_x_vol` | `ob_depth_ratio × btc_vol_1h` |
+
+---
+
+## 5. DataQualityGate — limites corretos
+
+| Check | Limite | Motivo |
+|-------|--------|--------|
+| `RETURN_RANGE` | `(-50, 50)` | Retornos normalizados por vol_1h; ±0.05 era falso positivo |
+| `ASK_RANGE` | `(0.1, 0.95)` | Exclui mercados já decididos |
+| `MIN_TICKS` | 50 | Mínimo de ticks para sinal confiável |
+| `SPOT_MAX_AGE` | 300s | Buffer Binance não pode ser muito stale |
+| `WARMUP_SLOTS` | 3 | Cold start protection |
+
+---
+
+## 6. Features do pipeline completo (71 features candidatas para versões futuras)
+
+Ver histórico completo em `docs/features_full_history.md` (versões v18–v31).
+
+---
+
+## 7. Features REMOVIDAS por impossibilidade live ou mismatch train/live
+
+| Feature | Motivo |
+|---------|--------|
+| `ob_mid_drift` | Precisa snapshot close (t~168s) — lookahead vs OBS_SECS=60 |
+| `ob_imbalance_end` | Idem |
+| `ob_spread_end` | Idem |
+| `ob_imb_w1`, `ob_imb_w2` | Requer book reais em t=60-168s — WS só entrega 1 por slot |
+| `clob_imb_mean/std/drift` | Sempre 0.0 live — apenas 1 book real por slot |
+| `clob_depth_trend` | Idem |
+| `clob_activity_rate` | Diverge entre train (janela fixa) e live (wall-clock) |
+| `clob_mid_velocity` | Computada mas não inclusa no CLOB_KEEP (v29) |
