@@ -982,42 +982,87 @@ _ob_last_slot: int = 0                 # track slot changes to clear cache
 
 
 def _fetch_ob_snapshot(up_token_id: str) -> dict | None:
-    """Fetch raw OB metrics from CLOB REST. Returns dict or None on failure."""
-    try:
-        r = _http.get(
-            f"{CLOB_URL}/book",
-            params={"token_id": up_token_id},
-            timeout=5,
-        )
-        if not r.ok:
-            log.warning("OB snapshot HTTP %d for %s", r.status_code, up_token_id[:20])
-            return None
-        book = r.json()
-        asks = book.get("asks", [])
-        bids = book.get("bids", [])
-        if not asks or not bids:
-            log.warning("OB snapshot empty book for %s: asks=%d bids=%d", up_token_id[:20], len(asks), len(bids))
-            return None
-        asks_sorted = sorted(asks, key=lambda x: float(x["price"]))
-        bids_sorted = sorted(bids, key=lambda x: float(x["price"]), reverse=True)
-        best_ask = float(asks_sorted[0]["price"])
-        best_bid = float(bids_sorted[0]["price"])
-        best_ask_sz = float(asks_sorted[0]["size"])
-        best_bid_sz = float(bids_sorted[0]["size"])
-        mid = (best_ask + best_bid) / 2
-        spread = best_ask - best_bid
-        imbalance = float((best_bid_sz - best_ask_sz) / (best_bid_sz + best_ask_sz + 1e-8))
-        return {
-            "asks_sorted": asks_sorted, "bids_sorted": bids_sorted,
-            "asks": asks, "bids": bids,
-            "best_ask": best_ask, "best_bid": best_bid,
-            "best_ask_sz": best_ask_sz, "best_bid_sz": best_bid_sz,
-            "mid": mid, "spread": spread, "imbalance": imbalance,
-            "ts": time.time(),
-        }
-    except Exception as e:
-        log.warning("OB snapshot fetch failed for %s: %s", up_token_id[:20], e)
-        return None
+    """Fetch raw OB metrics from CLOB REST. Returns dict or None on failure.
+
+    Retries up to 3 times with 0.5s delay to handle:
+      - Transient network errors
+      - Empty asks at slot start (~10s window where new market has no asks yet)
+
+    Does NOT retry HTTP 404 (market closed/not found) — that's permanent.
+    Does NOT retry asks=0 when bids>90 (market fully resolved ~99% one side) —
+    that means no liquidity to trade and the bot would skip anyway.
+    """
+    OB_RETRIES = 3
+    OB_RETRY_DELAY = 0.5   # seconds between retries
+
+    for attempt in range(1, OB_RETRIES + 1):
+        try:
+            r = _http.get(
+                f"{CLOB_URL}/book",
+                params={"token_id": up_token_id},
+                timeout=5,
+            )
+            if not r.ok:
+                log.warning("OB snapshot HTTP %d for %s (attempt %d/%d)",
+                            r.status_code, up_token_id[:20], attempt, OB_RETRIES)
+                if r.status_code == 404:
+                    return None   # permanent — market doesn't exist
+                if attempt < OB_RETRIES:
+                    time.sleep(OB_RETRY_DELAY)
+                    continue
+                return None
+
+            book = r.json()
+            asks = book.get("asks", [])
+            bids = book.get("bids", [])
+
+            if not bids:
+                # No bids at all — highly unusual, retry
+                log.warning("OB snapshot no bids for %s (attempt %d/%d)",
+                            up_token_id[:20], attempt, OB_RETRIES)
+                if attempt < OB_RETRIES:
+                    time.sleep(OB_RETRY_DELAY)
+                    continue
+                return None
+
+            if not asks:
+                # No asks: either market is ~99% resolved (asks=0, bids=99) or
+                # it's the first few seconds of a new slot.
+                # Retry once — if still empty after retry, it's a resolved market.
+                log.warning("OB snapshot asks=0 for %s bids=%d (attempt %d/%d)",
+                            up_token_id[:20], len(bids), attempt, OB_RETRIES)
+                if attempt < OB_RETRIES:
+                    time.sleep(OB_RETRY_DELAY)
+                    continue
+                # After retries: give up — market is too one-sided to trade
+                return None
+
+            asks_sorted = sorted(asks, key=lambda x: float(x["price"]))
+            bids_sorted = sorted(bids, key=lambda x: float(x["price"]), reverse=True)
+            best_ask = float(asks_sorted[0]["price"])
+            best_bid = float(bids_sorted[0]["price"])
+            best_ask_sz = float(asks_sorted[0]["size"])
+            best_bid_sz = float(bids_sorted[0]["size"])
+            mid = (best_ask + best_bid) / 2
+            spread = best_ask - best_bid
+            imbalance = float((best_bid_sz - best_ask_sz) / (best_bid_sz + best_ask_sz + 1e-8))
+            if attempt > 1:
+                log.info("OB snapshot OK after %d attempts for %s", attempt, up_token_id[:20])
+            return {
+                "asks_sorted": asks_sorted, "bids_sorted": bids_sorted,
+                "asks": asks, "bids": bids,
+                "best_ask": best_ask, "best_bid": best_bid,
+                "best_ask_sz": best_ask_sz, "best_bid_sz": best_bid_sz,
+                "mid": mid, "spread": spread, "imbalance": imbalance,
+                "ts": time.time(),
+            }
+        except Exception as e:
+            log.warning("OB snapshot fetch failed for %s: %s (attempt %d/%d)",
+                        up_token_id[:20], e, attempt, OB_RETRIES)
+            if attempt < OB_RETRIES:
+                time.sleep(OB_RETRY_DELAY)
+
+    return None
 
 
 def _build_ob_features(up_token_id: str) -> dict:
@@ -1360,18 +1405,32 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
     # clob_imb_*/depth_trend/activity_rate removed (❌ quase sempre 0.0 live)
     if up_token_id:
         _acc = get_accumulator()
+
+        # clob_* WS features (janela t=[108,168s))
         clob_feats = _acc.get_features(
             up_token_id,
             slot_ts=slot_ts,
             obs_secs=168,
             window_secs=60.0,
         )
-        # Only keep the 5 OK clob features; discard the divergent ones
         CLOB_KEEP = {"clob_spread_mean", "clob_spread_trend",
                      "clob_mid_volatility", "clob_ask_pressure"}
         for k, v in clob_feats.items():
             if k in CLOB_KEEP:
                 feat[k] = v
+
+        # ob_pc_* features — price_change events desde slot_ts (t=[0,168s))
+        pc_feats = _acc.get_ob_pc_features(up_token_id, slot_ts, cutoff_secs=168)
+        feat["ob_pc_up_ratio"]    = pc_feats.get("ob_pc_up_ratio", 0.5)
+        feat["ob_pc_count"]       = pc_feats.get("ob_pc_count", 0.0)
+        feat["ob_fill_imbalance"] = pc_feats.get("ob_fill_imbalance", 0.0)
+
+        # ob_imb_w0 — mean imbalance de book reais em t=[0,60s)
+        imb_windows = _acc.get_windowed_imbalance(
+            up_token_id, slot_ts,
+            windows=[(0, 60), (60, 120), (120, 168)]
+        )
+        feat["ob_imb_w0"] = imb_windows.get("ob_imb_w0", 0.0)
 
     # ── Final: fill any remaining model features with context-aware defaults ────
     _neutral_defaults = {
