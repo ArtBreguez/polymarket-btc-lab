@@ -10,7 +10,7 @@ truth for "what to try" and "what to avoid".
 ## Scoring Reference
 
 All metrics are computed via **purged walk-forward CV** (5 folds, gap=5 slots
-unless noted) on 601 resolved BTC 5-minute markets.
+unless noted) on 22k+ resolved BTC 5-minute markets.
 
 | Metric | Direction | Notes |
 |--------|-----------|-------|
@@ -467,7 +467,7 @@ slightly different hyperparameters, failed to beat the champion on any metric.
 
 ---
 
-## v21: Feature Ablation & Pruning (CURRENT CHAMPION)
+## v21: Feature Ablation & Pruning
 
 **Date:** 2026-06-05
 **Result:** PROMOTED (3/3 gate) — 30 features, AUC=0.9002
@@ -517,4 +517,136 @@ colsample_bytree: 0.603
 reg_alpha: 0.0056
 reg_lambda: 0.0234
 ```
+
+---
+
+## v22: OBS Window Alignment A/B Test
+
+**Date:** 2026-06-06 | **Champion:** No
+
+A/B test: variant A (OBS_SECS=60, match live) vs variant B (OBS_SECS=180, full window).
+Neither variant beat v21 champion (AUC=0.9002). Root cause: removing the 180s tick data from the OBS window
+hurt the CLOB flow features that depended on a full 3-minute observation window.
+
+**Lesson:**
+- Training OBS window must match what live actually receives — but shrinking the window naively degrades features built for 180s
+- Confirmed: live CLOB data-api lags ~120s, so at t=60s only partial tick data available
+
+---
+
+## v23: Live-Aligned Feature Formulas
+
+**Date:** 2026-06-07 | **Champion:** No
+
+Fixed formula mismatches vs v22: tw_up_ratio (linear→exp decay), momentum (unified n_windows formula),
+x_ob_drift_x_inslot (was always zero in live due to ordering bug).
+Focus on OBS_SECS=60. Did not beat v21.
+
+**Lesson:**
+- Formula alignment is necessary but not sufficient — fixing bugs without a stronger signal source won't lift AUC
+
+---
+
+## v24–v25: CLOB WS Microstructure Features
+
+**Date:** 2026-06-08 | **Champion:** No (v25)
+
+v25 added 10 CLOB WS real-time features (clob_imb_mean, clob_spread_mean, clob_mid_velocity, etc.)
+from BrockMisner/polymarket-btc-updown dataset (CLOB book + price_change events).
+Total: 50 features. OBS_SECS=60.
+
+**Result:** Did not beat v21. CLOB WS features had signal but couldn't compensate for smaller OBS window.
+
+**Lesson:**
+- CLOB WS features (clob_*) are real-time zero-lag — keep them, but need better data alignment
+
+---
+
+## v26–v27: Real-Time Only Philosophy
+
+**Date:** 2026-06-09 | **Champion:** No
+
+Philosophy shift: ONLY features computable with <5s lag (Binance kline WS + CLOB REST /book + CLOB WS).
+Excluded tick-based features (data-api ~120s lag). OB snapshot from pmdata poly_l2.
+
+**Result:** AUC degraded vs v21 — tick features (btc_up_ratio etc.) do carry signal even with lag.
+
+**Lesson:**
+- Pure real-time restriction too aggressive at this dataset size
+- Tick features from data-api are available by t=60s decision time (lag ~30-40s, not 120s) — safe to keep
+
+---
+
+## v28: Full Feature Parity (train == live)
+
+**Date:** 2026-06-10 | **Champion:** No
+
+Exact same feature set as deploy/live_trader.py. Includes:
+- Group A: Binance spot (kline WS): pre-slot returns, in-slot ret/range/vol, dist round numbers
+- Group B: CLOB REST /book snapshot (t~60s): imbalance, spread, depth
+- Group C: Tick-based order flow (data-api, available by t=60s): up_ratio, n_ticks, momentum, buy_ratio, etc.
+- Group D: CLOB WS price_change: spread/mid dynamics, fill imbalance
+- Group E: Ring buffer (lag outcomes, zscores)
+- Group F: Cross-interaction features
+
+Used ob_features_full.parquet (CLOB window [108,168s) — mismatch with live [0,60s)).
+
+**Result:** Trained but champion gate details unclear — superceded by v29.
+
+---
+
+## v29: 20 Real-Time Features — CURRENT CHAMPION
+
+**Date:** 2026-06-11 | **Champion:** PROMOTED — WF AUC=0.7918
+
+| Metric | Value |
+|--------|-------|
+| WF AUC | **0.7918** |
+| WF Brier | — |
+| Features | **20** |
+| OBS_SECS | 60 |
+
+**Changes vs v28:**
+- Pruned to 20 features via importance ablation
+- ob_features_full.parquet (CLOB window [108,168s)) used for training
+- Live: clob_features window_secs=168 (later fixed to 60 for paridade)
+- Retornos spot (btc_inslot_ret, btc_inslot_range, btc_pre_5m_ret): brutos (sem normalização vol_1h)
+
+**Live state (2026-06-13):**
+- Champion ativo no HF: artbreguez/polymarket-btc-model
+- Wallet W4/L1, P&L=+$5.78, saldo ~$23 USDC
+- CLOB window live: [0,60s) — leve mismatch vs treino [108,168s), mas melhor que antes
+- Retornos brutos live = paridade com treino ✅
+
+**Lessons:**
+- 20 features é suficiente para 22k mercados — menos overfitting
+- RETURN_RANGE deve ser ±0.05 quando retornos são brutos (não normalizar por vol_1h no live)
+- CLOB window [0,60s) vs [108,168s) é mismatch conhecido — resolver no v31
+
+---
+
+## v30: Vol_1h Normalization + CLOB [0,60s) Parity
+
+**Date:** 2026-06-13 | **Champion:** No (AUC=0.7783 < champion 0.7918)
+
+| Metric | Value |
+|--------|-------|
+| WF AUC | 0.7783 ± 0.0083 |
+| AV AUC | 0.9508 (drift severo) |
+| Features | 10 |
+| Optuna trials | 89/200 (cortado por timeout) |
+
+**Changes vs v29:**
+- FIX: btc_inslot_ret/range/pre_*_ret normalizados por vol_1h — tentativa de match com live
+- CLOB: usa ob_features_v31.parquet (janela [0,60s)) em vez de ob_features_full.parquet ([108,168s))
+
+**Result:** Não promoveu. Optuna cortado no trial 89/200 pelo timeout Modal.
+AV AUC 0.9508 indica drift severo entre folds (possível sinal de overfitting ou Optuna incompleto).
+
+**Lessons:**
+- Normalização por vol_1h piora AUC — os splits do LightGBM foram treinados com retornos brutos (v29)
+  e a normalização criou uma distribuição diferente sem benefício mensurável
+- REVERTER: manter retornos brutos no live para paridade com v29 ✅ (feito)
+- Optuna precisa de 200 trials completos — não cortar por timeout no Modal
+- Próximo passo (v31): fetch local pmdata [0,168s) + retreinar com janela unificada
 

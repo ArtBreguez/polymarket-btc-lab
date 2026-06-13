@@ -3,10 +3,19 @@
 ## Completed
 
 ### v19: L2 Orderbook Features — DONE
-Real L2 orderbook features from pmdata poly_l2 data. Added 9 OB features (ob_mid, ob_mid_drift, ob_weighted_imb, ob_imb_w0/w1/w2, ob_imb_momentum, ob_ask_depth_5c, ob_total_depth) + 3 cross-domain interactions. AUC: 0.8979 → 0.9000.
+Real L2 orderbook features from pmdata poly_l2 data. AUC: 0.8979 → 0.9000. 40 features.
 
-### v21: Ablation Study — DONE (Current Champion)
-Pruned from 40 → 30 features. Removed 10 low-importance features (zscore, early windows, noisy lags). AUC maintained at 0.9002, accuracy improved to 81.34%.
+### v21: Ablation Study — DONE
+Pruned 40 → 30 features. AUC maintained 0.9002. Champion at the time.
+
+### v22–v27: OBS Window + Formula Alignment — DONE
+A/B tests for OBS_SECS=60 vs 180. Formula fixes (tw_up_ratio, momentum, x_ob_drift). CLOB WS microstructure features added (v25). Pure real-time philosophy tested (v26–v27). None beat v21.
+
+### v28: Full Train/Live Parity — DONE
+Unified feature groups A–F. CLOB WS features (clob_spread_mean, clob_mid_volatility, clob_ask_pressure) integrated. Base for v29.
+
+### v29: 20 Real-Time Features — DONE (CURRENT CHAMPION)
+Pruned to 20 features. WF AUC=0.7918. Live on Fly.io (polymarket-maker-mm). Retornos brutos, CLOB window [0,60s). W4/L1, P&L=+$5.78.
 
 ### Position Sizing — DONE
 Auto-sizing shares based on wallet balance. Linear scaling: 5 shares at $20 → 40 shares at $700. Risk cap: never spend >10% of balance per trade. Configurable via env vars (AUTO_SHARES, FIXED_SHARES, etc.).
@@ -18,20 +27,20 @@ ws_manager.py with exponential backoff, active zombie detection, Binance REST fa
 
 ## In Progress
 
-### Daily Data Expansion
+### v31: CLOB Window Unification [0,168s)
 
-**Status**: Blocked (pmdata.dev API key expired)
+**Status**: Planned — próximo sprint
 
-Currently data is manually fetched and uploaded. Plan:
-1. Renew pmdata API key
-2. Cron job to fetch new resolved markets daily
-3. Fetch corresponding Binance spot candles
-4. Append to training dataset
-5. Upload to Modal Volume
+Mismatch atual: treino v29 usou ob_features_full.parquet ([108,168s)), live usa [0,60s).
 
-Dataset grows ~280 markets/day. Target: 30k+ markets for v22.
+Plano:
+1. Fetch local pmdata [0,168s) para todos os mercados do dataset
+2. Computar ob_features_v31.parquet com janela [0,168s)
+3. Retreinar v31 com retornos brutos + CLOB [0,168s) — 200 trials Optuna sem timeout
+4. Promover se AUC > 0.7918 (champion v29)
+5. Atualizar live clob_features.py window_secs=168
 
-More data has been the single biggest driver of improvement (v17→v18: +0.004 AUC from 3x data alone).
+Impacto esperado: maior janela CLOB captura mais eventos de microestrutura → melhor sinal.
 
 ---
 

@@ -21,10 +21,10 @@
 | 6 | `ob_total_depth` | B | CLOB REST /book (snapshot open t~60s) |
 | 7 | `ob_imbalance` | B | CLOB REST /book (snapshot open) |
 | 8 | `ob_depth_ratio` | B | CLOB REST /book (snapshot open) |
-| 9 | `clob_spread_mean` | C | CLOB WS price_change (janela t=[0,168s)) |
-| 10 | `clob_spread_trend` | C | CLOB WS price_change (janela t=[0,168s)) |
-| 11 | `clob_mid_volatility` | C | CLOB WS price_change (janela t=[0,168s)) |
-| 12 | `clob_ask_pressure` | C | CLOB WS price_change (janela t=[0,168s)) |
+| 9 | `clob_spread_mean` | C | CLOB WS price_change (janela t=[0,60s)) |
+| 10 | `clob_spread_trend` | C | CLOB WS price_change (janela t=[0,60s)) |
+| 11 | `clob_mid_volatility` | C | CLOB WS price_change (janela t=[0,60s)) |
+| 12 | `clob_ask_pressure` | C | CLOB WS price_change (janela t=[0,60s)) |
 | 13 | `btc_up_w1` | D | Data-API trades (t=30-60s) |
 | 14 | `btc_size_disparity` | D | Data-API trades (avg_up - avg_dn) |
 | 15 | `btc_up_ratio_zscore_5s` | D | Ring buffer (zscore 5 slots) |

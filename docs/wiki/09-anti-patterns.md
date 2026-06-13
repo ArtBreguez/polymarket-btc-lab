@@ -111,3 +111,32 @@ This page documents every approach that was tried and produced worse results. Do
 **Result**: Silent failures — model produces garbage predictions because input features don't match what it was trained on. At least 6 distinct bugs traced to this (see 08-troubleshooting.md).
 
 **Verdict**: Every training feature change MUST be mirrored in live_trader.py. Run `tests/test_features.py` after any change. Consider a shared feature module (currently features are duplicated between training scripts and live_trader.py).
+
+---
+
+## Vol_1h Normalization for Spot Returns (v30)
+
+**What**: Divide btc_inslot_ret, btc_inslot_range, btc_pre_5m_ret by btc_vol_1h before feeding to LightGBM.
+
+**Motivation**: Normalize returns by volatility regime to make features scale-invariant.
+
+**Result**: WF AUC dropped from 0.7918 (v29 champion, brutos) to 0.7783 (v30, normalizado).
+LightGBM splits were calibrated on raw returns — changing the distribution invalidated all internal thresholds.
+Additionally, Optuna was cut at trial 89/200 (Modal timeout), so the model was undertrained.
+
+**Verdict**: Keep spot returns raw (brutos). RETURN_RANGE = (-0.05, 0.05). Do not normalize by vol_1h.
+
+---
+
+## CLOB Window [108, 168s) in Training (ob_features_full.parquet)
+
+**What**: Use CLOB price_change events from t=[108,168s) for training features (ob_features_full.parquet).
+
+**Motivation**: Originally the entire [0,168s) window was used but live data only accumulated [0,60s).
+A legacy script cut the window to [108,168s) to avoid using early events.
+
+**Result**: Mismatch: live bot accumulates CLOB events [0,60s), but training used [108,168s).
+Different temporal slice → different microstructure signal → silent prediction degradation.
+
+**Verdict**: Training and live must use the same CLOB time window.
+v31 will use [0,168s) both in training (ob_features_v31.parquet) and live (window_secs=168).
