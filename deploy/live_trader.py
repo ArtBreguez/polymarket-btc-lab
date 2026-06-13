@@ -1406,12 +1406,15 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
     if up_token_id:
         _acc = get_accumulator()
 
-        # clob_* WS features (janela t=[108,168s))
+        # clob_* WS features (janela t=[0,168s)) — janela completa do slot
+        # window_secs=168 cobre desde o reset_token no início do slot até o
+        # momento de predição (~170s). Antes era 60s ([108,168s)), o que
+        # excluía todos os eventos acumulados no início do slot.
         clob_feats = _acc.get_features(
             up_token_id,
             slot_ts=slot_ts,
             obs_secs=168,
-            window_secs=60.0,
+            window_secs=168.0,
         )
         CLOB_KEEP = {"clob_spread_mean", "clob_spread_trend",
                      "clob_mid_volatility", "clob_ask_pressure"}
