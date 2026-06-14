@@ -124,16 +124,23 @@ class ClobFeatureAccumulator:
             self._prune_buffer(buf, now)
 
     def reset_token(self, token_id: str, slot_ts: int = 0) -> None:
-        """Clear all buffered data for a token (e.g., on slot change).
+        """Reanchor buffer to a new slot_ts WITHOUT clearing events.
+
+        Eventos acumulados são mantidos — o obs_secs dinâmico no live_trader.py
+        garante que só eventos do slot atual sejam usados via janela [slot_ts, now+5).
+        Limpar o buffer aqui causava CLOB features sempre zero: o WS levava 60-170s
+        para remandar o book snapshot do novo token, e a janela [slot_ts, slot_ts+60)
+        ficava vazia no momento da decisão.
 
         Args:
-            token_id: The asset/token identifier to clear.
+            token_id: The asset/token identifier to reanchor.
             slot_ts: New slot timestamp (stored for reference).
         """
         with self._lock:
             buf = self._buffers[token_id]
-            buf.book_events.clear()
-            buf.price_events.clear()
+            # Não limpar — só reancorar o slot_ts.
+            # Eventos antigos são automaticamente excluídos pela janela dinâmica
+            # [slot_ts, now+5) em get_features() e pelo prune do MAX_BUFFER_SECS.
             buf.slot_ts = slot_ts
 
     # ------------------------------------------------------------------
