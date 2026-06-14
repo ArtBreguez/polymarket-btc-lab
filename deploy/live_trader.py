@@ -2035,6 +2035,24 @@ def run(client, model, features):
             _fv = " | ".join(f"{f}={v:.4f}" for f, v in _feat_vals)
             log.info("  FEATS (%d): %s", len(features), _fv)
 
+            # ── Persist full feature snapshot to JSONL for audit/debug ──────
+            # /tmp/all_features_log.jsonl — uma linha por avaliação de slot
+            try:
+                import time as _time
+                _feat_row = {
+                    "slot_ts": slot_ts,
+                    "t_in_slot": t_elapsed,
+                    "logged_at": round(_time.time(), 2),
+                    "prob_up": round(prob_up, 4),
+                    "direction": direction,
+                    "confidence": round(confidence, 4),
+                    **{f: round(feat.get(f, 0.0), 6) for f in features},
+                }
+                with open("/tmp/all_features_log.jsonl", "a") as _fh:
+                    _fh.write(json.dumps(_feat_row) + "\n")
+            except Exception as _e:
+                log.debug("feature log write failed: %s", _e)
+
             # Log CLOB features for future v25 training
             clob_feats = {k: feat.get(k, 0.0) for k in CLOB_FEATURE_NAMES}
             log_clob_features(
