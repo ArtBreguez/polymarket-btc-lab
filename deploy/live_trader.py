@@ -63,8 +63,10 @@ GAMMA_HOST      = "https://gamma-api.polymarket.com"
 DATA_API        = "https://data-api.polymarket.com"
 CLOB_URL        = "https://clob.polymarket.com"
 CLOB_WS_URL     = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-BINANCE_WS      = "wss://stream.binance.com:9443/stream?streams=btcusdt@kline_1m"
-BINANCE_REST    = "https://api.binance.com/api/v3"
+# Binance WS/REST são bloqueados pelo Fly AMS (HTTP 451 geo-block).
+# Bybit WS não tem geo-block e tem o mesmo stream de kline 1m.
+BINANCE_WS      = "wss://stream.bybit.com/v5/public/spot"   # Bybit (sem geo-block)
+BINANCE_REST    = "https://api.bybit.com/v5/market"          # Bybit REST fallback
 
 HTTP_TIMEOUT    = 3    # seconds — tight budget for a 10s loop
 MAX_TRADE_PAGES = 8    # max 8 pages/token × 2 tokens = 16 calls max (~4000 trades/token)
@@ -138,79 +140,99 @@ def _write_spot_buffer():
     _spot_last_write = now
 
 def _seed_spot_buffers():
+    """Seed spot buffers via Bybit REST on startup."""
     for sym in _spot_buffers:
-        limit = 300 if sym == "btcusdt" else 75  # BTC needs 4h+ history
+        limit = 300 if sym == "btcusdt" else 75
         try:
-            r = _http.get(f"{BINANCE_REST}/klines",
-                             params={"symbol": sym.upper(), "interval": "1m", "limit": limit},
-                             timeout=HTTP_TIMEOUT)
+            r = _http.get(f"{BINANCE_REST}/kline",
+                          params={"category": "spot", "symbol": sym.upper(),
+                                  "interval": "1", "limit": limit},
+                          timeout=HTTP_TIMEOUT)
             if r.ok:
-                for k in r.json():
-                    _spot_buffers[sym].append([k[0] // 1000, float(k[4]), float(k[2]), float(k[3]), float(k[5])])  # [ts, close, high, low, volume]
-                log.info("Spot seed %s: %d candles", sym.upper(), len(_spot_buffers[sym]))
+                candles = r.json().get("result", {}).get("list", [])
+                for k in candles:
+                    # Bybit list: [startMs, open, high, low, close, volume, turnover]
+                    _spot_buffers[sym].append([int(k[0]) // 1000, float(k[4]), float(k[2]), float(k[3]), float(k[5])])
+                log.info("Spot seed %s: %d candles (Bybit)", sym.upper(), len(_spot_buffers[sym]))
         except Exception as e:
             log.warning("Spot seed %s failed: %s", sym, e)
     _write_spot_buffer()
 
 
 async def _spot_on_message(msg: dict) -> None:
-    """Handle Binance kline WS message."""
-    if isinstance(msg, dict):
-        sym = msg.get("stream", "").split("@")[0]
-        if sym not in _spot_buffers:
-            return
-        k = msg.get("data", {}).get("k", {})
-        if not k:
-            return
-        ts_s = k["t"] // 1000
-        close = float(k["c"])
-        high = float(k["h"])
-        low = float(k["l"])
-        volume = float(k["v"])
-        dq = _spot_buffers[sym]
-        if dq and dq[-1][0] == ts_s:
-            dq[-1][1] = close
-            if len(dq[-1]) >= 4:
-                dq[-1][2] = max(dq[-1][2], high)
-                dq[-1][3] = min(dq[-1][3], low)
-            else:
-                dq[-1].extend([high, low])
-            # Update volume (always latest cumulative from WS)
-            if len(dq[-1]) >= 5:
-                dq[-1][4] = volume
-            else:
-                dq[-1].append(volume)
+    """Handle Bybit kline WS message.
+
+    Bybit format:
+      {"topic": "kline.1.BTCUSDT", "data": [{"start": ms, "open": "...", "close": "...",
+       "high": "...", "low": "...", "volume": "...", "confirm": bool, ...}]}
+    Fields map directly to what we used from Binance.
+    """
+    if not isinstance(msg, dict):
+        return
+    # Subscribe ACK / other control messages
+    topic = msg.get("topic", "")
+    if not topic.startswith("kline"):
+        return
+    data_list = msg.get("data", [])
+    if not data_list:
+        return
+    k = data_list[0]
+    # Infer symbol: "kline.1.BTCUSDT" → "btcusdt"
+    sym = topic.split(".")[-1].lower()   # "btcusdt"
+    if sym not in _spot_buffers:
+        return
+    ts_s = k["start"] // 1000
+    close = float(k["close"])
+    high = float(k["high"])
+    low = float(k["low"])
+    volume = float(k["volume"])
+    dq = _spot_buffers[sym]
+    if dq and dq[-1][0] == ts_s:
+        dq[-1][1] = close
+        if len(dq[-1]) >= 4:
+            dq[-1][2] = max(dq[-1][2], high)
+            dq[-1][3] = min(dq[-1][3], low)
         else:
-            dq.append([ts_s, close, high, low, volume])
-        _write_spot_buffer()
+            dq[-1].extend([high, low])
+        # Update volume (always latest cumulative from WS)
+        if len(dq[-1]) >= 5:
+            dq[-1][4] = volume
+        else:
+            dq[-1].append(volume)
+    else:
+        dq.append([ts_s, close, high, low, volume])
+    _write_spot_buffer()
 
 
 async def _spot_on_connect(ws) -> None:
-    """Seed buffers on first connect (runs in the WS thread's event loop)."""
-    # Seeding uses REST, safe to call from async context
-    pass
+    """Subscribe to Bybit kline stream on connect."""
+    await ws.send(json.dumps({
+        "op": "subscribe",
+        "args": ["kline.1.BTCUSDT"]
+    }))
+    log.info("Bybit WS subscribed kline.1.BTCUSDT")
 
 
 def _spot_rest_poll():
-    """Fallback: poll Binance REST API for latest klines when WS is blocked.
-
-    Runs in a background thread, polls every 30s. This handles the case where
-    Binance WS returns HTTP 451 (geo-blocked) from certain cloud regions.
-    """
+    """Fallback: poll Bybit REST API for latest klines when WS is disconnected."""
     while True:
         try:
             for sym in _spot_buffers:
-                limit = 5  # just the latest candles, seed already loaded history
-                r = _http.get(f"{BINANCE_REST}/klines",
-                              params={"symbol": sym.upper(), "interval": "1m", "limit": limit},
+                # Bybit REST: /v5/market/kline?category=spot&symbol=BTCUSDT&interval=1&limit=5
+                r = _http.get(f"{BINANCE_REST}/kline",
+                              params={"category": "spot", "symbol": sym.upper(),
+                                      "interval": "1", "limit": 5},
                               timeout=HTTP_TIMEOUT + 2)
                 if r.ok:
-                    for k in r.json():
-                        ts_s = k[0] // 1000
+                    data = r.json()
+                    # Bybit returns {"result": {"list": [[startMs, open, high, low, close, vol, turnover], ...]}}
+                    candles = data.get("result", {}).get("list", [])
+                    for k in candles:
+                        ts_s  = int(k[0]) // 1000
                         close = float(k[4])
-                        high = float(k[2])
-                        low = float(k[3])
-                        volume = float(k[5])
+                        high  = float(k[2])
+                        low   = float(k[3])
+                        volume= float(k[5])
                         dq = _spot_buffers[sym]
                         if dq and dq[-1][0] == ts_s:
                             dq[-1][1] = close
@@ -240,14 +262,15 @@ def start_spot_daemon():
     _seed_spot_buffers()
 
     _spot_ws_manager = WebSocketManager(
-        name="binance-spot",
+        name="bybit-spot",
         url=BINANCE_WS,
         on_message=_spot_on_message,
+        on_connect=_spot_on_connect,
         config=WSConfig(
             ping_interval=20.0,
             ping_timeout=10.0,
-            zombie_timeout=60.0,       # Binance sends klines every ~2s
-            health_log_interval=300.0,  # log health every 5 min
+            zombie_timeout=60.0,       # Bybit sends klines every ~2s
+            health_log_interval=300.0,
         ),
     )
     _spot_ws_manager.start()

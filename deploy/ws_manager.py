@@ -72,6 +72,13 @@ class WSConfig:
     zombie_timeout: float = 45.0       # no message for N seconds → force reconnect
     zombie_check_interval: float = 5.0 # how often to check for zombie state
 
+    # Application-level keepalive (independent of RFC 6455 ping/pong)
+    # Sends a WS ping frame if no message received for keepalive_interval seconds.
+    # Prevents NAT idle timeout (code=1006) on cloud environments like Fly.io
+    # where firewall kills idle TCP connections before the server's ping cycle.
+    # Set to None to disable.
+    keepalive_interval: Optional[float] = 15.0
+
     # Health logging
     health_log_interval: float = 300.0 # log health summary every N seconds (5 min)
 
@@ -388,11 +395,16 @@ class WebSocketManager:
             self._stop_event.wait(timeout=delay)
 
     async def _message_loop(self, ws) -> None:
-        """Process messages with zombie detection and periodic health logging."""
+        """Process messages with zombie detection, keepalive, and periodic health logging."""
         last_health_log = time.time()
 
         # Start zombie detector as background task
         zombie_task = asyncio.create_task(self._zombie_watchdog(ws))
+
+        # Start keepalive task if configured
+        keepalive_task = None
+        if self.config.keepalive_interval:
+            keepalive_task = asyncio.create_task(self._keepalive_loop(ws))
 
         try:
             async for raw in ws:
@@ -434,6 +446,12 @@ class WebSocketManager:
                 await zombie_task
             except asyncio.CancelledError:
                 pass
+            if keepalive_task:
+                keepalive_task.cancel()
+                try:
+                    await keepalive_task
+                except asyncio.CancelledError:
+                    pass
 
         # If async for exits cleanly, the connection was closed by the server
         log.info("[%s] Server closed connection gracefully", self.name)
@@ -520,3 +538,28 @@ class WebSocketManager:
                 self.metrics.record_zombie_kill()
                 await ws.close(code=4000, reason="zombie-timeout")
                 return
+
+    async def _keepalive_loop(self, ws) -> None:
+        """Send periodic WS ping frames to prevent NAT idle timeout (code=1006).
+
+        Cloud firewalls (Fly.io, AWS NAT) kill idle TCP connections after
+        ~30-60s of silence. This sends a ping every keepalive_interval seconds
+        if no data message was received recently, keeping the TCP connection alive.
+        """
+        interval = self.config.keepalive_interval
+        if not interval:
+            return
+
+        while True:
+            await asyncio.sleep(interval)
+            age = time.time() - self.metrics.last_message_at if self.metrics.last_message_at else interval + 1
+            if age >= interval * 0.8:
+                try:
+                    pong = await ws.ping()
+                    await asyncio.wait_for(pong, timeout=10.0)
+                    log.debug("[%s] Keepalive ping OK (last msg %.0fs ago)", self.name, age)
+                except asyncio.CancelledError:
+                    return
+                except Exception as e:
+                    log.warning("[%s] Keepalive ping failed: %s", self.name, e)
+                    return  # connection dead, let zombie watchdog handle it
