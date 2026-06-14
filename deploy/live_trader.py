@@ -1402,15 +1402,18 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
     if up_token_id:
         _acc = get_accumulator()
 
-        # clob_* WS features — janela t=[0,60s), obs_secs=60, window_secs=60
-        # Paridade com treino v30: ob_features_v31.parquet ob60_clob_* usa t=[0,60s).
-        # (janela [108,168s) do v29 excluía eventos do início do slot — bug corrigido)
-        # Futuro v31: fetch pmdata [0,168s) + retreinar com window_secs=168.
+        # clob_* WS features — janela [slot_ts, agora)
+        # obs_secs dinâmico = tempo decorrido desde slot_ts + margem de 5s.
+        # Isso garante que TODOS os eventos acumulados no slot (book WS + hydration REST)
+        # entrem na janela, independente de quando chegaram.
+        # BUG ANTERIOR: obs_secs=60 fixo fazia cutoff_wall = slot_ts+60; eventos
+        # chegados em t>60s (hydration REST, price_change tardios) ficavam fora → zeros.
+        _clob_obs_secs = max(60, int(time.time() - slot_ts) + 5)
         clob_feats = _acc.get_features(
             up_token_id,
             slot_ts=slot_ts,
-            obs_secs=60,
-            window_secs=60.0,
+            obs_secs=_clob_obs_secs,
+            window_secs=float(_clob_obs_secs),  # janela = slot inteiro até agora
         )
         CLOB_KEEP = {"clob_spread_mean", "clob_spread_trend",
                      "clob_mid_volatility", "clob_ask_pressure"}
