@@ -1653,6 +1653,52 @@ def _update_slot_history(slot_ts: int, up_ratio: float, sw: list[float],
 
 
 # ── Trades log ─────────────────────────────────────────────────────────────────
+# Dry run trades are persisted to HuggingFace on every save so restarts
+# (Fly /tmp is ephemeral) don't lose the virtual P&L history.
+HF_DRY_TRADES_FILE = "dry_trades.json"
+
+def _hf_upload_dry_trades(trades: list[dict]) -> None:
+    """Upload dry trades JSON to HuggingFace model repo (fire-and-forget)."""
+    if not HF_TOKEN:
+        return
+    try:
+        from huggingface_hub import HfApi
+        import io
+        api = HfApi(token=HF_TOKEN)
+        content = json.dumps(trades, indent=2).encode()
+        api.upload_file(
+            path_or_fileobj=io.BytesIO(content),
+            path_in_repo=HF_DRY_TRADES_FILE,
+            repo_id=HF_REPO,
+            repo_type="model",
+            commit_message="dry_trades update",
+        )
+    except Exception as e:
+        log.warning("HF dry trades upload failed: %s", e)
+
+
+def _hf_load_dry_trades() -> list[dict]:
+    """Download dry trades from HuggingFace on startup (survives Fly restarts)."""
+    if not HF_TOKEN:
+        return []
+    try:
+        from huggingface_hub import hf_hub_download
+        path = hf_hub_download(
+            repo_id=HF_REPO,
+            filename=HF_DRY_TRADES_FILE,
+            repo_type="model",
+            token=HF_TOKEN,
+            local_dir="/tmp",
+        )
+        data = json.loads(Path(path).read_text())
+        if isinstance(data, list):
+            log.info("Loaded %d dry trades from HuggingFace", len(data))
+            return data
+    except Exception as e:
+        log.info("No dry trades on HF (first run?): %s", e)
+    return []
+
+
 def load_trades() -> list[dict]:
     if TRADES_FILE.exists():
         try:
@@ -1746,6 +1792,10 @@ def rebuild_trades_from_chain(proxy_wallet: str) -> list[dict]:
 
 def save_trades(trades: list[dict]):
     TRADES_FILE.write_text(json.dumps(trades, indent=2))
+    # Dry run: persist to HF in background so restarts don't lose history
+    if DRY_RUN:
+        t = threading.Thread(target=_hf_upload_dry_trades, args=(trades,), daemon=True)
+        t.start()
 
 
 # ── Settlement ──────────────────────────────────────────────────────────────────
@@ -1868,6 +1918,18 @@ def run(client, model, features):
     if DRY_RUN:
         log.info("DRY RUN active | virtual_balance=$%.2f | min_conf=%.0f%% | min_edge=%.0f%%",
                  _dry_virtual_balance, MIN_CONFIDENCE * 100, MIN_EDGE * 100)
+        # Restore previous dry trades from HuggingFace (survives Fly /tmp resets)
+        if not TRADES_FILE.exists():
+            prior = _hf_load_dry_trades()
+            if prior:
+                save_trades(prior)
+                # Recompute virtual balance from settled trades
+                settled_cost = sum(t.get("actual_cost", 0) for t in prior if t.get("dry") and t.get("status") == "dry_open")
+                settled_pnl  = sum(t.get("pnl_usdc", 0)   for t in prior if t.get("dry") and t.get("status") == "settled")
+                # open dry trades already subtracted from balance at entry
+                open_cost = sum(t.get("actual_cost", 0) for t in prior if t.get("status") == "dry_open")
+                _dry_virtual_balance = DRY_VIRTUAL_BALANCE + settled_pnl - open_cost
+                log.info("Restored dry trades: %d total | virtual_bal=$%.2f", len(prior), _dry_virtual_balance)
     else:
         # Print balance
         try:
@@ -2450,11 +2512,18 @@ def run(client, model, features):
 def _print_summary(trades):
     settled = [t for t in trades if t.get("status") == "settled"]
     wins    = [t for t in settled if t.get("result") == "WIN"]
+    losses  = [t for t in settled if t.get("result") == "LOSS"]
     pnl     = sum(t.get("pnl_usdc", 0) for t in settled)
-    wr      = len(wins)/len(settled) if settled else 0
-    log.info("── settled=%d W%d/L%d WR=%.0f%% P&L=$%.2f open=%d",
-             len(settled), len(wins), len(settled)-len(wins), wr*100, pnl,
-             sum(1 for t in trades if t.get("status")=="open"))
+    wr      = len(wins) / len(settled) if settled else 0
+    open_live = sum(1 for t in trades if t.get("status") == "open")
+    open_dry  = sum(1 for t in trades if t.get("status") == "dry_open")
+    if DRY_RUN:
+        log.info("── [DRY] settled=%d W%d/L%d WR=%.0f%% P&L=$%+.2f | open_dry=%d | virtual_bal=$%.2f",
+                 len(settled), len(wins), len(losses), wr * 100, pnl,
+                 open_dry, _dry_virtual_balance)
+    else:
+        log.info("── settled=%d W%d/L%d WR=%.0f%% P&L=$%.2f open=%d",
+                 len(settled), len(wins), len(losses), wr * 100, pnl, open_live)
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────────
