@@ -53,11 +53,12 @@ from data_quality_gate import DataQualityGate
 import requests
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-PRIVATE_KEY    = os.environ["POLY_PRIVATE_KEY"]
-PROXY_WALLET   = os.environ["POLY_SAFE_ADDRESS"]
-BUILDER_KEY    = os.environ["MM_BUILDER_KEY"]
-BUILDER_SECRET = os.environ["MM_BUILDER_SECRET"]
-BUILDER_PASS   = os.environ["MM_BUILDER_PASSPHRASE"]
+# In DRY_RUN mode credentials are optional — checked at startup
+PRIVATE_KEY    = os.environ.get("POLY_PRIVATE_KEY", "")
+PROXY_WALLET   = os.environ.get("POLY_SAFE_ADDRESS", "")
+BUILDER_KEY    = os.environ.get("MM_BUILDER_KEY", "")
+BUILDER_SECRET = os.environ.get("MM_BUILDER_SECRET", "")
+BUILDER_PASS   = os.environ.get("MM_BUILDER_PASSPHRASE", "")
 
 GAMMA_HOST      = "https://gamma-api.polymarket.com"
 DATA_API        = "https://data-api.polymarket.com"
@@ -105,6 +106,14 @@ HF_REPO     = "artbreguez/polymarket-btc-model"
 HF_TOKEN    = os.environ.get("HF_TOKEN")
 TRADES_FILE = Path("/tmp/live_trades.json")
 SPOT_BUFFER = Path("/tmp/spot_buffer.json")
+
+# ── Dry Run mode ───────────────────────────────────────────────────────────────
+# DRY_RUN=true  → full pipeline runs (features, model, price) but NO real orders.
+#                 Trades are recorded as "dry_open" and settled via Gamma outcome.
+# DRY_VIRTUAL_BALANCE=100 → simulated USDC wallet balance for sizing.
+DRY_RUN             = os.environ.get("DRY_RUN", "false").lower() in ("true", "1", "yes")
+DRY_VIRTUAL_BALANCE = float(os.environ.get("DRY_VIRTUAL_BALANCE", "100.0"))
+_dry_virtual_balance = DRY_VIRTUAL_BALANCE   # mutable — updated on each dry settle
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1741,10 +1750,11 @@ def save_trades(trades: list[dict]):
 
 # ── Settlement ──────────────────────────────────────────────────────────────────
 def settle_trades(trades: list[dict]) -> bool:
+    global _dry_virtual_balance
     now     = int(time.time())
     updated = False
     for trade in trades:
-        if trade.get("status") != "open":
+        if trade.get("status") not in ("open", "dry_open"):
             continue
         if now < trade["slot_ts"] + SLOT_DURATION + SETTLE_GRACE:
             continue
@@ -1791,11 +1801,18 @@ def settle_trades(trades: list[dict]) -> bool:
         trade.update({"status": "settled", "actual": actual,
                       "result": result, "pnl_usdc": pnl, "settled_at": now})
         updated = True
-        # Resolve CLOB feature log with ground truth for v25 training
+        # Resolve CLOB feature log with ground truth (for future training)
         resolve_clob_features(trade["slot_ts"], float(target_int))
-        log.info("SETTLED slot=%d | pred=%s actual=%s | %s | entry=$%.3f shares=%.0f cost=$%.2f P&L $%+.2f",
-                 trade["slot_ts"], direction, actual, result,
-                 entry, shares_out, cost, pnl)
+        # Dry run: update virtual balance
+        if trade.get("dry"):
+            _dry_virtual_balance += pnl
+            log.info("DRY SETTLED slot=%d | pred=%s actual=%s | %s | entry=$%.3f shares=%.0f cost=$%.2f P&L $%+.2f | virtual_bal=$%.2f",
+                     trade["slot_ts"], direction, actual, result,
+                     entry, shares_out, cost, pnl, _dry_virtual_balance)
+        else:
+            log.info("SETTLED slot=%d | pred=%s actual=%s | %s | entry=$%.3f shares=%.0f cost=$%.2f P&L $%+.2f",
+                     trade["slot_ts"], direction, actual, result,
+                     entry, shares_out, cost, pnl)
     return updated
 
 
@@ -1842,21 +1859,26 @@ def _backfill_history_targets():
 
 # ── Main loop ───────────────────────────────────────────────────────────────────
 def run(client, model, features):
+    global _dry_virtual_balance
     gate = DataQualityGate(features_list=features, warmup_slots=3, min_subwindows_with_ticks=1)
     log.info("Live trader started | stake=$%.2f | min_conf=%.0f%% | min_edge=%.0f%%",
              STAKE_USDC, MIN_CONFIDENCE*100, MIN_EDGE*100)
     log.info("DataQualityGate active — warming up for %d slots", gate.warmup_slots)
 
-    # Print balance
-    try:
-        bal  = client.get_balance_allowance(asset_type="COLLATERAL")
-        usdc = float(bal.balance) / 1e6
-        log.info("Wallet balance: $%.2f USDC", usdc)
-    except Exception as e:
-        log.warning("Balance check failed: %s", e)
+    if DRY_RUN:
+        log.info("DRY RUN active | virtual_balance=$%.2f | min_conf=%.0f%% | min_edge=%.0f%%",
+                 _dry_virtual_balance, MIN_CONFIDENCE * 100, MIN_EDGE * 100)
+    else:
+        # Print balance
+        try:
+            bal  = client.get_balance_allowance(asset_type="COLLATERAL")
+            usdc = float(bal.balance) / 1e6
+            log.info("Wallet balance: $%.2f USDC", usdc)
+        except Exception as e:
+            log.warning("Balance check failed: %s", e)
 
     # Rebuild trade history from on-chain activity (survives restarts)
-    if not TRADES_FILE.exists():
+    if not TRADES_FILE.exists() and not DRY_RUN:
         log.info("Rebuilding trade history from chain...")
         rebuilt = rebuild_trades_from_chain(PROXY_WALLET)
         if rebuilt:
@@ -1924,9 +1946,9 @@ def run(client, model, features):
         # causing lag_N_outcome to stay at 0.5 indefinitely — degrading lag features.
         _backfill_history_targets()
 
-        # 2. Enter — only block re-entry for open/settled/error, NOT skipped
+        # 2. Enter — only block re-entry for open/settled/error/dry_open, NOT skipped
         already = {t["slot_ts"] for t in trades
-                   if t.get("status") in ("open", "settled", "error")}
+                   if t.get("status") in ("open", "settled", "error", "dry_open")}
         cur_slot = (now // SLOT_DURATION) * SLOT_DURATION
 
         # Clear OB open snapshot cache when slot changes (new observation window)
@@ -2221,12 +2243,15 @@ def run(client, model, features):
 
             # ── Compute shares + actual cost (CLOB min 5 shares) ───────────
             # Fetch balance first — needed for both auto-sizing and balance check
-            try:
-                bal  = client.get_balance_allowance(asset_type="COLLATERAL")
-                usdc = float(bal.balance) / 1e6
-            except Exception as e:
-                log.warning("  Balance check FAILED: %s — using FIXED_SHARES without confirmation", e)
-                usdc = None
+            if DRY_RUN:
+                usdc = _dry_virtual_balance
+            else:
+                try:
+                    bal  = client.get_balance_allowance(asset_type="COLLATERAL")
+                    usdc = float(bal.balance) / 1e6
+                except Exception as e:
+                    log.warning("  Balance check FAILED: %s — using FIXED_SHARES without confirmation", e)
+                    usdc = None
 
             if usdc is not None:
                 shares = compute_shares(usdc, ask_price)
@@ -2260,6 +2285,32 @@ def run(client, model, features):
                     log.error("  Insufficient balance $%.2f < required $%.2f — skipping",
                               usdc, required)
                     continue
+
+            # ── Place order OR simulate (dry run) ──────────────────────────
+            if DRY_RUN:
+                # Simulate fill at ask_price (as if taker order filled instantly)
+                dry_cost = round(shares * ask_price, 4)
+                _dry_virtual_balance -= dry_cost
+                log.info("  [DRY] BUY %s %.0f shares @ $%.3f — cost $%.2f | virtual_bal=$%.2f | edge_ask=%.1f%% edge_mid=%.1f%%",
+                         direction, shares, ask_price, dry_cost, _dry_virtual_balance,
+                         edge_vs_ask * 100, (edge_vs_mid or 0) * 100)
+                trades.append({
+                    "slot_ts":     slot_ts,
+                    "direction":   direction,
+                    "confidence":  round(confidence, 4),
+                    "entry_price": round(ask_price, 4),
+                    "shares":      shares,
+                    "actual_cost": dry_cost,
+                    "stake_usdc":  STAKE_USDC,
+                    "token_id":    token_id,
+                    "order_id":    f"DRY-{slot_ts}",
+                    "status":      "dry_open",
+                    "entered_at":  now,
+                    "true_edge":   round(true_edge, 4),
+                    "dry":         True,
+                })
+                save_trades(trades)
+                continue
 
             # ── Place limit order at ask + 1 tick (taker-aggressive) ──────────
             # Polymarket tick size is 0.01. Posting exactly at the ask often races
@@ -2443,23 +2494,34 @@ if __name__ == "__main__":
         log.info("Config: AUTO_SHARES=OFF fixed_shares=%d", FIXED_SHARES)
     log.info("=" * 60)
 
+    if DRY_RUN:
+        log.info("*** DRY RUN MODE — no real orders will be placed ***")
+        log.info("    Virtual balance: $%.2f USDC", DRY_VIRTUAL_BALANCE)
+        log.info("=" * 60)
+
     # Start spot daemon in background
     start_spot_daemon()
 
     # Load model
     model, features = load_model()
 
-    # Init client (same pattern as maker_mm.py)
-    client = SecureClient.create(
-        private_key=PRIVATE_KEY,
-        wallet=PROXY_WALLET,
-        api_key=BuilderApiKey(
-            key=BUILDER_KEY,
-            secret=BUILDER_SECRET,
-            passphrase=BUILDER_PASS,
-        ),
-    )
-    log.info("Client initialized | wallet=%s", PROXY_WALLET)
+    if DRY_RUN:
+        # Dummy client — never used for orders in dry run
+        client = None
+    else:
+        if not PRIVATE_KEY or not PROXY_WALLET:
+            raise RuntimeError("DRY_RUN=false but POLY_PRIVATE_KEY / POLY_SAFE_ADDRESS not set")
+        # Init client (same pattern as maker_mm.py)
+        client = SecureClient.create(
+            private_key=PRIVATE_KEY,
+            wallet=PROXY_WALLET,
+            api_key=BuilderApiKey(
+                key=BUILDER_KEY,
+                secret=BUILDER_SECRET,
+                passphrase=BUILDER_PASS,
+            ),
+        )
+        log.info("Client initialized | wallet=%s", PROXY_WALLET)
 
     # Start CLOB WS daemon (after client init so fetch_market can run)
     start_clob_daemon()
