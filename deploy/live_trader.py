@@ -1910,12 +1910,22 @@ def run(client, model, features):
         global _ob_last_slot
         if cur_slot != _ob_last_slot:
             _ob_open_cache.clear()
-            # Reset CLOB accumulator buffers so ob_pc_* and ob_imb_w* windows
-            # are anchored to the new slot_ts — matches training [slot_ts, slot_ts+168)
+            # Reset CLOB accumulator buffers (só reancora slot_ts, não limpa eventos)
             _acc = get_accumulator()
             for tid in list(_clob_subscribed):
                 _acc.reset_token(tid, slot_ts=cur_slot)
             _ob_last_slot = cur_slot
+
+            # Pre-subscribe ao slot ATUAL e PRÓXIMO logo no início do slot (t~0s).
+            # Sem isso, o subscribe só ocorre em fetch_market() na entry window (t~170s),
+            # e o WS leva ~60s para enviar o primeiro book snapshot → CLOB empty em t=170-230s.
+            # Pre-subscribendo agora garantimos dados desde t~30s, prontos para t=170s.
+            for offset in [0, SLOT_DURATION]:
+                _pre_slot = cur_slot + offset
+                _pre_mkt = fetch_market(_pre_slot)
+                if _pre_mkt:
+                    clob_subscribe([_pre_mkt["yes_token"], _pre_mkt["no_token"]], slot_ts=_pre_slot)
+                    log.info("CLOB WS pre-subscribed slot=%d (t=%ds)", _pre_slot, int(now - _pre_slot))
 
         # ── OB early snapshot: fetch "open" OB at t~60s (well before entry window) ──
         # This gives temporal separation between open (t~60s) and close (t~170s+)
