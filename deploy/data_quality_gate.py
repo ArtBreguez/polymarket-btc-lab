@@ -57,7 +57,7 @@ RETURN_FEATURES = {
 # Since v30, return features are normalised by btc_vol_1h (floor=1e-4).
 # Raw 5% move / 0.0003 vol = ~167 normalised units. ±50 catches only
 # genuine data corruption (e.g. stale candle, wrong timestamp).
-RETURN_RANGE = (-50.0, 50.0)
+RETURN_RANGE = (-0.05, 0.05)   # retornos brutos (não normalizados) — paridade com v29
 
 RATIO_FEATURES = {
     "btc_up_ratio", "btc_buy_ratio", "btc_tw_up_ratio",

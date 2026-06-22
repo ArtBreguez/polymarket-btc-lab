@@ -1196,9 +1196,14 @@ def _build_ob_features(up_token_id: str) -> dict:
         weighted_imb = float((bid_wt - ask_wt) / (bid_wt + ask_wt + 1e-8))
 
         return {
-            "ob_mid":           float(open_snap["mid"]),
-            "ob_spread":        float(open_snap.get("spread", spread)),
-            "ob_imbalance":     float(open_snap.get("imbalance", imbalance)),
+            # PARIDADE com treino: features estáticas vêm do CLOSE snapshot.
+            # fetch_ob_features_modal.py usa `static = close_snap` (t=[150,168s)),
+            # i.e. o book mais recente antes da entrada. Antes ob_mid/spread/imbalance
+            # vinham do open_snap (~t60) — skew em ob_imbalance (feature #7 do modelo
+            # e input de x_imb_x_ur). depth_ratio/total_depth já usavam o close.
+            "ob_mid":           float(mid),
+            "ob_spread":        float(spread),
+            "ob_imbalance":     float(imbalance),
             "ob_depth_ratio":   float(depth_ratio),
             "ob_bid_depth_5c":  float(bid_depth_5c),
             "ob_ask_depth_5c":  float(ask_depth_5c),
@@ -1434,18 +1439,24 @@ def build_features(ticks: list[dict], slot_ts: int, features: list[str],
     if up_token_id:
         _acc = get_accumulator()
 
-        # clob_* WS features — janela [slot_ts, agora)
-        # obs_secs dinâmico = tempo decorrido desde slot_ts + margem de 5s.
-        # Isso garante que TODOS os eventos acumulados no slot (book WS + hydration REST)
-        # entrem na janela, independente de quando chegaram.
-        # BUG ANTERIOR: obs_secs=60 fixo fazia cutoff_wall = slot_ts+60; eventos
-        # chegados em t>60s (hydration REST, price_change tardios) ficavam fora → zeros.
-        _clob_obs_secs = max(60, int(time.time() - slot_ts) + 5)
+        # clob_* WS features — janela [108, 168s) = PARIDADE EXATA com o treino v29.
+        #
+        # CRÍTICO (train/serve skew): o champion v29 foi treinado com
+        # ob_features_full.parquet, cuja janela CLOB é [108,168s) — ver
+        # docs/EXPERIMENTS.md (seção v29: "CLOB window [108,168s) used for training").
+        # As 4 features clob_* (~21% da importância do modelo) DEVEM ser computadas
+        # nessa mesma janela, senão clob_spread_mean/trend ficam enviesados.
+        #
+        # Histórico do bug: obs_secs=60 (janela [0,60)) dava zeros porque os eventos
+        # chegavam tarde; o "fix" anterior abriu para o slot inteiro [0,~200s), o que
+        # introduziu o skew oposto (incluía spreads largos do início do slot que o
+        # modelo nunca viu). [108,168s) resolve ambos: é a janela do treino E já está
+        # populada na decisão (t≈170-240s), pois os eventos de t=108-168 já chegaram.
         clob_feats = _acc.get_features(
             up_token_id,
             slot_ts=slot_ts,
-            obs_secs=_clob_obs_secs,
-            window_secs=float(_clob_obs_secs),  # janela = slot inteiro até agora
+            obs_secs=168,        # cutoff = slot_ts + 168
+            window_secs=60.0,    # lookback 60s → janela [108, 168) == treino v29
         )
         CLOB_KEEP = {"clob_spread_mean", "clob_spread_trend",
                      "clob_mid_volatility", "clob_ask_pressure"}

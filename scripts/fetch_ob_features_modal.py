@@ -47,7 +47,10 @@ app = modal.App("btc-fetch-ob", image=image)
     secrets=[modal.Secret.from_name("pmdata-api-key")],
     volumes={"/btc_local": LOCAL_VOL},
 )
-def fetch_ob_features():
+def fetch_ob_features(markets_file: str = "all_markets.csv",
+                      out_file: str = "ob_features_full.parquet",
+                      progress_file: str = "ob_progress.json",
+                      force: bool = False):
     import gc, io, json, logging, os, sys, time
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from pathlib import Path
@@ -67,8 +70,12 @@ def fetch_ob_features():
     OBS_SECS    = 180   # load full window, apply CUTOFF inside functions
     CUTOFF_SEC  = 168   # 2s before earliest entry at t=170s — zero lookahead
     LOCAL_DIR   = Path("/btc_local")
-    OUT_FILE    = LOCAL_DIR / "ob_features_full.parquet"
-    PROGRESS_FILE = LOCAL_DIR / "ob_progress.json"
+    # Parametrizável via argumentos — permite reusar a MESMA lógica para o holdout
+    # (close[150,168] + clob[108,168]) sem duplicar o código de cálculo.
+    # Defaults preservam o comportamento de treino.
+    MARKETS_FILE  = markets_file
+    OUT_FILE      = LOCAL_DIR / out_file
+    PROGRESS_FILE = LOCAL_DIR / progress_file
 
     if not PMDATA_KEY:
         raise RuntimeError("PMDATA_API_KEY required — set as Modal Secret 'pmdata-api-key'")
@@ -76,7 +83,7 @@ def fetch_ob_features():
     # ── Resume mode — skip already-processed markets ──────────────────────
     # Progress file tracks done market_ids so we can resume after timeout.
     # Set FORCE_RECOMPUTE=1 env var to wipe and start fresh.
-    FORCE = os.environ.get("FORCE_RECOMPUTE", "0") == "1"
+    FORCE = force or os.environ.get("FORCE_RECOMPUTE", "0") == "1"
     if FORCE:
         if PROGRESS_FILE.exists():
             PROGRESS_FILE.unlink()
@@ -85,10 +92,11 @@ def fetch_ob_features():
         log.info("FORCE_RECOMPUTE=1 — starting fresh")
 
     # ── Load markets ───────────────────────────────────────────────────────
-    markets = pd.read_csv(LOCAL_DIR / "all_markets.csv")
+    markets = pd.read_csv(LOCAL_DIR / MARKETS_FILE)
     markets["market_id"] = markets["market_id"].astype(str)
     markets["slot_ts"]   = markets["slot_ts"].astype(int)
-    log.info("Total markets: %d", len(markets))
+    log.info("Markets file: %s | OUT: %s | total markets: %d",
+             MARKETS_FILE, OUT_FILE.name, len(markets))
 
     if "slug" not in markets.columns:
         log.error("all_markets.csv missing 'slug' column! Columns: %s", list(markets.columns))
@@ -465,5 +473,9 @@ def fetch_ob_features():
 
 
 @app.local_entrypoint()
-def main():
-    fetch_ob_features.remote()
+def main(markets_file: str = "all_markets.csv",
+         out_file: str = "ob_features_full.parquet",
+         progress_file: str = "ob_progress.json",
+         force: bool = False):
+    fetch_ob_features.remote(markets_file=markets_file, out_file=out_file,
+                             progress_file=progress_file, force=force)
