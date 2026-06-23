@@ -53,6 +53,9 @@ OB_PC_FEATURE_NAMES: List[str] = [
 # we retain enough events to cover the full ob_pc window [0, 168s).
 MAX_BUFFER_SECS: float = 360.0
 
+# A cada quanto tempo varrer e remover buffers de tokens mortos (anti-OOM).
+_EVICT_INTERVAL_SECS: float = 120.0
+
 
 @dataclass
 class BookSnapshot:
@@ -98,6 +101,7 @@ class ClobFeatureAccumulator:
         self._max_buffer_secs = max_buffer_secs
         self._buffers: Dict[str, TokenBuffer] = defaultdict(TokenBuffer)
         self._lock = threading.Lock()
+        self._last_evict = 0.0
 
     def feed_event(self, token_id: str, event: Dict[str, Any]) -> None:
         """Ingest a raw CLOB WebSocket event into the buffer."""
@@ -122,6 +126,16 @@ class ClobFeatureAccumulator:
 
             # Prune old events beyond max buffer
             self._prune_buffer(buf, now)
+
+            # Evicção periódica de tokens MORTOS (slots passados) — evita OOM.
+            # _prune_buffer só limpa o token que recebe evento; tokens de slots
+            # antigos param de receber e retêm seus últimos ~360s de eventos
+            # (~640 msgs/s) para sempre → o dict _buffers cresce sem limite e a
+            # máquina foi OOM-killed (~1x/h, exit 137). Aqui removemos buffers
+            # inteiros sem eventos há > max_buffer_secs.
+            if now - self._last_evict > _EVICT_INTERVAL_SECS:
+                self._evict_stale_tokens(now, keep=token_id)
+                self._last_evict = now
 
     def reset_token(self, token_id: str, slot_ts: int = 0) -> None:
         """Reanchor buffer to a new slot_ts WITHOUT clearing events.
@@ -458,6 +472,25 @@ class ClobFeatureAccumulator:
                     pass
 
         return results, synth_books
+
+    def _evict_stale_tokens(self, now: float, keep: str = "") -> None:
+        """Remove buffers inteiros de tokens sem eventos há > max_buffer_secs.
+
+        Chamado dentro do _lock (a partir de feed_event). Mantém o token atual
+        (`keep`). Sem isto, _buffers acumula um TokenBuffer por token já visto,
+        cada um retendo ~360s de eventos de alta frequência → OOM.
+        """
+        cutoff = now - self._max_buffer_secs
+        dead = []
+        for tid, b in self._buffers.items():
+            if tid == keep:
+                continue
+            last_book = b.book_events[-1].timestamp if b.book_events else -1.0
+            last_pc   = b.price_events[-1].timestamp if b.price_events else -1.0
+            if max(last_book, last_pc) < cutoff:
+                dead.append(tid)
+        for tid in dead:
+            del self._buffers[tid]
 
     def _prune_buffer(self, buf: TokenBuffer, now: float) -> None:
         """Remove events older than max_buffer_secs."""
