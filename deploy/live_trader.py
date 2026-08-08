@@ -348,7 +348,22 @@ def _clob_prune_stale() -> None:
 
 
 def _clob_drain_and_subscribe(ws_manager: WebSocketManager) -> None:
-    """Drain the subscribe queue and send new subscriptions via WS manager."""
+    """Drain the subscribe queue and (re)subscribe via a fresh connection.
+
+    CRITICAL — Polymarket protocol constraint:
+    The CLOB market channel accepts EXACTLY ONE {"type":"Market"} message per
+    connection. A second one is answered with the plain-text payload
+    "INVALID OPERATION", after which the server stops sending book/price_change
+    events while still answering ping/pong. Verified 2026-08-08 from the prod
+    machine: 1 subscribe -> 417 events/s; 2 subscribes -> 6.6 events/s.
+
+    This is why every clob_* feature was 0.0 in ~91% of live decisions
+    (20.65% of the champion's importance served as zeros).
+
+    So we never send an incremental subscribe. We record the new tokens and
+    force a reconnect; _clob_on_connect then sends ONE message carrying the
+    full token set.
+    """
     pending: list[tuple[str, int]] = []
     while True:
         try:
@@ -358,17 +373,25 @@ def _clob_drain_and_subscribe(ws_manager: WebSocketManager) -> None:
     if not pending:
         return
     new_tokens = [t for t, _ in pending if t not in _clob_subscribed]
+    for t, s in pending:
+        if s:
+            _token_slot[t] = s
     if new_tokens:
         _clob_subscribed.update(new_tokens)
-        for t, s in pending:
-            if s:
-                _token_slot[t] = s
-        ws_manager.send_sync({"type": "Market", "assets_ids": new_tokens})
-        log.info("CLOB WS subscribed %d new tokens", len(new_tokens))
+        log.info("CLOB WS %d new tokens queued — reconnecting to resubscribe "
+                 "(full set: %d tokens)", len(new_tokens), len(_clob_subscribed))
+        ws_manager.force_reconnect(reason=f"subscribe {len(new_tokens)} new tokens")
 
 
 async def _clob_on_connect(ws) -> None:
-    """Re-subscribe existing tokens + drain queue on (re)connect."""
+    """Subscribe the FULL token set in exactly ONE Market message.
+
+    Polymarket's CLOB market channel allows only one {"type":"Market"} message
+    per connection; a second is answered with plain-text "INVALID OPERATION"
+    and the feed goes silent (see _clob_drain_and_subscribe). So this callback
+    must send exactly one message covering every token we care about — the
+    already-subscribed set PLUS anything queued while we were disconnected.
+    """
     global _clob_last_keepalive
 
     _clob_prune_stale()
@@ -384,19 +407,42 @@ async def _clob_on_connect(ws) -> None:
     if stale_count:
         log.info("CLOB WS reconnect — invalidated %d cached prices (forcing HTTP fallback until fresh data)", stale_count)
 
-    with _clob_prices_lock:
-        existing = list(_clob_subscribed)
-    if existing:
-        await ws.send(json.dumps({"type": "Market", "assets_ids": existing}))
-        log.info("CLOB WS re-subscribed %d tokens on connect", len(existing))
+    # Drain queued subscription requests FIRST so they go out in the same
+    # (and only) Market message as the already-subscribed tokens.
+    pending: list[tuple[str, int]] = []
+    while True:
+        try:
+            pending.append(_subscribe_queue.get_nowait())
+        except _queue_mod.Empty:
+            break
+    for t, s in pending:
+        if s:
+            _token_slot[t] = s
 
-        # Hydrate accumulator via REST /book on reconnect.
-        # The CLOB WS sends 1 book snapshot per subscribe, but it arrives a few
-        # seconds after connect. If the entry window fires during that gap the
-        # accumulator is empty. Pre-seeding via REST guarantees data immediately.
+    with _clob_prices_lock:
+        _clob_subscribed.update(t for t, _ in pending)
+        tokens = list(_clob_subscribed)
+
+    if not tokens:
+        _clob_last_keepalive = time.time()
+        return
+
+    # THE single subscription message for this connection.
+    await ws.send(json.dumps({"type": "Market", "assets_ids": tokens}))
+    log.info("CLOB WS subscribed %d tokens in one message (%d newly queued)",
+             len(tokens), len(pending))
+
+    _clob_last_keepalive = time.time()
+
+    # Hydrate the accumulator via REST /book so features are available even in
+    # the seconds before the first WS book snapshot lands.
+    # Runs in a thread: _http.get is BLOCKING and this is the asyncio loop —
+    # doing it inline stalled message reads for up to 3s x n_tokens right when
+    # the burst of book/price_change events arrives.
+    async def _hydrate() -> None:
         _acc = get_accumulator()
-        hydrated = 0
-        for tid in existing:
+
+        def _one(tid: str) -> bool:
             try:
                 r = _http.get(f"{CLOB_URL}/book", params={"token_id": tid}, timeout=3)
                 if r.ok:
@@ -404,30 +450,20 @@ async def _clob_on_connect(ws) -> None:
                     book["event_type"] = "book"
                     book["asset_id"] = tid
                     _acc.feed_event(tid, book)
-                    hydrated += 1
+                    return True
             except Exception:
                 pass
-        if hydrated:
-            log.info("CLOB WS reconnect — hydrated accumulator for %d tokens via REST", hydrated)
+            return False
 
-    _clob_last_keepalive = time.time()
+        results = await asyncio.gather(
+            *(asyncio.to_thread(_one, tid) for tid in tokens),
+            return_exceptions=True,
+        )
+        n = sum(1 for r in results if r is True)
+        if n:
+            log.info("CLOB WS — hydrated accumulator for %d/%d tokens via REST", n, len(tokens))
 
-    # Drain any queued subscription requests that arrived before connect
-    pending: list[tuple[str, int]] = []
-    while True:
-        try:
-            pending.append(_subscribe_queue.get_nowait())
-        except _queue_mod.Empty:
-            break
-    if pending:
-        new_tokens = [t for t, _ in pending if t not in _clob_subscribed]
-        if new_tokens:
-            _clob_subscribed.update(new_tokens)
-            for t, s in pending:
-                if s:
-                    _token_slot[t] = s
-            await ws.send(json.dumps({"type": "Market", "assets_ids": new_tokens}))
-            log.info("CLOB WS subscribed %d new tokens on connect", len(new_tokens))
+    asyncio.create_task(_hydrate())
 
 
 async def _clob_on_message(msg) -> None:
@@ -485,7 +521,12 @@ async def _clob_on_message(msg) -> None:
                     except (ValueError, TypeError):
                         pass
 
-    # Drain pending subscriptions from external threads
+    # Drain pending subscriptions from external threads.
+    # We must NOT send an incremental {"type":"Market"} here: the CLOB channel
+    # accepts one subscription message per connection and answers any further
+    # one with plain-text "INVALID OPERATION", after which it stops sending
+    # events (ping/pong still succeeds, so it looks healthy). Record the tokens
+    # and reconnect — _clob_on_connect resubscribes the full set in one message.
     if _clob_ws_manager:
         pending: list[tuple[str, int]] = []
         while True:
@@ -495,14 +536,14 @@ async def _clob_on_message(msg) -> None:
                 break
         if pending:
             new_tokens = [t for t, _ in pending if t not in _clob_subscribed]
+            for t, s in pending:
+                if s:
+                    _token_slot[t] = s
             if new_tokens:
                 _clob_subscribed.update(new_tokens)
-                for t, s in pending:
-                    if s:
-                        _token_slot[t] = s
-                # Use async send — we're already in the event loop
-                await _clob_ws_manager.send({"type": "Market", "assets_ids": new_tokens})
-                log.info("CLOB WS subscribed %d new tokens", len(new_tokens))
+                log.info("CLOB WS %d new tokens queued — reconnecting to resubscribe",
+                         len(new_tokens))
+                _clob_ws_manager.force_reconnect(reason="new tokens queued")
 
     # NOTE: We no longer send periodic re-subscribe as "keepalive".
     # The websockets library already sends RFC 6455 PING frames every 20s

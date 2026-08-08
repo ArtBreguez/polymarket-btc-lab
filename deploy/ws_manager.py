@@ -72,6 +72,12 @@ class WSConfig:
     zombie_timeout: float = 45.0       # no message for N seconds → force reconnect
     zombie_check_interval: float = 5.0 # how often to check for zombie state
 
+    # Stale-data detection: the connection answers ping/pong but stops sending
+    # book/price_change events. After `stale_max_quiet` consecutive checks with
+    # no new messages, force a reconnect.
+    stale_check_interval: float = 120.0
+    stale_max_quiet: int = 3
+
     # Application-level keepalive (independent of RFC 6455 ping/pong)
     # Sends a WS ping frame if no message received for keepalive_interval seconds.
     # Prevents NAT idle timeout (code=1006) on cloud environments like Fly.io
@@ -267,6 +273,28 @@ class WebSocketManager:
         h["backoff_attempt"] = self._backoff.attempt
         return h
 
+    def force_reconnect(self, reason: str = "") -> bool:
+        """Close the current connection so _connect_loop reconnects immediately.
+
+        Thread-safe: callable from the main trading thread. The reconnect fires
+        the on_connect callback again, which is the ONLY place a subscription
+        may be sent (see the Polymarket 'INVALID OPERATION' note in live_trader).
+        Returns True if a close was scheduled.
+        """
+        with self._ws_lock:
+            ws = self._ws
+        if ws is None:
+            return False
+        log.info("[%s] Force reconnect requested: %s", self.name, reason or "(no reason)")
+        try:
+            loop = self._loop
+            if loop and loop.is_running():
+                asyncio.run_coroutine_threadsafe(ws.close(), loop)
+                return True
+        except Exception as e:
+            log.warning("[%s] force_reconnect() failed: %s", self.name, e)
+        return False
+
     async def send(self, data: dict | list | str) -> bool:
         """Send data through the current WS connection. Returns True on success."""
         with self._ws_lock:
@@ -417,8 +445,17 @@ class WebSocketManager:
                 try:
                     msg = json.loads(raw)
                 except (json.JSONDecodeError, TypeError):
-                    log.debug("[%s] Non-JSON message: %s", self.name, raw[:100] if raw else "")
-                    continue
+                    # Polymarket signals protocol errors as PLAIN TEXT, not JSON.
+                    # "INVALID OPERATION" is returned when a second subscription
+                    # message is sent on one connection; the server then stops
+                    # delivering data while ping/pong keeps answering, so the
+                    # zombie watchdog only notices ~426s later. Silently skipping
+                    # this (the old behaviour) kept a dead feed alive for hours
+                    # and zeroed every clob_* feature. Treat it as fatal.
+                    text = (raw[:200] if isinstance(raw, str) else str(raw)[:200]) or ""
+                    log.error("[%s] Protocol error from server (non-JSON): %r "
+                              "— forcing reconnect", self.name, text)
+                    return
 
                 try:
                     await self._on_message(msg)
@@ -474,8 +511,8 @@ class WebSocketManager:
         Previous bug: resetting last_message_at created a 120s blind window
         each cycle, so consecutive_quiet never accumulated past 1.
         """
-        MAX_QUIET_BEFORE_RECONNECT = 3   # 3 checks ≈ 6 min max
-        STALE_CHECK_INTERVAL = 120.0     # seconds between stale-data checks
+        MAX_QUIET_BEFORE_RECONNECT = self.config.stale_max_quiet
+        STALE_CHECK_INTERVAL = self.config.stale_check_interval
 
         # Wait for initial messages before starting checks
         await asyncio.sleep(self.config.zombie_timeout)

@@ -345,8 +345,15 @@ class TestWebSocketManager:
         assert first_call["event_type"] == "book"
 
     @pytest.mark.asyncio
-    async def test_message_loop_handles_invalid_json(self):
-        """Message loop should skip non-JSON messages without crashing."""
+    async def test_message_loop_treats_non_json_as_fatal(self):
+        """A non-JSON payload is a protocol error and must end the message loop.
+
+        Polymarket answers an illegal request with the plain-text body
+        "INVALID OPERATION" and then stops sending data while ping/pong keeps
+        working. Skipping it (the old behaviour) left the feed dead for ~7min
+        until the zombie watchdog noticed. Returning here forces an immediate
+        reconnect. See tests/test_clob_subscription.py for the trigger.
+        """
         handler = AsyncMock()
         mgr = WebSocketManager(
             name="test",
@@ -356,7 +363,7 @@ class TestWebSocketManager:
         )
 
         messages = [
-            "not valid json {{{{",
+            "INVALID OPERATION",
             json.dumps({"valid": True}),
         ]
 
@@ -364,8 +371,8 @@ class TestWebSocketManager:
 
         await mgr._message_loop(mock_ws)
 
-        # Only the valid message should be dispatched
-        assert handler.call_count == 1
+        # Loop aborted on the protocol error — the later message is never handled.
+        assert handler.call_count == 0
 
     @pytest.mark.asyncio
     async def test_message_loop_handles_callback_error(self):
@@ -392,22 +399,35 @@ class TestWebSocketManager:
 
     @pytest.mark.asyncio
     async def test_zombie_watchdog_triggers(self):
-        """Zombie watchdog should close WS if no messages for too long."""
+        """Watchdog closes the WS when ping/pong works but no data arrives.
+
+        Drives the stale-data path: `stale_max_quiet` checks with zero new
+        messages must end in a forced close.
+        """
         mgr = WebSocketManager(
             name="test",
             url="wss://example.com",
             on_message=AsyncMock(),
-            config=WSConfig(zombie_timeout=0.2, zombie_check_interval=0.1),
+            config=WSConfig(
+                zombie_timeout=0.05,
+                zombie_check_interval=0.05,
+                stale_check_interval=0.05,
+                stale_max_quiet=2,
+            ),
         )
 
-        # Simulate a message was received a long time ago
+        # A message arrived long ago and none since → data flow is stale.
         mgr.metrics.last_message_at = time.time() - 10
+        mgr.metrics.total_messages = 1
 
         mock_ws = AsyncMock()
         mock_ws.close = AsyncMock()
+        # ws.ping() returns an awaitable pong waiter; the connection is alive.
+        pong = asyncio.get_running_loop().create_future()
+        pong.set_result(None)
+        mock_ws.ping = AsyncMock(return_value=pong)
 
-        # Zombie watchdog should fire within ~0.3s and close the connection
-        await asyncio.wait_for(mgr._zombie_watchdog(mock_ws), timeout=2.0)
+        await asyncio.wait_for(mgr._zombie_watchdog(mock_ws), timeout=5.0)
 
         mock_ws.close.assert_called_once()
         assert mgr.metrics.zombie_kills == 1

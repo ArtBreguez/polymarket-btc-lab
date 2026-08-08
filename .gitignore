@@ -29,3 +29,12 @@ artifacts/*.csv
 # OS
 .DS_Store
 Thumbs.db
+
+# Secrets / tokens
+fly.token
+
+# Large prod captures (analysis snapshots)
+artifacts/*.jsonl
+artifacts/**/*.jsonl
+artifacts/**/*.json
+artifacts/**/*.parquet
