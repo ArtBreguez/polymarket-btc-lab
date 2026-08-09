@@ -101,11 +101,27 @@ AUTO_SHARES_MAX = float(os.environ.get("AUTO_SHARES_MAX", "40"))
 AUTO_SHARES_BAL_FLOOR = float(os.environ.get("AUTO_SHARES_BAL_FLOOR", "20"))
 AUTO_SHARES_BAL_CEIL  = float(os.environ.get("AUTO_SHARES_BAL_CEIL", "700"))
 
-MODEL_PATH  = Path("/tmp/champion.pkl")
+# Durable state directory. Defaults to /tmp so local runs and tests are unchanged,
+# but in prod it points at a mounted Fly volume (see deploy/fly.toml [mounts]).
+# Everything the bot needs to KEEP across restarts lives here: the trade ledger and
+# the feature/CLOB audit logs. /tmp on Fly is wiped on every deploy and restart —
+# 47 days of dry-run trading history existed only there, with HF upload failing
+# (403, private-storage quota), so a single restart would have destroyed it.
+DATA_DIR = Path(os.environ.get("BOT_DATA_DIR", "/tmp"))
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    DATA_DIR = Path("/tmp")
+
+MODEL_PATH  = Path("/tmp/champion.pkl")   # cache only — re-fetchable, stays on /tmp
+# Last-resort model shipped inside the image, used only when HF is unreachable
+# AND /tmp holds no cached copy (e.g. first boot after a deploy during an outage).
+MODEL_FALLBACK = Path(__file__).resolve().parent / "champion_fallback.pkl"
 HF_REPO     = "artbreguez/polymarket-btc-model"
 HF_TOKEN    = os.environ.get("HF_TOKEN")
-TRADES_FILE = Path("/tmp/live_trades.json")
-SPOT_BUFFER = Path("/tmp/spot_buffer.json")
+TRADES_FILE = DATA_DIR / "live_trades.json"
+FEATURES_LOG = DATA_DIR / "all_features_log.jsonl"
+SPOT_BUFFER = Path("/tmp/spot_buffer.json")  # rebuilt from WS on boot — ephemeral is fine
 
 # ── Dry Run mode ───────────────────────────────────────────────────────────────
 # DRY_RUN=true  → full pipeline runs (features, model, price) but NO real orders.
@@ -637,10 +653,18 @@ def compute_shares(balance_usdc: float, ask_price: float) -> float:
 
 # ── Model loading ──────────────────────────────────────────────────────────────
 def load_model():
-    """Download champion.pkl from HuggingFace (always fresh), then load it."""
-    if MODEL_PATH.exists():
-        MODEL_PATH.unlink()
-        log.info("Removed stale champion cache — downloading fresh from HF...")
+    """Load champion.pkl: fresh from HuggingFace, else fall back to a local copy.
+
+    The old version unlinked the cache BEFORE downloading and hard-failed if HF
+    was unreachable, so any HF outage bricked the bot on restart. That is exactly
+    what happened on 2026-08-08: the account hit its private-storage quota and
+    every HF read returned 403, which would have taken prod down on the next
+    deploy. Download to a temp path first and only replace the cache on success;
+    if HF fails, serve the last known-good model (cache, then the image-bundled
+    copy) and log loudly instead of dying.
+    """
+    import shutil
+
     log.info("Downloading champion model from HuggingFace (%s)...", HF_REPO)
     try:
         from huggingface_hub import hf_hub_download
@@ -649,15 +673,25 @@ def load_model():
             filename="champion.pkl",
             repo_type="model",
             token=HF_TOKEN,
-            local_dir="/tmp",
+            local_dir="/tmp/hf_model",
         )
-        # hf_hub_download saves to /tmp/champion.pkl (or subdir) — normalise
-        import shutil
+        # Only now is it safe to replace the cached model.
         if Path(path) != MODEL_PATH:
             shutil.copy(path, MODEL_PATH)
-        log.info("Champion model downloaded: %s", MODEL_PATH)
+        log.info("Champion model downloaded fresh from HF: %s", MODEL_PATH)
     except Exception as e:
-        raise RuntimeError(f"Failed to download champion model from HF: {e}") from e
+        if MODEL_PATH.exists():
+            log.error("HF download FAILED (%s) — serving CACHED model at %s. "
+                      "It may be stale; fix HF before promoting a new champion.", e, MODEL_PATH)
+        elif MODEL_FALLBACK.exists():
+            shutil.copy(MODEL_FALLBACK, MODEL_PATH)
+            log.error("HF download FAILED (%s) and no cache — serving the model "
+                      "BUNDLED IN THE IMAGE (%s).", e, MODEL_FALLBACK)
+        else:
+            raise RuntimeError(
+                f"Failed to download champion from HF ({e}) and no local fallback "
+                f"exists at {MODEL_PATH} or {MODEL_FALLBACK}"
+            ) from e
     with open(MODEL_PATH, "rb") as f:
         bundle = pickle.load(f)
     log.info("Model loaded: %d features, WF AUC=%.3f, ensemble=%s",
@@ -2207,7 +2241,7 @@ def run(client, model, features):
                     "confidence": round(confidence, 4),
                     **{f: round(feat.get(f, 0.0), 6) for f in features},
                 }
-                with open("/tmp/all_features_log.jsonl", "a") as _fh:
+                with open(FEATURES_LOG, "a") as _fh:
                     _fh.write(json.dumps(_feat_row) + "\n")
             except Exception as _e:
                 log.debug("feature log write failed: %s", _e)

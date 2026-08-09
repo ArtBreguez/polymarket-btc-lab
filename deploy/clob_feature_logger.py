@@ -24,7 +24,9 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-LOG_FILE = Path("/tmp/clob_features_log.jsonl")
+# Written to the durable state dir (a mounted volume in prod) so the CLOB audit
+# trail survives deploys/restarts — /tmp on Fly is wiped every time.
+LOG_FILE = Path(os.environ.get("BOT_DATA_DIR", "/tmp")) / "clob_features_log.jsonl"
 _lock = threading.Lock()
 
 

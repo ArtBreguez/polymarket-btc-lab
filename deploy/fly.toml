@@ -5,6 +5,14 @@ primary_region = "ams"
 
 [env]
   PYTHONUNBUFFERED = "1"
+  # Durable state (trade ledger + feature/CLOB audit logs). /tmp is wiped on
+  # every deploy and restart, and the HF backup has been failing with 403
+  # (private-storage quota) — so without this the trading history is lost.
+  BOT_DATA_DIR = "/data"
+
+[[mounts]]
+  source = "bot_data"
+  destination = "/data"
 
 [processes]
   app = "python -u live_trader.py"
