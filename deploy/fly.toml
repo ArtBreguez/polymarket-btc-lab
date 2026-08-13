@@ -1,4 +1,4 @@
-app = "polymarket-maker-mm"
+app = "polymarket-btc-lab-bot"
 primary_region = "ams"
 
 [build]
@@ -9,6 +9,9 @@ primary_region = "ams"
   # every deploy and restart, and the HF backup has been failing with 403
   # (private-storage quota) — so without this the trading history is lost.
   BOT_DATA_DIR = "/data"
+  # No wallet configured yet on this account — full pipeline runs, no real orders.
+  # Flip to "false" once POLY_PRIVATE_KEY / POLY_SAFE_ADDRESS / MM_BUILDER_* secrets are set.
+  DRY_RUN = "true"
 
 [[mounts]]
   source = "bot_data"
@@ -18,7 +21,7 @@ primary_region = "ams"
   app = "python -u live_trader.py"
 
 [[vm]]
-  size = "performance-1x"
+  size = "shared-cpu-1x"
   memory = "2048mb"
 
 # Worker machine — no HTTP service, must never auto-stop

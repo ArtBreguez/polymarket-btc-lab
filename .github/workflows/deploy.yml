@@ -47,7 +47,7 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: |
-          flyctl deploy --app polymarket-maker-mm --ha=false --remote-only
+          flyctl deploy --app polymarket-btc-lab-bot --ha=false --remote-only
 
       # Verify machine is running
       - name: Verify deployment
@@ -55,5 +55,5 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: |
           sleep 10
-          flyctl status --app polymarket-maker-mm
+          flyctl status --app polymarket-btc-lab-bot
           echo "✅ Deployed successfully"
