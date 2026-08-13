@@ -1,87 +1,77 @@
 """
-fetch_holdout_pipeline.py — Busca mercados de 7-10 jun (genuinamente OOS pro v29)
-===================================================================================
-Pipeline completo em sequência:
-  1. Fetch markets do Gamma (slots 7-10 jun resolvidos)
+fetch_holdout_pipeline.py — Busca mercados 7-10 jun (holdout OOS pro v29)
+==========================================================================
+Roda LOCAL — sem Modal.
+
+Pipeline:
+  1. Fetch markets do Gamma (slots resolvidos pós TRAIN_CUTOFF)
   2. Fetch ticks do data-api
-  3. Fetch OB features do pmdata (janela t<60s, v29)
-  4. Upload tudo pro HF como holdout set permanente
+  3. Fetch OB features do pmdata (t<60s)
+  4. Salva local + upload HF
 
-Esses dados NUNCA entram no treino — são o gate de validação real.
+Uso:
+    cd ~/polymarket-btc-lab
+    python scripts/fetch_holdout_pipeline.py
+    python scripts/fetch_holdout_pipeline.py --skip-upload   # só local
 """
-import modal
+import argparse, io, json, logging, math, os, sys, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
-image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install(
-        "pyarrow>=18.0", "pandas>=2.2", "numpy>=1.26",
-        "requests>=2.31", "huggingface_hub>=0.26",
-    )
-)
+import numpy as np
+import pandas as pd
+import requests
 
-LOCAL_VOL = modal.Volume.from_name("btc-local-data")
-app = modal.App("btc-fetch-holdout", image=image)
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s",
+                    datefmt="%H:%M:%S", stream=sys.stdout)
+log = logging.getLogger(__name__)
 
-# Cutoff: último slot no dataset de treino (6 jun 19:10 UTC)
+# ── Config ────────────────────────────────────────────────────────────────────
+DATA_DIR      = Path(__file__).parent.parent / "data"
+GAMMA_BASE    = "https://gamma-api.polymarket.com"
+DATA_API_BASE = "https://data-api.polymarket.com"
+PMDATA_BASE   = "https://api.pmdata.dev/download/poly_l2"
+HF_REPO       = "artbreguez/polymarket-btc-model"
+OBS_SECS      = 60
+
+# Cutoff: último slot do dataset de treino v29 (6 jun 19:10 UTC)
 TRAIN_CUTOFF_TS = 1780773000
-# Holdout começa no slot seguinte
-HOLDOUT_START_TS = TRAIN_CUTOFF_TS + 300
+HOLDOUT_START   = TRAIN_CUTOFF_TS + 300
 
 
-@app.function(
-    cpu=8,
-    memory=16384,
-    timeout=7200,
-    secrets=[
-        modal.Secret.from_name("pmdata-api-key"),
-        modal.Secret.from_name("hf-token"),
-    ],
-    volumes={"/btc_local": LOCAL_VOL},
-)
-def fetch_holdout():
-    import gc, io, json, logging, math, os, sys, time
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from pathlib import Path
+def load_env():
+    env = {}
+    for path in [Path.home() / ".env", Path(__file__).parent.parent / ".env"]:
+        if path.exists():
+            for line in path.read_text().splitlines():
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip()
+    return env
 
-    import numpy as np
-    import pandas as pd
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-    import requests
-    from huggingface_hub import HfApi
 
-    logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s",
-                        datefmt="%H:%M:%S", stream=sys.stdout)
-    log = logging.getLogger(__name__)
+# ── STEP 1: Markets ───────────────────────────────────────────────────────────
+def fetch_markets(now_ts: int) -> pd.DataFrame:
+    slots = list(range(HOLDOUT_START, now_ts, 300))
+    log.info("STEP 1: Scanning %d slots (%s → %s)...",
+             len(slots),
+             pd.Timestamp(HOLDOUT_START, unit="s", tz="UTC").strftime("%Y-%m-%d %H:%M"),
+             pd.Timestamp(now_ts, unit="s", tz="UTC").strftime("%Y-%m-%d %H:%M"))
 
-    PMDATA_KEY    = os.environ.get("PMDATA_API_KEY", "")
-    HF_TOKEN      = os.environ.get("HF_TOKEN", "")
-    HF_REPO       = "artbreguez/polymarket-btc-model"
-    LOCAL_DIR     = Path("/btc_local")
-    PMDATA_BASE   = "https://api.pmdata.dev/download/poly_l2"
-    GAMMA_BASE    = "https://gamma-api.polymarket.com"
-    DATA_API_BASE = "https://data-api.polymarket.com"
-    OBS_SECS      = 60
+    # Resume: carregar já fetchados
+    out_path = DATA_DIR / "holdout_markets.csv"
+    done_slots = set()
+    rows = []
+    if out_path.exists():
+        existing = pd.read_csv(out_path)
+        done_slots = set(existing["slot_ts"].tolist())
+        rows = existing.to_dict("records")
+        log.info("  Resume: %d já fetchados", len(done_slots))
 
-    # Até agora - 1h de buffer para resolução
-    now_ts = int(time.time()) - 3600
+    todo = [s for s in slots if s not in done_slots]
+    log.info("  Restantes: %d", len(todo))
 
-    log.info("=" * 60)
-    log.info("HOLDOUT PIPELINE")
-    log.info("Janela: %s → %s",
-             __import__("datetime").datetime.utcfromtimestamp(HOLDOUT_START_TS),
-             __import__("datetime").datetime.utcfromtimestamp(now_ts))
-    log.info("=" * 60)
-
-    # ── STEP 1: Fetch markets do Gamma ────────────────────────────────────
-    log.info("STEP 1: Fetching markets from Gamma...")
-
-    slots = list(range(HOLDOUT_START_TS, now_ts, 300))
-    log.info("Slots to scan: %d", len(slots))
-
-    holdout_markets = []
-
-    def _fetch_market(slot_ts):
+    def _fetch(slot_ts):
         slug = f"btc-updown-5m-{slot_ts}"
         try:
             r = requests.get(f"{GAMMA_BASE}/markets/slug/{slug}", timeout=10)
@@ -96,105 +86,117 @@ def fetch_holdout():
             prices = json.loads(op) if isinstance(op, str) else op
             if not prices:
                 return None
-            target = 1 if float(prices[0]) >= 0.5 else 0
             return {
                 "market_id": str(m["id"]),
                 "slug":      m["slug"],
                 "slot_ts":   slot_ts,
-                "target":    target,
+                "target":    1 if float(prices[0]) >= 0.5 else 0,
             }
         except Exception:
             return None
 
     with ThreadPoolExecutor(max_workers=40) as ex:
-        futures = {ex.submit(_fetch_market, s): s for s in slots}
+        futures = {ex.submit(_fetch, s): s for s in todo}
         for i, fut in enumerate(as_completed(futures), 1):
-            result = fut.result()
-            if result:
-                holdout_markets.append(result)
-            if i % 200 == 0:
-                log.info("  %d/%d scanned, %d found", i, len(slots), len(holdout_markets))
+            r = fut.result()
+            if r:
+                rows.append(r)
+            if i % 200 == 0 or i == len(todo):
+                log.info("  %d/%d scanned, %d found", i, len(todo), len(rows))
 
-    holdout_df = pd.DataFrame(holdout_markets).sort_values("slot_ts").reset_index(drop=True)
-    log.info("Markets found: %d (%.1f%% UP)", len(holdout_df), 100 * holdout_df["target"].mean())
+    df = pd.DataFrame(rows).sort_values("slot_ts").reset_index(drop=True)
+    df.to_csv(out_path, index=False)
+    log.info("Markets: %d (%.1f%% UP) → %s", len(df), 100 * df["target"].mean(), out_path)
+    return df
 
-    if len(holdout_df) == 0:
-        log.error("Nenhum mercado encontrado — abortando")
-        return {"error": "no markets found"}
 
-    # Salvar
-    holdout_csv = LOCAL_DIR / "holdout_markets.csv"
-    holdout_df.to_csv(holdout_csv, index=False)
-    LOCAL_VOL.commit()
-    log.info("Saved holdout_markets.csv")
+# ── STEP 2: Ticks ─────────────────────────────────────────────────────────────
+def fetch_ticks(markets_df: pd.DataFrame) -> pd.DataFrame:
+    log.info("STEP 2: Fetching ticks for %d markets...", len(markets_df))
 
-    all_ids = set(holdout_df["market_id"].tolist())
+    out_path = DATA_DIR / "holdout_ticks.parquet"
+    done_ids = set()
+    existing_rows = []
+    if out_path.exists():
+        existing = pd.read_parquet(out_path)
+        done_ids = set(existing["market_id"].astype(str).tolist())
+        existing_rows = existing.to_dict("records")
+        log.info("  Resume: %d já fetchados", len(done_ids))
 
-    # ── STEP 2: Fetch ticks do data-api ──────────────────────────────────
-    log.info("STEP 2: Fetching ticks for %d markets...", len(holdout_df))
+    todo = markets_df[~markets_df["market_id"].isin(done_ids)]
+    log.info("  Restantes: %d", len(todo))
 
-    tick_rows = []
     TICK_COLS = ["market_id", "timestamp_ms", "outcome", "side", "price", "size_usdc"]
 
-    def _fetch_ticks(market_id, slug, slot_ts):
-        """Busca ticks do data-api para um mercado."""
+    def _fetch(market_id, slug, slot_ts):
         try:
-            # data-api usa condition_id ou market slug — tentar via trades endpoint
-            url = f"{DATA_API_BASE}/trades"
-            params = {"market": slug, "limit": 1000}
-            r = requests.get(url, params=params, timeout=15)
+            r = requests.get(
+                f"{DATA_API_BASE}/trades",
+                params={"market": slug, "limit": 500},
+                timeout=15,
+            )
             if not r.ok:
                 return []
             trades = r.json()
             if not isinstance(trades, list):
                 return []
             rows = []
-            obs_end = slot_ts + 60  # só ticks dentro da janela OBS_SECS
             for t in trades:
-                try:
-                    ts_ms = int(t.get("timestamp", 0))
-                    ts_s  = ts_ms / 1000
-                    if ts_s < slot_ts or ts_s >= slot_ts + 300:
-                        continue
-                    outcome = "Up" if str(t.get("outcome", "")).lower() in ("yes", "up", "1") else "Down"
-                    rows.append({
-                        "market_id":   market_id,
-                        "timestamp_ms": ts_ms,
-                        "outcome":     outcome,
-                        "side":        t.get("side", "BUY"),
-                        "price":       float(t.get("price", 0.5)),
-                        "size_usdc":   float(t.get("amount", t.get("size", 1.0))),
-                    })
-                except Exception:
+                ts_ms = int(t.get("timestamp", 0))
+                ts_s  = ts_ms / 1000
+                if ts_s < slot_ts or ts_s >= slot_ts + 300:
                     continue
+                outcome_raw = str(t.get("outcome", "")).lower()
+                outcome = "Up" if outcome_raw in ("yes", "up", "1") else "Down"
+                rows.append({
+                    "market_id":    market_id,
+                    "timestamp_ms": ts_ms,
+                    "outcome":      outcome,
+                    "side":         t.get("side", "BUY"),
+                    "price":        float(t.get("price", 0.5)),
+                    "size_usdc":    float(t.get("amount", t.get("size", 1.0))),
+                })
             return rows
         except Exception:
             return []
 
+    new_rows = []
     with ThreadPoolExecutor(max_workers=20) as ex:
         futures = {
-            ex.submit(_fetch_ticks, r["market_id"], r["slug"], r["slot_ts"]): r["market_id"]
-            for _, r in holdout_df.iterrows()
+            ex.submit(_fetch, r["market_id"], r["slug"], r["slot_ts"]): r["market_id"]
+            for _, r in todo.iterrows()
         }
         for i, fut in enumerate(as_completed(futures), 1):
-            tick_rows.extend(fut.result())
-            if i % 100 == 0:
-                log.info("  ticks: %d/%d markets done, %d ticks total",
-                         i, len(holdout_df), len(tick_rows))
+            new_rows.extend(fut.result())
+            if i % 100 == 0 or i == len(todo):
+                log.info("  %d/%d done, %d ticks", i, len(todo), len(new_rows))
 
-    if tick_rows:
-        ticks_df = pd.DataFrame(tick_rows)
-        holdout_ticks_path = LOCAL_DIR / "holdout_ticks.parquet"
-        ticks_df.to_parquet(holdout_ticks_path, index=False)
-        LOCAL_VOL.commit()
-        log.info("Saved %d ticks for %d markets", len(ticks_df),
-                 ticks_df["market_id"].nunique())
-    else:
-        log.warning("No ticks fetched")
-        ticks_df = pd.DataFrame(columns=TICK_COLS)
+    all_rows = existing_rows + new_rows
+    df = pd.DataFrame(all_rows) if all_rows else pd.DataFrame(columns=TICK_COLS)
+    if len(df):
+        df.to_parquet(out_path, index=False)
+    log.info("Ticks: %d total, %d markets → %s", len(df),
+             df["market_id"].nunique() if len(df) else 0, out_path)
+    return df
 
-    # ── STEP 3: Fetch OB features do pmdata ──────────────────────────────
-    log.info("STEP 3: Fetching OB features from pmdata...")
+
+# ── STEP 3: OB features (pmdata) ─────────────────────────────────────────────
+def fetch_ob(markets_df: pd.DataFrame, pmdata_key: str) -> pd.DataFrame:
+    log.info("STEP 3: Fetching OB features (%d markets)...", len(markets_df))
+
+    out_path = DATA_DIR / "holdout_ob_features.parquet"
+    done_ids = set()
+    existing_rows = []
+    if out_path.exists():
+        existing = pd.read_parquet(out_path)
+        done_ids = set(existing["market_id"].astype(str).tolist())
+        existing_rows = existing.to_dict("records")
+        log.info("  Resume: %d já fetchados", len(done_ids))
+
+    todo = markets_df[~markets_df["market_id"].isin(done_ids)]
+    log.info("  Restantes: %d", len(todo))
+
+    headers = {"api_key": pmdata_key}
 
     def _extract_snap(row):
         try:
@@ -204,140 +206,112 @@ def fetch_holdout():
             bs  = np.array(row["bid_sizes"],  dtype=np.float64)
             if not len(ap) or not len(bp):
                 return None
-            mid    = float((ap[0] + bp[0]) / 2)
+            mid  = float((ap[0] + bp[0]) / 2)
             spread = float(ap[0] - bp[0])
-            tsz    = float(as_[0] + bs[0])
-            imb    = float((bs[0] - as_[0]) / tsz) if tsz > 0 else 0.0
-            total_bid   = bs.sum() + 1e-8
-            total_ask   = as_.sum() + 1e-8
-            bd5 = float(bs[bp >= mid - 0.05].sum() / total_bid)
-            ad5 = float(as_[ap <= mid + 0.05].sum() / total_ask)
-            dr  = float(bd5 / (ad5 + 1e-8))
-            total_depth = float(bs.sum() + as_.sum())
-            bid_wt = float(np.sum(bs * np.exp(-10 * np.abs(bp - mid))))
-            ask_wt = float(np.sum(as_ * np.exp(-10 * np.abs(ap - mid))))
-            w_imb  = float((bid_wt - ask_wt) / (bid_wt + ask_wt + 1e-8))
+            tsz  = float(as_[0] + bs[0])
+            imb  = float((bs[0] - as_[0]) / tsz) if tsz > 0 else 0.0
+            bd5  = float(bs[bp >= mid - 0.05].sum() / (bs.sum() + 1e-8))
+            ad5  = float(as_[ap <= mid + 0.05].sum() / (as_.sum() + 1e-8))
+            dr   = float(bd5 / (ad5 + 1e-8))
+            td   = float(bs.sum() + as_.sum())
+            bwt  = float(np.sum(bs * np.exp(-10 * np.abs(bp - mid))))
+            awt  = float(np.sum(as_ * np.exp(-10 * np.abs(ap - mid))))
+            wimb = float((bwt - awt) / (bwt + awt + 1e-8))
             return {"mid": mid, "spread": spread, "imb": imb,
-                    "bd5": bd5, "ad5": ad5, "dr": dr,
-                    "total_depth": total_depth, "w_imb": w_imb}
+                    "bd5": bd5, "ad5": ad5, "dr": dr, "td": td, "wimb": wimb}
         except Exception:
             return None
 
     def _linslope(t, y):
         if len(t) < 2:
             return 0.0
-        t = np.array(t, dtype=np.float64)
-        y = np.array(y, dtype=np.float64)
+        t, y = np.array(t, dtype=np.float64), np.array(y, dtype=np.float64)
         tm, ym = t.mean(), y.mean()
-        denom = np.sum((t - tm) ** 2)
-        return float(np.sum((t - tm) * (y - ym)) / denom) if denom > 1e-12 else 0.0
+        d = np.sum((t - tm) ** 2)
+        return float(np.sum((t - tm) * (y - ym)) / d) if d > 1e-12 else 0.0
 
-    def _compute_ob_features(book_rows, pc_rows):
+    def _compute(book_rows, pc_rows):
         if book_rows is None or len(book_rows) == 0:
             return None
         book_rows = book_rows.sort_values("t_sec")
         open_rows = book_rows[book_rows["t_sec"] <= 30]
-        open_snap = _extract_snap(open_rows.iloc[0]) if len(open_rows) else _extract_snap(book_rows.iloc[0])
-        if open_snap is None:
+        snap = _extract_snap(open_rows.iloc[0]) if len(open_rows) else _extract_snap(book_rows.iloc[0])
+        if not snap:
             return None
 
         feats = {
-            "ob_imbalance":    open_snap["imb"],
-            "ob_depth_ratio":  open_snap["dr"],
-            "ob_total_depth":  open_snap["total_depth"],
-            "ob_spread":       open_snap["spread"],
-            "ob_mid":          open_snap["mid"],
-            "ob_bid_depth_5c": open_snap["bd5"],
-            "ob_ask_depth_5c": open_snap["ad5"],
-            "ob_weighted_imb": open_snap["w_imb"],
-            "ob_mid_drift": 0.0, "ob_imbalance_end": open_snap["imb"],
-            "ob_spread_end": open_snap["spread"], "ob_depth_change": 0.0,
-            "ob_imb_momentum": 0.0,
-            "ob_pc_up_ratio": 0.5, "ob_pc_volatility": 0.0,
-            "ob_pc_count": 0.0, "ob_fill_imbalance": 0.0,
+            "ob_imbalance": snap["imb"], "ob_depth_ratio": snap["dr"],
+            "ob_total_depth": snap["td"], "ob_spread": snap["spread"],
+            "ob_mid": snap["mid"], "ob_bid_depth_5c": snap["bd5"],
+            "ob_ask_depth_5c": snap["ad5"], "ob_weighted_imb": snap["wimb"],
+            "ob_mid_drift": 0.0, "ob_imbalance_end": snap["imb"],
+            "ob_spread_end": snap["spread"], "ob_depth_change": 0.0,
+            "ob_imb_momentum": 0.0, "ob_pc_up_ratio": 0.5,
+            "ob_pc_volatility": 0.0, "ob_pc_count": 0.0, "ob_fill_imbalance": 0.0,
         }
-
-        for w_i, (t0, t1) in enumerate([(0, 20), (20, 40), (40, 60)]):
+        for wi, (t0, t1) in enumerate([(0, 20), (20, 40), (40, 60)]):
             w = book_rows[(book_rows["t_sec"] >= t0) & (book_rows["t_sec"] < t1)]
-            imbs = [s["imb"] for _, r in w.iterrows() if (s := _extract_snap(r)) is not None]
-            feats[f"ob_imb_w{w_i}"] = float(np.mean(imbs)) if imbs else 0.0
+            imbs = [s["imb"] for _, r in w.iterrows() if (s := _extract_snap(r))]
+            feats[f"ob_imb_w{wi}"] = float(np.mean(imbs)) if imbs else 0.0
 
-        # CLOB features (janela 0-60s)
-        w_books = book_rows[(book_rows["t_sec"] >= 0) & (book_rows["t_sec"] < OBS_SECS)]
-        w_pcs   = (pc_rows[(pc_rows["t_sec"] >= 0) & (pc_rows["t_sec"] < OBS_SECS)]
-                   if pc_rows is not None and len(pc_rows) > 0 else pd.DataFrame())
+        # CLOB features t=[0,60s]
+        wb = book_rows[(book_rows["t_sec"] >= 0) & (book_rows["t_sec"] < OBS_SECS)]
+        wp = (pc_rows[(pc_rows["t_sec"] >= 0) & (pc_rows["t_sec"] < OBS_SECS)]
+              if pc_rows is not None and len(pc_rows) else pd.DataFrame())
 
-        zeros_clob = {
-            "clob_imb_mean": 0.0, "clob_imb_std": 0.0, "clob_imb_drift": 0.0,
-            "clob_spread_mean": 0.0, "clob_spread_trend": 0.0,
-            "clob_mid_velocity": 0.0, "clob_mid_volatility": 0.0,
-            "clob_activity_rate": 0.0, "clob_depth_trend": 0.0,
-            "clob_ask_pressure": 0.0,
-        }
-
-        if len(w_books) + len(w_pcs) < 3:
-            feats.update(zeros_clob)
+        zeros = {k: 0.0 for k in ["clob_imb_mean","clob_imb_std","clob_imb_drift",
+                                    "clob_spread_mean","clob_spread_trend","clob_mid_velocity",
+                                    "clob_mid_volatility","clob_activity_rate",
+                                    "clob_depth_trend","clob_ask_pressure"]}
+        if len(wb) + len(wp) < 3:
+            feats.update(zeros)
             return feats
 
-        real_imb, real_depth, real_ts = [], [], []
-        all_mid, all_spread, all_ts   = [], [], []
-        ask_prices_seq = []
-
-        for _, r in w_books.iterrows():
+        ri, rd, rt, am, asp, at_, asks = [], [], [], [], [], [], []
+        for _, r in wb.iterrows():
             s = _extract_snap(r)
             if s:
-                real_imb.append(s["imb"]); real_depth.append(s["total_depth"])
-                real_ts.append(float(r["t_sec"])); all_mid.append(s["mid"])
-                all_spread.append(s["spread"]); all_ts.append(float(r["t_sec"]))
-
-        for _, r in w_pcs.iterrows():
+                ri.append(s["imb"]); rd.append(s["td"]); rt.append(float(r["t_sec"]))
+                am.append(s["mid"]); asp.append(s["spread"]); at_.append(float(r["t_sec"]))
+        for _, r in wp.iterrows():
             try:
                 ba = float(r["best_ask"]) if pd.notna(r.get("best_ask")) else None
                 bb = float(r["best_bid"]) if pd.notna(r.get("best_bid")) else None
                 if ba and bb and ba > bb > 0:
-                    all_mid.append((ba + bb) / 2); all_spread.append(ba - bb)
-                    all_ts.append(float(r["t_sec"]))
-                if str(r.get("pc_side", "")).upper() == "SELL" and pd.notna(r.get("pc_price")):
-                    ask_prices_seq.append(float(r["pc_price"]))
+                    am.append((ba+bb)/2); asp.append(ba-bb); at_.append(float(r["t_sec"]))
+                if str(r.get("pc_side","")).upper() == "SELL" and pd.notna(r.get("pc_price")):
+                    asks.append(float(r["pc_price"]))
             except Exception:
-                continue
+                pass
 
-        if len(all_mid) < 2:
-            feats.update(zeros_clob)
-            return feats
+        if len(am) < 2:
+            feats.update(zeros); return feats
 
-        order   = np.argsort(all_ts)
-        ts_arr  = np.array(all_ts)[order]
-        mid_arr = np.array(all_mid)[order]
-        sp_arr  = np.array(all_spread)[order]
-        t_rel   = ts_arr - ts_arr[0]
+        order = np.argsort(at_)
+        ts  = np.array(at_)[order]; ma = np.array(am)[order]; sa = np.array(asp)[order]
+        tr  = ts - ts[0]
+        md  = np.diff(ma)
+        ask_diffs = np.diff(asks) if len(asks) >= 2 else np.array([])
+        nonzero   = ask_diffs[ask_diffs != 0]
 
-        clob = {
-            "clob_imb_mean":     float(np.mean(real_imb))           if real_imb          else 0.0,
-            "clob_imb_std":      float(np.std(real_imb))            if len(real_imb) > 1 else 0.0,
-            "clob_imb_drift":    float(real_imb[-1] - real_imb[0]) if len(real_imb) > 1 else 0.0,
-            "clob_spread_mean":  float(np.mean(sp_arr)),
-            "clob_spread_trend": _linslope(t_rel, sp_arr),
-            "clob_mid_velocity": _linslope(t_rel, mid_arr),
-            "clob_mid_volatility": float(np.std(np.diff(mid_arr))) if len(mid_arr) > 1 else 0.0,
-            "clob_activity_rate": float((len(w_books) + len(w_pcs)) / OBS_SECS),
-            "clob_depth_trend":  _linslope(
-                np.array(real_ts) - (real_ts[0] if real_ts else 0),
-                np.array(real_depth)
-            ) if len(real_depth) > 1 else 0.0,
-            "clob_ask_pressure": (
-                float((np.diff(ask_prices_seq) < 0).sum() / len(np.diff(ask_prices_seq)[np.diff(ask_prices_seq) != 0]))
-                if len(ask_prices_seq) >= 2 and len(np.diff(ask_prices_seq)[np.diff(ask_prices_seq) != 0]) > 0
-                else 0.0
-            ),
-        }
-        feats.update(clob)
+        feats.update({
+            "clob_imb_mean":     float(np.mean(ri))           if ri          else 0.0,
+            "clob_imb_std":      float(np.std(ri))            if len(ri)>1   else 0.0,
+            "clob_imb_drift":    float(ri[-1]-ri[0])          if len(ri)>1   else 0.0,
+            "clob_spread_mean":  float(np.mean(sa)),
+            "clob_spread_trend": _linslope(tr, sa),
+            "clob_mid_velocity": _linslope(tr, ma),
+            "clob_mid_volatility": float(np.std(md))          if len(md)     else 0.0,
+            "clob_activity_rate": float((len(wb)+len(wp))/OBS_SECS),
+            "clob_depth_trend":  _linslope(np.array(rt)-rt[0] if rt else [0], np.array(rd)) if len(rd)>1 else 0.0,
+            "clob_ask_pressure": float((nonzero<0).sum()/len(nonzero)) if len(nonzero) else 0.0,
+        })
         return feats
 
-    def _fetch_ob_one(market_id, slug, slot_ts):
+    def _fetch_ob(market_id, slug, slot_ts):
         try:
-            url = f"{PMDATA_BASE}/{slug}.parquet"
-            r   = requests.get(url, headers={"api_key": PMDATA_KEY}, timeout=60)
+            r = requests.get(f"{PMDATA_BASE}/{slug}.parquet",
+                             headers=headers, timeout=30)
             if not r.ok:
                 return market_id, None
             df = pd.read_parquet(io.BytesIO(r.content))
@@ -349,88 +323,99 @@ def fetch_holdout():
             df = df[(df["t_sec"] >= 0) & (df["t_sec"] < OBS_SECS)]
             books = df[df["event_type"] == "book"].copy()
             pcs   = df[df["event_type"] == "price_change"].copy()
-            feats = _compute_ob_features(
-                books if len(books) > 0 else None,
-                pcs   if len(pcs)   > 0 else None,
-            )
+            feats = _compute(books if len(books) else None,
+                             pcs   if len(pcs)   else None)
             if feats:
                 feats["market_id"] = market_id
             return market_id, feats
         except Exception:
             return market_id, None
 
-    ob_rows = []
-    ob_success = 0
-    ob_failed  = 0
-
+    ok, fail = 0, 0
+    new_rows = []
     with ThreadPoolExecutor(max_workers=20) as ex:
         futures = {
-            ex.submit(_fetch_ob_one, r["market_id"], r["slug"], r["slot_ts"]): r["market_id"]
-            for _, r in holdout_df.iterrows()
+            ex.submit(_fetch_ob, r["market_id"], r["slug"], r["slot_ts"]): r["market_id"]
+            for _, r in todo.iterrows()
         }
         for i, fut in enumerate(as_completed(futures), 1):
             mid, feats = fut.result()
             if feats:
-                ob_rows.append(feats)
-                ob_success += 1
+                new_rows.append(feats); ok += 1
             else:
-                ob_failed += 1
-            if i % 100 == 0:
-                log.info("  ob: %d/%d done, ok=%d fail=%d",
-                         i, len(holdout_df), ob_success, ob_failed)
+                fail += 1
+            if i % 100 == 0 or i == len(todo):
+                log.info("  %d/%d done, ok=%d fail=%d", i, len(todo), ok, fail)
+                # Checkpoint: salvar progresso a cada 100
+                if new_rows:
+                    _df = pd.DataFrame(existing_rows + new_rows)
+                    _df.to_parquet(out_path, index=False)
 
-    log.info("OB fetch: %d ok, %d failed", ob_success, ob_failed)
+    all_rows = existing_rows + new_rows
+    df = pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
+    if len(df):
+        df.to_parquet(out_path, index=False)
+    log.info("OB: %d ok, %d failed → %s", ok, fail, out_path)
+    return df
 
-    if ob_rows:
-        ob_df = pd.DataFrame(ob_rows)
-        holdout_ob_path = LOCAL_DIR / "holdout_ob_features.parquet"
-        ob_df.to_parquet(holdout_ob_path, index=False)
-        LOCAL_VOL.commit()
-        log.info("Saved holdout_ob_features.parquet (%d rows)", len(ob_df))
-    else:
-        log.warning("No OB features — backtest will use zeros for OB")
-        ob_df = pd.DataFrame()
 
-    # ── STEP 4: Upload para HF ────────────────────────────────────────────
-    log.info("STEP 4: Uploading holdout files to HF...")
-    api = HfApi(token=HF_TOKEN)
-
-    uploads = [
-        (LOCAL_DIR / "holdout_markets.csv",        "data/holdout_markets.csv"),
-        (LOCAL_DIR / "holdout_ticks.parquet",       "data/holdout_ticks.parquet"),
-        (LOCAL_DIR / "holdout_ob_features.parquet", "data/holdout_ob_features.parquet"),
+# ── STEP 4: Upload HF ─────────────────────────────────────────────────────────
+def upload_hf(hf_token: str):
+    from huggingface_hub import HfApi
+    api = HfApi(token=hf_token)
+    files = [
+        (DATA_DIR / "holdout_markets.csv",        "data/holdout_markets.csv"),
+        (DATA_DIR / "holdout_ticks.parquet",       "data/holdout_ticks.parquet"),
+        (DATA_DIR / "holdout_ob_features.parquet", "data/holdout_ob_features.parquet"),
     ]
-
-    for local_path, repo_path in uploads:
-        if not local_path.exists():
-            log.warning("  SKIP (not found): %s", local_path.name)
+    log.info("STEP 4: Uploading holdout files to HF...")
+    for local, remote in files:
+        if not local.exists():
+            log.warning("  SKIP (not found): %s", local.name)
             continue
-        size_mb = local_path.stat().st_size / 1024 / 1024
-        log.info("  Uploading %s (%.1f MB)...", local_path.name, size_mb)
+        log.info("  %s (%.1f MB)...", local.name, local.stat().st_size / 1e6)
         api.upload_file(
-            path_or_fileobj=str(local_path),
-            path_in_repo=repo_path,
+            path_or_fileobj=str(local),
+            path_in_repo=remote,
             repo_id=HF_REPO,
             repo_type="model",
-            commit_message=f"holdout: {local_path.name} (7-10 jun 2026, never seen by v29)",
+            commit_message=f"holdout: {local.name} (7-10 jun 2026)",
         )
-
-    log.info("=" * 60)
-    log.info("HOLDOUT PIPELINE COMPLETO")
-    log.info("Markets: %d | Ticks: %d | OB: %d/%d",
-             len(holdout_df), len(ticks_df), ob_success, len(holdout_df))
-    log.info("=" * 60)
-
-    return {
-        "n_markets":   len(holdout_df),
-        "n_ticks":     len(ticks_df),
-        "ob_success":  ob_success,
-        "ob_failed":   ob_failed,
-        "pct_up":      round(float(holdout_df["target"].mean()) * 100, 1),
-    }
+    log.info("Upload completo.")
 
 
-@app.local_entrypoint()
-def main():
-    result = fetch_holdout.remote()
-    print("\nRESULT:", result)
+# ── Main ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--skip-upload", action="store_true")
+    parser.add_argument("--skip-ticks",  action="store_true")
+    parser.add_argument("--skip-ob",     action="store_true")
+    args = parser.parse_args()
+
+    env = load_env()
+    pmdata_key = env.get("PMDATA_API_KEY", "")
+    hf_token   = env.get("HF_TOKEN", "")
+
+    if not pmdata_key:
+        log.error("PMDATA_API_KEY não encontrado no .env")
+        sys.exit(1)
+
+    now_ts = int(time.time()) - 3600  # 1h buffer para resolução
+
+    markets_df = fetch_markets(now_ts)
+    if len(markets_df) == 0:
+        log.error("Nenhum mercado encontrado"); sys.exit(1)
+
+    if not args.skip_ticks:
+        fetch_ticks(markets_df)
+
+    if not args.skip_ob:
+        fetch_ob(markets_df, pmdata_key)
+
+    if not args.skip_upload:
+        if not hf_token:
+            log.warning("HF_TOKEN não encontrado — pulando upload")
+        else:
+            upload_hf(hf_token)
+
+    log.info("Pipeline completo.")

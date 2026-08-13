@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-HF_TOKEN=os.environ.get("HF_TOKEN", "")
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
 HF_MODEL_REPO = "artbreguez/polymarket-btc-model"
 DATA_DIR = Path(__file__).parent.parent / "data"
 LAB_DIR  = Path(__file__).parent.parent

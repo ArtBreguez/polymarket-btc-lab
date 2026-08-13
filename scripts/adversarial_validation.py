@@ -141,9 +141,8 @@ def run_adversarial():
         f["hour_cos"] = math.cos(2 * math.pi * hour / 24)
         f["dow_sin"]  = math.sin(2 * math.pi * d.weekday() / 7)
         f["dow_cos"]  = math.cos(2 * math.pi * d.weekday() / 7)
-        f["slot_ts_norm"] = slot_ts / 1e9  # escala temporal bruta
-        # OB
-        for col in ["ob_imbalance", "ob_depth_ratio", "ob_total_depth", "ob_spread",
+        # OB — excluindo ob_total_depth (drift no holdout) e slot_ts_norm (temporal leak)
+        for col in ["ob_imbalance", "ob_depth_ratio", "ob_spread",
                     "clob_spread_mean", "clob_spread_trend", "clob_mid_volatility",
                     "clob_ask_pressure"]:
             v = ob_row.get(col, 0.0)

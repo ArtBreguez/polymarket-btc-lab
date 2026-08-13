@@ -18,12 +18,13 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-HF_TOKEN     = os.environ.get("HF_TOKEN", "")
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
 HF_MODEL_REPO = "artbreguez/polymarket-btc-model"
 DATA_DIR     = Path(__file__).parent.parent / "data"
 
-# Arquivos que o train_v28 consome do HF
+# Arquivos que o train_v31 consome do HF
 ALL_DATA_FILES = [
+    "ob_features_v31.parquet",
     "ob_features_full.parquet",
     "all_markets.csv",
     "new_markets.csv",
@@ -72,8 +73,8 @@ def main():
     elif args.all:
         files = ALL_DATA_FILES
     else:
-        # default: só ob_features (o que muda mais)
-        files = ["ob_features_full.parquet"]
+        # default: ob_features_v31 (novo fetch)
+        files = ["ob_features_v31.parquet"]
 
     print(f"Destino: {HF_MODEL_REPO}/data/")
     print(f"Arquivos: {files}")
